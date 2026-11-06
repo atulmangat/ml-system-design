@@ -1,0 +1,521 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Harmful Content Detection</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-slug="harmful-content-detection">
+<div class="topbar"><a href="index.html">&larr; ML System Design Study Guide</a><span style="color:var(--muted)">Chapter 5 of 11</span></div>
+<div class="layout"><aside class="toc" id="toc"></aside>
+<main>
+<div class="kicker">Chapter 5</div>
+<h1>Harmful Content Detection</h1>
+<p class="lead">A social platform receives about 100 million new posts a day and roughly one in a thousand breaks policy. The system must find those posts in any mix of text, image, and video across many languages, remove clear violations, demote borderline ones, and send the uncertain middle to human reviewers, all within seconds to minutes while adversaries keep changing tactics. The core idea is one calibrated multi-label model with a threshold ladder on top: probabilities pick the action, humans resolve the doubt, and every human decision becomes the next training label.</p>
+
+<h2>Clarifying Requirements</h2>
+<p>This problem is as much about policy and operations as about modeling. A strong candidate spends the first minutes pinning down what actions exist, what a mistake costs in each direction, and how much human capacity is available.</p>
+<div class="dlg">
+<div class="turn c"><span>Candidate</span><p>What can the system do to a harmful post?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Three things: remove clear violations and tell the author why, demote borderline posts so fewer people see them, and send uncertain posts to human reviewers. Authors can appeal removals.</p></div>
+<div class="turn c"><span>Candidate</span><p>What is in scope as input: posts only, or comments and messages too?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Posts only. A post may have text, an image, a video, or any mix. Comments and private messages are out of scope, but reports, hides, and flagged replies on a post can be used as signals.</p></div>
+<div class="turn c"><span>Candidate</span><p>Which harm types, and can one post violate several?</p></div>
+<div class="turn i"><span>Interviewer</span><p>About a dozen categories, such as violence, nudity, hate speech, self-harm, harassment, and spam. A post can violate several at once. Policy text changes a few times a year, and some rules differ by country.</p></div>
+<div class="turn c"><span>Candidate</span><p>What scale should I design for?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Assume 100 million new posts per day, about 10% of them with video. Assume roughly 0.1% violate policy, so positives are rare.</p></div>
+<div class="turn c"><span>Candidate</span><p>How fast must we act?</p></div>
+<div class="turn i"><span>Interviewer</span><p>A decision for 95% of text and image posts within 30 seconds, and a few minutes for video. The earlier we act, the fewer people see the post, but speed must not cost accuracy on removals.</p></div>
+<div class="turn c"><span>Candidate</span><p>What labels do we have?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Human reviewer decisions, user reports, and a small random sample that reviewers label for measurement. Reports are noisy and sometimes organized attacks on innocent posts.</p></div>
+<div class="turn c"><span>Candidate</span><p>Which languages, and how good is the data in each?</p></div>
+<div class="turn i"><span>Interviewer</span><p>More than 50 languages. A handful have abundant labels; many have only a few hundred positives.</p></div>
+<div class="turn c"><span>Candidate</span><p>What do the two kinds of mistakes cost?</p></div>
+<div class="turn i"><span>Interviewer</span><p>A wrong removal hurts trust and has legal exposure, so automatic removal needs at least 95% precision. A miss exposes people to harm, so recall matters too. Reviewers can handle about 150,000 items per day.</p></div>
+<div class="turn c"><span>Candidate</span><p>Is anything personalized, and how should new accounts or new harm types be handled?</p></div>
+<div class="turn i"><span>Interviewer</span><p>No personalization: the same policy applies to everyone, adjusted only by country. New accounts and brand-new harm types are the cold-start cases, so plan for them.</p></div>
+<div class="turn c"><span>Candidate</span><p>What is out of scope?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Encrypted private messaging, account-level bans, and ads review. Known illegal imagery is handled by hash matching with a legal workflow, which you can mention in one line.</p></div>
+</div>
+<div class="summary"><p>Build a proactive system that scores every new post (any mix of text, image, and video, in 50+ languages) for about a dozen harm types, then removes clear violations, demotes borderline ones, and routes uncertain ones to human reviewers. Scale is 100 million posts a day at roughly 0.1% prevalence, with decisions in under 30 seconds for most posts, at least 95% precision for automatic removal, and about 150,000 reviews a day of capacity. Users are told why and can appeal.</p></div>
+<script type="application/json" class="dg" data-cap="The product as a black box: a post and its context go in, an action and a user notice come out">
+{"type":"graph","cols":3,
+ "nodes":[
+  {"id":"post","t":"New post","s":"text, image, video, any mix","c":0,"r":0,"k":"io"},
+  {"id":"sys","t":"Harmful content detection","s":"scores every harm type","c":1,"r":0,"k":"model"},
+  {"id":"out","t":"Action per post","s":"remove, demote, review, allow","c":2,"r":0,"k":"io"},
+  {"id":"ctx","t":"Context signals","s":"author history, later reactions","c":0,"r":1,"k":"data"},
+  {"id":"note","t":"Notice and appeal","s":"reason shown to the author","c":2,"r":1}],
+ "edges":[["post","sys","text + media"],["ctx","sys","signals",{"sa":"r","sb":"b"}],["sys","out","scores + policy",{"hl":1}],["out","note","if removed"]]}
+</script>
+
+<h2>Frame the Problem as an ML Task</h2>
+<h3>ML objective</h3>
+<p>The system must turn a post into a decision, but the model should not make the decision itself. The model's job is to estimate how likely the post is to violate each policy. The action then follows from thresholds that policy and operations teams can change without retraining.</p>
+<table>
+<caption>Candidate objectives</caption>
+<tr><th>Option</th><th>What the model predicts</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Single binary classifier</td><td>"Harmful or not"</td><td>Simplest to build and evaluate</td><td>Cannot say which policy was broken, so no useful notice to the author; one threshold for very different harms</td></tr>
+<tr><td>Multi-class softmax</td><td>Exactly one of N harm types or "none"</td><td>Familiar loss; outputs sum to 1</td><td>Wrong assumption: a threatening, hateful meme is violence and hate at once; adding a policy changes every other probability</td></tr>
+<tr><td>One binary model per harm</td><td>Independent model per policy</td><td>Teams iterate independently</td><td>Dozens of large models to train and serve; no shared learning, so rare harms stay weak</td></tr>
+<tr><td><b>Multi-label, multi-task</b></td><td>Independent calibrated probability per harm class from a shared backbone</td><td>Shared features, one forward pass, per-class thresholds, a natural explanation</td><td>Tasks can interfere; needs per-class evaluation and care with missing labels</td></tr>
+</table>
+<div class="callout key"><p>Predict a calibrated probability per harm class and keep the action choice outside the model. Policies, country rules, and review capacity change faster than a model can be retrained, and a threshold is the cheapest knob to turn.</p></div>
+
+<h3>Input and output</h3>
+<p>The input is the whole post, not only its text: caption, text found inside images, sampled video frames, an audio transcript, and linked domains. Author and posting-context features come with it. After exposure, reaction signals such as reports and hides join in a second-pass model.</p>
+<script type="application/json" class="dg" data-cap="Anatomy of a post: every signal feeds one harm model, and reactions arrive only after people have seen the post">
+{"type":"graph","cols":3,
+ "nodes":[
+  {"id":"tx","t":"Text and OCR text","s":"caption plus words found in images","c":0,"r":0},
+  {"id":"md","t":"Image or video frames","s":"sampled, decoded once","c":1,"r":0,"k":"img"},
+  {"id":"lk","t":"Links and audio","s":"domain, speech-to-text","c":2,"r":0},
+  {"id":"au","t":"Author","s":"age, past violations","c":0,"r":1,"k":"user"},
+  {"id":"m","t":"Harm model","s":"fuses all signals","c":1,"r":1,"k":"model"},
+  {"id":"cx","t":"Where it is posted","s":"group, audience, country","c":2,"r":1},
+  {"id":"rx","t":"Reactions","s":"reports, hides, flagged replies","c":1,"r":2,"k":"data"}],
+ "edges":[["tx","m"],["md","m"],["lk","m"],["au","m"],["cx","m"],["rx","m","after exposure",{"d":1}]]}
+</script>
+<p>The output is a vector of probabilities, one per harm class, plus an explanation handle such as the text span or frame that drove the top score. Probabilities are independent, so a post can score high on several classes while a news clip about a war stays below every threshold.</p>
+<script type="application/json" class="dg" data-cap="Multi-label output (illustrative): each row is a post, each column an independent probability; outlined cells are the violations">
+{"type":"matrix","rl":"Posts","cl":"Harm class","rows":["Meme with slur","Beach photo","Fight clip + threat","Giveaway link blast","News clip about war"],"cols":["Violence","Nudity","Hate","Self-harm","Spam"],
+ "v":[[0.0,0.0,0.9,0.0,0.0],[0.0,0.1,0.0,0.0,0.0],[0.8,0.0,0.6,0.0,0.0],[0.0,0.0,0.0,0.0,0.9],[0.3,0.0,0.0,0.0,0.0]],"hl":[[0,2],[2,0],[2,2],[3,4]]}
+</script>
+
+<h3>ML category</h3>
+<p>The backbone choice is separate from the multi-label framing. A candidate may compare four families and say which fits each stage.</p>
+<table>
+<caption>Model families for the backbone</caption>
+<tr><th>Family</th><th>How it works</th><th>Strengths</th><th>Weaknesses</th></tr>
+<tr><td>Classical</td><td>Bag-of-words or n-grams plus logistic regression or gradient-boosted trees</td><td>Cheap, fast, easy to debug</td><td>Brittle to misspellings and new slang; no cross-language transfer; no pixels</td></tr>
+<tr><td>Per-modality deep models</td><td>Separate text and image networks, outputs combined late</td><td>Modular, reuses strong pretrained encoders</td><td>Misses meaning that only exists across modalities</td></tr>
+<tr><td><b>Pretrained multimodal encoders, fine-tuned</b></td><td>Multilingual text transformer, vision transformer or CLIP-style encoder, fusion layer, per-harm heads</td><td>Strong accuracy, 100-language reach, one shared forward pass</td><td>Heavier to serve; needs calibration and per-language checks</td></tr>
+<tr><td>Prompted LLM or vision-language model</td><td>Policy text in the prompt, zero-shot judgment</td><td>Instant coverage of a new policy; useful to pre-label and explain</td><td>Slow, costly per post, not calibrated; unsuitable as the first-pass scorer at this scale</td></tr>
+</table>
+<p>The decision is a staged one. Fine-tuned multimodal encoders score every post. A prompted model helps bootstrap a brand-new policy and speeds up labeling, but its output is a suggestion for reviewers, not an automatic action.</p>
+<script type="application/json" class="dg" data-cap="The action ladder: calibrated scores map to four actions; the thresholds, not the model, encode policy">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"sc","t":"Calibrated score","s":"one per harm class","c":0,"r":1,"k":"model","dy":52},
+  {"id":"t1","t":"Score 0.95 or higher","s":"precision above 95%","c":1,"r":0},
+  {"id":"t2","t":"Score 0.40 to 0.95","s":"uncertain band","c":1,"r":1},
+  {"id":"t3","t":"Score 0.15 to 0.40","s":"borderline","c":1,"r":2},
+  {"id":"t4","t":"Score under 0.15","s":"clean","c":1,"r":3},
+  {"id":"a1","t":"Remove","s":"hide post, notify author","c":2,"r":0,"k":"io"},
+  {"id":"a2","t":"Demote + human review","s":"reach cut while queued","c":2,"r":1,"k":"io"},
+  {"id":"a3","t":"Demote lightly","s":"reversible, no human","c":2,"r":2,"k":"io"},
+  {"id":"a4","t":"Publish normally","s":"stays in random audit","c":2,"r":3,"k":"io"},
+  {"id":"n1","t":"Appeal path","s":"second reviewer re-checks","c":3,"r":0,"k":"user"},
+  {"id":"n2","t":"Reviewer decides","s":"labels feed training","c":3,"r":1,"k":"user"}],
+ "edges":[["sc","t1"],["sc","t2"],["sc","t3"],["sc","t4"],["t1","a1"],["t2","a2",{"hl":1}],["t3","a3"],["t4","a4"],["a1","n1"],["a2","n2",{"hl":1}]]}
+</script>
+
+<h2>Data Preparation</h2>
+<h3>Data engineering</h3>
+<p>Four tables carry most of the weight. Sizes below are assumptions for 100 million posts a day.</p>
+<table>
+<caption>Posts (about 100M rows a day, roughly 200 GB of metadata; media stays in the blob store)</caption>
+<tr><th>post_id</th><th>author_id</th><th>created_at</th><th>lang</th><th>media</th><th>country</th></tr>
+<tr><td>p_9f1</td><td>a_77</td><td>10:02:11</td><td>es</td><td>image</td><td>MX</td></tr>
+<tr><td>p_9f2</td><td>a_08</td><td>10:02:12</td><td>en</td><td>text</td><td>US</td></tr>
+<tr><td>p_9f3</td><td>a_31</td><td>10:02:15</td><td>hi</td><td>video</td><td>IN</td></tr>
+</table>
+<table>
+<caption>Reports and hides (about 1M reports a day, assumption)</caption>
+<tr><th>post_id</th><th>reporter_id</th><th>reason</th><th>reported_at</th><th>reporter_trust</th></tr>
+<tr><td>p_9f3</td><td>u_410</td><td>violence</td><td>10:09:40</td><td>0.82</td></tr>
+<tr><td>p_9f3</td><td>u_977</td><td>hate</td><td>10:11:03</td><td>0.15</td></tr>
+</table>
+<table>
+<caption>Reviews (about 200K a day: the review band, report-driven items, and random samples)</caption>
+<tr><th>post_id</th><th>reviewer_id</th><th>queue</th><th>policy_label</th><th>decision</th><th>seconds</th></tr>
+<tr><td>p_9f3</td><td>r_12</td><td>violence</td><td>graphic_violence</td><td>violating</td><td>41</td></tr>
+<tr><td>p_9f1</td><td>r_55</td><td>random_sample</td><td>none</td><td>benign</td><td>18</td></tr>
+</table>
+<table>
+<caption>Enforcement log (one row per decision, kept for audit and appeals)</caption>
+<tr><th>post_id</th><th>model_version</th><th>harm</th><th>score</th><th>action</th><th>pass</th></tr>
+<tr><td>p_9f3</td><td>fp-2026-w44</td><td>violence</td><td>0.97</td><td>remove</td><td>first</td></tr>
+<tr><td>p_9f1</td><td>fp-2026-w44</td><td>nudity</td><td>0.12</td><td>allow</td><td>first</td></tr>
+</table>
+<p>Log every score with its model version and the thresholds in force. Without that, you cannot audit a removal, answer an appeal, or replay old traffic against a new model. Keep removed content for the appeal window (for example 90 days) under strict access control.</p>
+
+<h3>Feature engineering</h3>
+<table>
+<caption>Features by entity and how they are encoded</caption>
+<tr><th>Entity</th><th>Features</th><th>Encoding</th></tr>
+<tr><td>Text</td><td>Caption, OCR text, speech transcript, language ID</td><td>Unicode normalization (NFKC), confusable-character and zero-width cleanup, then multilingual subword tokens into an XLM-R style encoder</td></tr>
+<tr><td>Image</td><td>Pixels, perceptual hash, OCR text</td><td>Vision-transformer or CLIP-style patch embedding; PDQ-style hash looked up against known-bad media</td></tr>
+<tr><td>Video</td><td>1 frame per 2 seconds (cap 16), audio, motion</td><td>Per-frame embeddings pooled with attention; ASR transcript joins the text path</td></tr>
+<tr><td>Author</td><td>Account age, decayed count of past violations, follower bucket, verification</td><td>Log buckets and decayed counts; never a raw ID embedding, which would memorize individuals</td></tr>
+<tr><td>Context</td><td>Group or page type, audience, posting country, link domain reputation</td><td>Embedding lookups for categories, rates for reputation</td></tr>
+<tr><td>Reactions (second pass only)</td><td>Reports weighted by reporter trust, hides per 1,000 views, flagged-reply share, view velocity</td><td>Rates normalized by views, log-scaled; counts alone favor viral posts</td></tr>
+</table>
+<p>Reaction features are the strongest signal but they only exist after exposure. The timing makes the design: score everything with content and author features immediately, then rescore with reactions as they accumulate.</p>
+<script type="application/json" class="dg" data-cap="Why reactions cannot be first-pass features (illustrative): a content-only model acts at hour 0, while a reaction-aware model gains recall only after much of the audience has already seen the post">
+{"type":"curve","xl":"Hours since posting","yl":"Fraction","xmax":24,"ticks":5,
+ "series":[
+  {"n":"Views delivered","c":2,"lp":3,"pts":[[0,0],[1,0.35],[3,0.6],[6,0.8],[12,0.92],[24,1]]},
+  {"n":"Recall with reactions","c":0,"lp":5,"pts":[[0,0.55],[1,0.6],[3,0.68],[6,0.74],[12,0.78],[24,0.8]]},
+  {"n":"Recall, content only","c":1,"d":1,"lp":1,"pts":[[0,0.55],[24,0.55]]}]}
+</script>
+<div class="callout tip"><p>If an interviewer asks for report counts as features, agree, then ask where in the timeline they are available. Distinguishing a first-pass model (content only, acts immediately) from a second-pass model (adds reactions, escalates) shows you understand label and feature leakage in time.</p></div>
+
+<h3>Labels</h3>
+<table>
+<caption>Where labels come from</caption>
+<tr><th>Source</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Human reviewers</td><td>Policy-aware and accurate; the only trusted ground truth</td><td>Expensive, slow (hours), and they disagree on gray areas; shown only what the system surfaced</td></tr>
+<tr><td>User reports</td><td>Plentiful and fast; capture harms the model misses</td><td>Noisy; biased toward visible content; can be brigaded by organized groups</td></tr>
+<tr><td>Weak labels (rules, keyword lists, older model output, LLM pre-labels)</td><td>Huge volume and cheap; helps new languages</td><td>Inherits the blind spots of whatever produced it</td></tr>
+</table>
+<p><b>Decision.</b> Treat reviewer decisions as ground truth. Use reports to decide what reviewers see and, once weighted by reporter trust, as extra noisy training signal. Use weak labels only for pretraining and for low-resource languages, never for evaluation.</p>
+<script type="application/json" class="dg" data-cap="Label workflow: three entry points share one priority queue, two blind reviewers decide, disagreements go to a senior reviewer, and every outcome lands in the label store">
+{"type":"graph","cols":3,
+ "nodes":[
+  {"id":"rep","t":"User reports","s":"noisy, can be brigaded","c":0,"r":0,"k":"io"},
+  {"id":"flag","t":"Classifier flags","s":"scores in the review band","c":1,"r":0,"k":"model"},
+  {"id":"smp","t":"Random sample","s":"unbiased, for measurement","c":2,"r":0,"k":"io"},
+  {"id":"q","t":"Priority queue","s":"severity x reach, deduped","c":1,"r":1,"k":"store"},
+  {"id":"ra","t":"Reviewer A","s":"language-matched","c":0,"r":2,"k":"user"},
+  {"id":"sen","t":"Senior reviewer","s":"breaks ties, audits","c":1,"r":2,"k":"user"},
+  {"id":"rb","t":"Reviewer B","s":"blind to reviewer A","c":2,"r":2,"k":"user"},
+  {"id":"ls","t":"Label store","s":"decision, policy, rationale","c":1,"r":3,"k":"store"}],
+ "edges":[["rep","q"],["flag","q"],["smp","q"],["q","ra",{"sa":"b","sb":"t"}],["q","rb",{"sa":"b","sb":"t"}],["ra","sen","disagree"],["rb","sen"],["sen","ls","final label"],["ra","ls",{"sa":"b","sb":"l"}],["rb","ls",{"sa":"b","sb":"r"}]]}
+</script>
+<h4>Label noise and agreement</h4>
+<p>Reviewers disagree most on exactly the posts the model is unsure about. Measure it with Cohen's kappa: the observed agreement minus the agreement expected by chance, divided by what is left over. Low kappa on a policy usually means the written guidance is ambiguous, and no model can beat that ceiling.</p>
+<script type="application/json" class="dg" data-cap="Agreement between two reviewers on 100 posts from the uncertain band (illustrative): the diagonal is agreement, the rest is disagreement">
+{"type":"matrix","rl":"Reviewer A","cl":"Reviewer B","rows":["Violating","Borderline","Benign"],"cols":["Violating","Borderline","Benign"],
+ "v":[[0.3,0.1,0.0],[0.1,0.1,0.1],[0.0,0.1,0.2]],"hl":"diag"}
+</script>
+<div class="callout math"><p>Joint shares from the matrix: observed agreement p<sub>o</sub> = 0.3 + 0.1 + 0.2 = 0.60. Row totals for reviewer A are 0.4, 0.3, 0.3, and the column totals for B are the same, so chance agreement p<sub>e</sub> = 0.4&times;0.4 + 0.3&times;0.3 + 0.3&times;0.3 = 0.16 + 0.09 + 0.09 = 0.34. Kappa = (0.60 &minus; 0.34) / (1 &minus; 0.34) = 0.26 / 0.66 &asymp; 0.39, only fair agreement even though 60% of the posts matched. Fix the guidance, add a second review for this policy, and use soft labels (the fraction of reviewers voting violating) instead of hard 0 or 1.</p></div>
+<h4>Imbalance, delay, and selection bias</h4>
+<p>At 0.1% prevalence a model that says "clean" for everything scores 99.9% accuracy. Keep every positive, sample the negatives, and compensate afterwards, as the next figure shows.</p>
+<script type="application/json" class="dg" data-cap="Positive share of the training set after down-sampling clean posts: 100K positives a day against 99.9M clean ones">
+{"type":"bars","labels":["Raw stream","Keep 1% of clean posts","Keep 0.1% of clean posts"],"series":[{"n":"Positive share (%)","v":[0.1,9.1,50]}],"fmt":null,"max":58}
+</script>
+<ul>
+<li><b>Delay.</b> A final label can take hours, and an appeal can overturn it days later. Train on posts older than a maturity window (for example 7 days) and apply overturns as corrections.</li>
+<li><b>Selection bias.</b> Reviewers only see what reports or the current model surface, so a model trained on them never learns about harms it already misses. Keep a random labeled sample, and use inverse-propensity weights for the surfaced items.</li>
+<li><b>Hard negatives.</b> Include benign look-alikes: news about violence, medical nudity, quoted hate speech in a rebuttal, reclaimed slurs. Without them the model learns surface keywords.</li>
+</ul>
+
+<h2>Model Development</h2>
+<h3>Choosing the architecture</h3>
+<p>Harm often lives in the interaction of modalities. The Hateful Memes challenge was built from "benign confounders", pairs where swapping the image or the caption flips the label, so unimodal models cannot cheat. Its authors reported 64.73% accuracy for the strongest methods then against 84.7% for humans, which is the gap a design must close.</p>
+<table>
+<caption>Fusion strategies</caption>
+<tr><th>Strategy</th><th>How it works</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Early</td><td>Concatenate frozen text and image features, then an MLP</td><td>Cheap; easy to train and debug</td><td>Weak interaction between modalities</td></tr>
+<tr><td>Late</td><td>One classifier per modality; combine the scores with weights or a small tree model</td><td>Modular; each modality can be missing; reuses existing models</td><td>No interaction at all: harmless image plus hateful caption looks fine to both</td></tr>
+<tr><td>Joint</td><td>Cross-modal transformer over text tokens and image regions (ViLBERT, VisualBERT, CLIP-based fusion)</td><td>Learns meaning that exists only across modalities; best on memes</td><td>Costliest to train and serve; needs paired data</td></tr>
+</table>
+<script type="application/json" class="dg" data-cap="Three fusion strategies side by side: where the modalities meet decides how much interaction the model can learn">
+{"type":"graph","cols":4,
+ "groups":[{"t":"Early fusion: combine features","c0":0,"c1":3,"r0":0,"r1":0},{"t":"Late fusion: combine decisions","c0":0,"c1":3,"r0":1,"r1":1},{"t":"Joint fusion: combine inside the network","c0":0,"c1":3,"r0":2,"r1":2}],
+ "nodes":[
+  {"id":"e1","t":"Encoder features","s":"text and image embeddings","c":0,"r":0,"k":"vec"},
+  {"id":"e2","t":"Concatenate + MLP","c":1,"r":0,"k":"model"},
+  {"id":"e3","t":"Harm heads","c":2,"r":0},
+  {"id":"e4","t":"Weak interaction","s":"cheap, easy to train","c":3,"r":0,"k":"io"},
+  {"id":"l1","t":"Per-modality models","s":"text, image, video","c":0,"r":1,"k":"model"},
+  {"id":"l2","t":"Scores","s":"one per modality","c":1,"r":1,"k":"vec"},
+  {"id":"l3","t":"Combiner","s":"weights or small trees","c":2,"r":1},
+  {"id":"l4","t":"No interaction","s":"modular, handles gaps","c":3,"r":1,"k":"io"},
+  {"id":"j1","t":"Tokens + patches","s":"words and image regions","c":0,"r":2,"k":"data"},
+  {"id":"j2","t":"Cross-modal transformer","s":"ViLBERT-style attention","c":1,"r":2,"k":"model"},
+  {"id":"j3","t":"Harm heads","c":2,"r":2},
+  {"id":"j4","t":"Strong interaction","s":"costliest to run","c":3,"r":2,"k":"io"}],
+ "edges":[["e1","e2"],["e2","e3"],["e3","e4",{"d":1}],["l1","l2"],["l2","l3"],["l3","l4",{"d":1}],["j1","j2"],["j2","j3",{"hl":1}],["j3","j4",{"d":1}]]}
+</script>
+<p><b>Decision.</b> Start with joint fusion built on pretrained encoders, with the cross-modal interaction kept shallow (one light layer): a multilingual text encoder (XLM-R style, 100 languages), a vision encoder (CLIP-style), and one light cross-attention fusion layer. This keeps the encoders reusable, captures meme-style interactions, and degrades gracefully when a modality is missing. Meta has described the same direction publicly: a single whole-post model trained across content types, replacing dozens of single-purpose classifiers.</p>
+<script type="application/json" class="dg" data-cap="The chosen model: three input paths, one fusion layer, and an independent sigmoid head per harm class">
+{"type":"stack","cols":[
+ {"t":"Text path","layers":[{"t":"Caption, OCR, transcript","s":"normalized, language-tagged"},{"t":"Multilingual transformer","s":"XLM-R style"},{"t":"Text embedding","s":"768-d","k":"model"}]},
+ {"t":"Media path","layers":[{"t":"Image or video frames","s":"up to 16 frames"},{"t":"Vision encoder","s":"ViT or CLIP style"},{"t":"Media embedding","s":"768-d","k":"model"}]},
+ {"t":"Context path","layers":[{"t":"Author and context","s":"history, group, country"},{"t":"Embeddings + MLP"},{"t":"Context embedding","s":"128-d","k":"model"}]}],
+ "join":{"t":"Fusion + per-harm heads","s":"one sigmoid per class"}}
+</script>
+
+<h3>Training data construction</h3>
+<p>A training set is built per harm class from three pools plus a protected holdout. Positives are all reviewed violations. Hard negatives are benign posts that scored high or were reported and then cleared. Random negatives give the model the true variety of ordinary content. The holdout is a random slice of the live stream that is never trained on and keeps the true 0.1% prior for evaluation and calibration.</p>
+<script type="application/json" class="dg" data-cap="Training set construction for one day of data: counts are illustrative and the holdout keeps the true prior">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"pos","t":"Reviewed positives","s":"all kept, per harm class","c":0,"r":0,"k":"data"},
+  {"id":"hard","t":"Hard negatives","s":"news, satire, near-misses","c":1,"r":0,"k":"data"},
+  {"id":"rnd","t":"Random negatives","s":"1% of clean posts","c":2,"r":0,"k":"data"},
+  {"id":"strm","t":"Random stream sample","s":"no filtering at all","c":3,"r":0,"k":"io"},
+  {"id":"smp","t":"Sampler + weights","s":"balance class and language","c":1,"r":1},
+  {"id":"hold","t":"Unbiased holdout","s":"true prior, never trained on","c":3,"r":1,"k":"store"},
+  {"id":"trn","t":"Training set","s":"about 8% positive","c":1,"r":2,"k":"store"}],
+ "edges":[["pos","smp","100K"],["hard","smp","100K"],["rnd","smp","999K"],["smp","trn","keep weights"],["strm","hold"]]}
+</script>
+<p>With 100K positives, 100K hard negatives, and 999K random negatives the positive share is 100 / (100 + 100 + 999) &asymp; 8.3%.</p>
+
+<h3>Loss function</h3>
+<p>Each head is trained with binary cross-entropy, summed over classes, with a mask for classes whose label is unknown (a post reviewed only for nudity says nothing about spam). Because easy negatives dominate even after sampling, focal loss down-weights examples the model already gets right: FL = &minus;(1 &minus; p<sub>t</sub>)<sup>&gamma;</sup> log(p<sub>t</sub>), where p<sub>t</sub> is the probability assigned to the true label.</p>
+<div class="callout math"><p>With &gamma; = 2. An easy clean post scored 0.99 clean: cross-entropy is &minus;ln 0.99 = 0.0101 and the modulating factor is (1 &minus; 0.99)<sup>2</sup> = 0.0001, so focal loss is about 0.000001. A hard violation the model gives only 0.1: cross-entropy is &minus;ln 0.1 = 2.303 and the factor is 0.9<sup>2</sup> = 0.81, so focal loss is 1.865. The easy example's loss shrank 10,000-fold; the hard one barely changed, so gradients come from the mistakes.</p></div>
+<p>Focal loss and class weights distort probabilities, so the raw output is a ranking score, not a probability. That is why calibration is a separate step.</p>
+
+<h3>Calibration and thresholds</h3>
+<p>Thresholds are only meaningful if 0.95 means "about 95% of posts scored like this truly violate". Fit a calibrator (Platt scaling, a logistic curve on the score, or isotonic regression, a monotone step function) on the unbiased holdout, per harm class and per language group, and report expected calibration error. Calibrating on the down-sampled training data would be wrong.</p>
+<div class="callout math"><p>Down-sampling clean posts shifts the odds. If clean posts are kept at rate r, true odds = r &times; sampled odds. A model trained with r = 0.01 outputs 0.9 (sampled odds 9), so the true odds are 0.09 and the true probability is 0.09 / 1.09 &asymp; 0.083, not 0.9. At r = 0.1, the same 0.9 means true odds 0.9 and probability 0.9 / 1.9 &asymp; 0.47. A calibrator on the unbiased holdout absorbs this automatically.</p></div>
+<p>Pick thresholds from costs. Let W be the cost of wrongly removing a benign post, R the cost of one human review (which resolves the item), and E the cost of one missed violation staying up, all in the same arbitrary units.</p>
+<ul>
+<li><b>Remove automatically</b> when removing is cheaper than reviewing: (1 &minus; p) &times; W &lt; R, so p &gt; 1 &minus; R/W.</li>
+<li><b>Send to review</b> when reviewing is cheaper than leaving the post up: p &times; E &gt; R, so p &gt; R/E.</li>
+</ul>
+<div class="callout math"><p>Take R = 1, W = 20 (a wrongful removal costs twenty reviews), E = 2.5. Removal threshold: 1 &minus; 1/20 = 0.95. Review threshold: 1/2.5 = 0.40. These are the cut points used throughout this chapter. If W falls to 10, the removal threshold drops to 0.90; if reviewers become scarce and R doubles to 2, the review threshold rises to 0.80 and the removal threshold to 0.90 with W = 20.</p></div>
+
+<h3>Multilingual coverage and memes</h3>
+<p>A multilingual encoder lets high-resource languages lend strength to low-resource ones, but transfer is uneven. Slang, code-switching ("Hinglish" typed in Latin script), and dialect all shift the distribution. Practical levers: oversample low-resource positives, translate labeled posts into other languages as augmentation, calibrate and set thresholds per language group, and recruit native-language reviewers for the review queues. Meta reports that its consolidated cross-problem classifiers reached many markets in weeks rather than months.</p>
+<p>For memes, run OCR first and give the model both the extracted text and the pixels. OCR must survive stylized fonts, low contrast, and overlaid noise, so train it on augmented memes. The text becomes a normal text input, and the cross-attention layer decides whether the caption and the image combine into something harmful.</p>
+
+<h3>New harms and the learning loop</h3>
+<p>When a new harm appears (a viral conspiracy phrase, a fresh dangerous challenge), months of labeling is too slow. Few-shot approaches reformulate the task so the model reads a policy sentence plus a handful of examples. Meta's Few-Shot Learner uses entailment: a post is paired with a label description such as "this is hate speech" and the model decides whether the post entails it. The approach works with zero examples, under 50 demonstrations, or light fine-tuning, and Meta reports adaptation in weeks instead of months. Treat its outputs as review-band candidates until labels accumulate.</p>
+<p>Labeling effort is the scarcest resource, so spend it wisely with active learning: fill part of each queue with uncertain items (scores near the review threshold), part with diverse items (cluster-sampled so reviewers do not see 500 copies of one meme), and part with a random slice that keeps estimates unbiased.</p>
+<script type="application/json" class="dg" data-cap="The training data flywheel: review produces labels, labels produce a better model, and the better model changes what reviewers see next">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"prod","t":"Production model","s":"scores all posts","c":0,"r":0,"k":"model"},
+  {"id":"als","t":"Active-learning sampler","s":"uncertain, diverse, random","c":1,"r":0},
+  {"id":"hum","t":"Human review","s":"double-labeled where needed","c":2,"r":0,"k":"user"},
+  {"id":"ls","t":"Label store","s":"matured, deduped","c":3,"r":0,"k":"store"},
+  {"id":"rt","t":"Retrain + recalibrate","s":"fresh holdout for thresholds","c":3,"r":1,"k":"model"},
+  {"id":"sh","t":"Shadow + A/B test","s":"no user impact first","c":2,"r":1},
+  {"id":"ro","t":"Gradual rollout","s":"1%, 10%, 100%","c":1,"r":1}],
+ "edges":[["prod","als","scores"],["als","hum","items"],["hum","ls","labels"],["ls","rt","fresh labels"],["rt","sh"],["sh","ro"],["ro","prod",{"sa":"l","sb":"b","hl":1}]]}
+</script>
+
+<h2>Evaluation</h2>
+<h3>Offline metrics</h3>
+<p>Every threshold implies a confusion matrix, and the mix of its cells is what operations cares about. The table gives each candidate metric in the form to say in an interview: definition, a hand-checked example, flaw, and decision.</p>
+<table>
+<caption>Offline metrics</caption>
+<tr><th>Metric</th><th>Definition and example</th><th>Flaw</th><th>Decision</th></tr>
+<tr><td>Precision</td><td>Flagged posts that truly violate, divided by all flagged. 80 of 100 flagged violate: 0.80.</td><td>Ignores what was missed</td><td>Use at the removal threshold, per class</td></tr>
+<tr><td>Recall</td><td>True violations flagged, divided by all violations. 40 of 50 flagged: 0.80.</td><td>Trivially 1.0 if everything is flagged</td><td>Use, always next to precision</td></tr>
+<tr><td>F1</td><td>Harmonic mean of the two. P = 0.95, R = 0.40: 2&times;0.95&times;0.40 / 1.35 = 0.563.</td><td>Treats precision and recall as equal, which the policy does not</td><td>Do not use as the headline</td></tr>
+<tr><td>ROC-AUC</td><td>Chance that a random violating post outranks a random clean one. Plots recall against false positive rate.</td><td>False positive rate divides by 100M clean posts, so huge absolute error looks tiny (next callout)</td><td>Do not use as the headline</td></tr>
+<tr><td>PR-AUC (average precision)</td><td>Area under precision against recall; baseline equals prevalence (0.001 here).</td><td>Depends on prevalence, so not comparable across harm classes</td><td>Use for model selection per class</td></tr>
+<tr><td>Recall at precision 95%</td><td>Highest recall among thresholds whose precision is at least 0.95. From the table below: 0.55.</td><td>One point on the curve; noisy for rare classes</td><td>Use: it mirrors the removal policy</td></tr>
+<tr><td>Expected calibration error</td><td>Bin by score; average the gap between mean score and true rate, weighted by bin size. A bin with 10% of items, mean score 0.95, true rate 0.80 adds 0.10 &times; 0.15 = 0.015.</td><td>Hides errors that cancel across bins</td><td>Use with a reliability plot, per slice</td></tr>
+</table>
+<p>The precision-recall curve below is the main working view. The two marked points are the two actions.</p>
+<script type="application/json" class="dg" data-cap="Precision-recall curves (illustrative). Solid: multimodal model; dashed: text-only baseline. The marks are the removal and review operating points used in the text">
+{"type":"curve","xl":"Recall","yl":"Precision","ymin":0,"ymax":1,
+ "series":[
+  {"n":"Multimodal model","c":0,"lp":1,"pts":[[0,1],[0.2,0.995],[0.4,0.985],[0.55,0.965],[0.7,0.85],[0.8,0.65],[0.88,0.47],[0.93,0.22],[0.97,0.09],[1,0.02]]},
+  {"n":"Text-only baseline","c":1,"d":1,"pts":[[0,1],[0.2,0.98],[0.4,0.93],[0.55,0.82],[0.7,0.6],[0.8,0.38],[0.88,0.2],[0.93,0.1],[0.97,0.05],[1,0.015]]}],
+ "marks":[{"x":0.55,"y":0.965,"t":"auto-remove"},{"x":0.88,"y":0.47,"t":"review"}]}
+</script>
+<p>Now the numbers behind those points. Assume 100 million posts a day, 0.1% violating: 100,000 violations and 99,900,000 clean posts.</p>
+<table>
+<caption>Confusion counts per day at three thresholds (illustrative model)</caption>
+<tr><th>Threshold</th><th>TP</th><th>FN</th><th>FP</th><th>TN</th><th>Recall</th><th>FP rate</th><th>Precision</th></tr>
+<tr><td>0.95 (auto-remove)</td><td>55,000</td><td>45,000</td><td>2,000</td><td>99,898,000</td><td>0.55</td><td>0.002%</td><td>96.5%</td></tr>
+<tr><td>0.40 (review band starts)</td><td>88,000</td><td>12,000</td><td>100,000</td><td>99,800,000</td><td>0.88</td><td>0.100%</td><td>46.8%</td></tr>
+<tr><td>0.10 (very broad)</td><td>97,000</td><td>3,000</td><td>999,000</td><td>98,901,000</td><td>0.97</td><td>1.000%</td><td>8.9%</td></tr>
+</table>
+<script type="application/json" class="dg" data-cap="True positives, false positives, and false negatives per day at each threshold, in thousands (illustrative): lowering the threshold buys recall with an explosion of false positives">
+{"type":"bars","labels":["0.95 (remove)","0.40 (review)","0.10 (very broad)"],"series":[{"n":"TP (K)","v":[55,88,97]},{"n":"FP (K)","v":[2,100,999]},{"n":"FN (K)","v":[45,12,3]}],"fmt":null}
+</script>
+<div class="callout math"><p>Why ROC-AUC misleads. At threshold 0.10 the false positive rate is 1%, which looks excellent on a ROC plot with recall at 0.97. But 1% of 99.9M clean posts is 999,000 wrongly flagged posts against 97,000 real catches: precision = 97,000 / (97,000 + 999,000) = 97,000 / 1,096,000 &asymp; 8.9%. The area under the ROC curve is at least 0.97 &times; 0.99 = 0.960 from that one point alone, so ROC-AUC sits near 0.99 whether the model is good or mediocre. Precision-recall exposes the cost because precision divides by what was flagged, not by the huge clean population.</p></div>
+<script type="application/json" class="dg" data-cap="ROC-AUC barely separates the two models while PR-AUC separates them clearly (illustrative, approximated from the curves above)">
+{"type":"bars","labels":["ROC-AUC","PR-AUC (average precision)"],"series":[{"n":"Multimodal","v":[0.99,0.82]},{"n":"Text-only","v":[0.98,0.71]}],"max":1}
+</script>
+<div class="callout math"><p>PR-AUC by trapezoids over the multimodal curve: 0.1995 + 0.1980 + 0.1463 + 0.1361 + 0.0750 + 0.0448 + 0.0173 + 0.0062 + 0.0017 &asymp; 0.82. The text-only curve gives about 0.71. A 0.01 gap in ROC-AUC hides an eleven-point gap in average precision.</p></div>
+<p>Across the whole system, removal catches 55,000 violations and the review band (scores from 0.40 up to 0.95) contributes 33,000 more if reviewers act in time, so combined recall is 88,000 / 100,000 = 88%. The band holds 33,000 true violations and 98,000 clean posts, so 131,000 items a day, with in-band precision of 33,000 / 131,000 &asymp; 25%. That fits the 150,000-item capacity, and at an assumed 400 items per reviewer shift it needs about 330 shifts a day. About 2,000 posts a day are wrongly auto-removed; if 30% of those authors appeal (assumption), expect about 600 appeals a day.</p>
+<h4>Slices</h4>
+<p>A global metric hides the worst performance. Always slice by harm class, modality, language, country, and author group, and check that each slice has enough positives to be meaningful (a slice with 20 positives gives a precision interval of roughly plus or minus 20 points).</p>
+<script type="application/json" class="dg" data-cap="Recall at 95% precision by language (illustrative): the global number is dominated by high-resource languages while the long tail is far weaker">
+{"type":"bars","horiz":true,"labels":["English","Spanish","Hindi","Arabic","Swahili","Burmese"],"series":[{"n":"Recall at 95% precision","v":[0.71,0.66,0.55,0.52,0.34,0.25]}],"fmt":null,"max":1}
+</script>
+<div class="callout warn"><p>Evaluating on reviewer-surfaced data alone inflates every metric. Items were chosen because earlier systems or users already flagged them, so the evaluation set is easier than the real stream. Measure recall and prevalence on a random sample labeled independently of the model.</p></div>
+<h4>Fairness and explainability checks</h4>
+<p>Hate-speech models can penalize dialect: one study found tweets written in African American English up to two times more likely to be labeled offensive, partly because annotators were insensitive to dialect. Evaluate false positive rate across dialect and identity-term slices (including reclaimed terms and quoted slurs), use counterfactual augmentation that swaps identity terms, and prime annotators with dialect context. Report the false positive rate gap between slices as a guardrail.</p>
+
+<h3>Online metrics</h3>
+<p>The headline metric is prevalence: the share of all content views that were of violating content, estimated by labeling a random sample of views. It measures what people experienced after all enforcement, so it falls when removal is both accurate and early. Meta publishes it that way, uses stratified sampling to cut variance, has two reviewers label sampled items with a third as tiebreaker, and reports an upper bound when too few violations are found.</p>
+<script type="application/json" class="dg" data-cap="How prevalence is measured: it samples what users actually saw, independent of what the model thinks">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"np","t":"New posts","s":"100M a day","c":0,"r":0,"k":"io"},
+  {"id":"det","t":"Detection + removal","s":"first and second pass","c":1,"r":0,"k":"model"},
+  {"id":"vw","t":"Views of survivors","s":"what users really saw","c":2,"r":0,"k":"data"},
+  {"id":"sm","t":"Random sample of views","s":"stratified by surface","c":3,"r":0},
+  {"id":"dl","t":"Double labeling","s":"third reviewer breaks ties","c":3,"r":1,"k":"user"},
+  {"id":"ci","t":"Violating share + 95% CI","s":"weighted by stratum","c":2,"r":1},
+  {"id":"pv","t":"Prevalence trend","s":"or an upper bound if few hits","c":1,"r":1,"k":"io"}],
+ "edges":[["np","det"],["det","vw"],["vw","sm"],["sm","dl"],["dl","ci"],["ci","pv",{"hl":1}]]}
+</script>
+<div class="callout math"><p>Sample size. At prevalence p = 0.1% the 95% interval half-width is 1.96 &times; &radic;(p(1 &minus; p)/n). With n = 100,000 labeled views it is 1.96 &times; &radic;(0.000999 / 100,000) &asymp; 0.0196 percentage points, so 0.10% &plusmn; 0.02. To reach &plusmn; 0.01 points (10% relative) you need n = 1.96<sup>2</sup> &times; 0.000999 / 0.0001<sup>2</sup> &asymp; 384,000 labeled views. If zero violating views appear in n = 100,000, the 95% upper bound is about 3 / n = 0.003%.</p></div>
+<table>
+<caption>Online and guardrail metrics</caption>
+<tr><th>Metric</th><th>Definition</th><th>Role</th><th>Watch for</th></tr>
+<tr><td>Prevalence</td><td>Violating views divided by all views (sampled)</td><td>Primary</td><td>Wide intervals for rare harms; label noise biases the estimate</td></tr>
+<tr><td>Proactive rate</td><td>Removed items found before any user report, divided by all removed</td><td>Primary</td><td>Can rise by removing only easy items</td></tr>
+<tr><td>Views before action</td><td>Median views a violating post gets before removal or demotion</td><td>Primary</td><td>A better target than raw detection count</td></tr>
+<tr><td>Time to action</td><td>Post creation to removal, p50 and p95</td><td>Primary</td><td>Video and queue backlog drive the tail</td></tr>
+<tr><td>Appeal overturn rate</td><td>Appeals where the removal is reversed, divided by appeals</td><td>Guardrail</td><td>Proxy for false positives; biased because few authors appeal</td></tr>
+<tr><td>Queue yield</td><td>Share of review items upheld as violating (about 25% in the band above)</td><td>Efficiency</td><td>Falling yield means thresholds or model drifted</td></tr>
+<tr><td>Reviewer agreement</td><td>Cohen's kappa against senior and gold audits</td><td>Quality</td><td>Policy ambiguity vs reviewer fatigue</td></tr>
+<tr><td>Slice false positive rate</td><td>Wrong removals by language or dialect group</td><td>Guardrail</td><td>Fairness and trust</td></tr>
+<tr><td>Reviewer exposure</td><td>Minutes per reviewer per day on graphic queues</td><td>Guardrail</td><td>Wellbeing limits</td></tr>
+</table>
+<div class="callout warn"><p>A/B pitfalls. Content spreads between users, so randomizing viewers leaks the treatment (a post removed for the test group is still seen by the control group). Randomize by author or content cluster, or compare shadow-mode decisions against reviewer labels before enforcing. Never hold back protection for severe harms as a control. Prevalence needs very large samples, so run tests long enough, and expect adversaries to adapt a few weeks after any launch, which makes early gains look larger than they last.</p></div>
+
+<h2>Serving</h2>
+<h3>Architecture</h3>
+<p>Scoring is asynchronous and event-driven: nothing blocks the user's post. A cheap first pass handles everything, and a second pass fuses reactions as they appear.</p>
+<script type="application/json" class="dg" data-cap="Serving architecture: a first pass at post time, a second pass as reactions arrive, review queues, and an offline loop that feeds fresh models back in">
+{"type":"graph","cols":5,
+ "groups":[{"t":"Online: first pass at post time","c0":0,"c1":4,"r0":0,"r1":0},{"t":"Online: second pass and review","c0":1,"c1":4,"r0":1,"r1":1},{"t":"Offline: learning loop","c0":2,"c1":4,"r0":2,"r1":2}],
+ "nodes":[
+  {"id":"es","t":"Event stream","s":"posts + reactions","c":0,"r":0,"k":"store"},
+  {"id":"hf","t":"Hash + rule filter","s":"known-bad media, regex","c":1,"r":0},
+  {"id":"fp","t":"First-pass scorer","s":"distilled multimodal","c":2,"r":0,"k":"model"},
+  {"id":"pe","t":"Policy engine","s":"thresholds, country rules","c":3,"r":0},
+  {"id":"as","t":"Action service","s":"remove, demote, notify","c":4,"r":0},
+  {"id":"ra","t":"Reaction aggregator","s":"windowed, trust-weighted","c":1,"r":1},
+  {"id":"sp","t":"Second-pass scorer","s":"content + reactions","c":2,"r":1,"k":"model"},
+  {"id":"rq","t":"Review queues","s":"severity x reach","c":3,"r":1,"k":"store"},
+  {"id":"rv","t":"Reviewers","s":"language-matched","c":4,"r":1,"k":"user"},
+  {"id":"ls","t":"Label store","s":"decisions, appeals","c":4,"r":2,"k":"store"},
+  {"id":"tr","t":"Training + eval","s":"retrain, calibrate","c":3,"r":2},
+  {"id":"mr","t":"Model registry","s":"versions, thresholds","c":2,"r":2,"k":"store"}],
+ "edges":[["es","hf"],["hf","fp"],["fp","pe",{"hl":1}],["pe","as"],["es","ra"],["ra","sp"],["sp","pe","rescore"],["pe","rq","uncertain"],["rq","rv"],["rv","ls"],["ls","tr"],["tr","mr"],["mr","sp","deploy",{"d":1}]]}
+</script>
+<p>Step by step:</p>
+<ol>
+<li>A post event lands on the stream. A hash and rule filter catches known violating media (perceptual hashes such as PDQ) and obvious patterns in milliseconds, with no model.</li>
+<li>The first-pass scorer, a distilled multimodal model, writes per-class probabilities. Only posts above a low cascade threshold (assume 5%) go on to the heavier ensemble.</li>
+<li>The policy engine applies the ladder and country rules: remove, demote, enqueue for review, or allow. Removal triggers the user notice with the policy named.</li>
+<li>Reports, hides, and flagged replies stream into the aggregator, which weights reporters by trust. The second-pass scorer reruns on posts whose reaction counts cross a trigger and may escalate.</li>
+<li>Review decisions enter the label store, which feeds retraining, recalibration, and the next deployment.</li>
+</ol>
+<h3>Review queue prioritization</h3>
+<p>Reviewers are the bottleneck, so order the queue by expected harm, not by arrival time: P(violating) times severity of the harm times predicted reach (views the post will receive in the next hours).</p>
+<script type="application/json" class="dg" data-cap="Queue priority as the product of severity weight and reach weight (illustrative weights 0.3, 0.6, 1.0, rounded); this is then multiplied by P(violating)">
+{"type":"matrix","rl":"Severity","cl":"Predicted reach","rows":["Low severity","Medium severity","High severity"],"cols":["Low reach","Medium reach","High reach"],
+ "v":[[0.09,0.18,0.3],[0.18,0.36,0.6],[0.3,0.6,1.0]],"hl":[[2,2]]}
+</script>
+<p>Add a time-in-queue boost so low-priority items are not starved, and a hard ceiling for severe categories such as threats or self-harm, which jump the queue. If a queue overflows, items already demoted stay demoted and expire to a decision rule rather than being published unreviewed.</p>
+<h3>Latency and scale</h3>
+<p>Assumptions: 100 million posts a day is 100,000,000 / 86,400 &asymp; 1,157 posts per second on average and about 3,500 per second at 3x peak. Text appears on 90% of posts, 35% carry images, and 10% carry video. Throughput per GPU for small distilled models is 800 text items per second, 500 images per second, 200 OCR images per second, and 40 videos per second (8 frames plus audio).</p>
+<table>
+<caption>First-pass compute at peak (assumptions stated above)</caption>
+<tr><th>Stage</th><th>Share of posts</th><th>GPU ms per item</th><th>Items per second at peak</th><th>GPUs at 100% use</th></tr>
+<tr><td>Text encoder</td><td>90%</td><td>1.25</td><td>3,150</td><td>3.9</td></tr>
+<tr><td>Image encoder + OCR</td><td>35%</td><td>7 (2 + 5)</td><td>1,225</td><td>8.6</td></tr>
+<tr><td>Video (8 frames + ASR)</td><td>10%</td><td>25</td><td>350</td><td>8.75</td></tr>
+<tr><td><b>Total</b></td><td></td><td>about 6.1 per average post</td><td>3,500 posts</td><td><b>about 21</b></td></tr>
+</table>
+<p>At a 50% target utilization the first pass needs roughly 43 GPUs at peak, and the second pass is cheap: it triggers on about 5% of posts (175 per second) and reuses cached embeddings with a small model on CPU. Storage is small by comparison: one 768-dimension fp16 embedding is 1,536 bytes, so 100 million posts a day is about 154 GB, and 30 days of embeddings is about 4.6 TB.</p>
+<script type="application/json" class="dg" data-cap="GPU milliseconds per item by modality (assumptions from the throughput figures above): video costs twenty times a text post, so score sampled frames first">
+{"type":"bars","horiz":true,"labels":["Text only","Image encoder","Image + OCR","Video, 8 frames + ASR"],"series":[{"n":"GPU ms per item","v":[1.25,2,7,25]}],"fmt":null}
+</script>
+<p>Latency budget for a 30-second p95 target: event ingest and queueing under 2 seconds, media fetch and decode under 1 second, first-pass inference under 100 ms for text and images, policy engine and action write under 200 ms. Most of the 30 seconds is slack for queueing at peak and for long videos. A 10-minute video is scored on sampled frames first, with finer scans scheduled afterwards.</p>
+<h3>Failure modes, refresh, and monitoring</h3>
+<ul>
+<li><b>Scorer backlog or outage.</b> Publish with a reach cap for high-risk surfaces (new accounts, high-severity categories) until scored. Do not fail fully open or fully closed, and process the backlog by priority.</li>
+<li><b>Reviewer shortage.</b> Demotions stay in force, the queue is ordered by expected harm, and the review threshold rises temporarily with an alert.</li>
+<li><b>Bad model release.</b> Roll out by shadow, then 1%, 10%, 100% with automatic rollback on appeal overturn spikes or queue yield drops.</li>
+<li><b>Refresh cadence.</b> Hashes and rules in hours, thresholds and calibration daily on a fresh holdout, the model weekly or on drift, few-shot adapters in days for new harms.</li>
+<li><b>Monitoring.</b> Score distribution drift per class and language, calibration on the weekly random sample, precision of auto-removals via an audit re-review of about 1% of removals, queue age, time to action, and slice false positive rates.</li>
+</ul>
+<script type="application/json" class="dg" data-cap="The adversarial loop: attackers adapt, so detection, patching, retraining, and red-teaming run continuously">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"ev","t":"Evasion tactic appears","s":"leetspeak, crops, new meme","c":0,"r":0,"k":"io"},
+  {"id":"sp","t":"Spike in misses","s":"reports, reviewer finds","c":1,"r":0},
+  {"id":"tri","t":"Analyst triage","s":"confirm pattern, severity","c":2,"r":0,"k":"user"},
+  {"id":"pa","t":"Patch fast","s":"rules + hashes in hours","c":3,"r":0},
+  {"id":"co","t":"Collect + label variants","s":"cluster, double-label","c":3,"r":1,"k":"data"},
+  {"id":"rt","t":"Retrain + augment","s":"adversarial examples added","c":2,"r":1,"k":"model"},
+  {"id":"rd","t":"Red team","s":"tries to beat the new model","c":1,"r":1,"k":"user"},
+  {"id":"ad","t":"Attacker adapts","s":"next tactic","c":0,"r":1,"k":"io"}],
+ "edges":[["ev","sp"],["sp","tri"],["tri","pa"],["pa","co"],["co","rt"],["rt","rd"],["rd","ad"],["ad","ev",{"d":1,"hl":1}]]}
+</script>
+<h3>Challenges</h3>
+<table>
+<caption>Challenges and mitigations</caption>
+<tr><th>Challenge</th><th>Why it is hard</th><th>Mitigation</th></tr>
+<tr><td>Cold start: new accounts</td><td>No history, and spammers rotate accounts</td><td>Rely on content features, rate limits, and a stricter threshold for brand-new accounts</td></tr>
+<tr><td>Cold start: new harm</td><td>No labels, policy still being written</td><td>Few-shot and zero-shot scoring into review; fast label collection</td></tr>
+<tr><td>Speed</td><td>Views accrue in minutes</td><td>Async cascade, hash lookup first, priority queues, sampled video frames</td></tr>
+<tr><td>Brigading</td><td>Groups mass-report innocent posts to silence them</td><td>Weight reports by reporter trust, cluster correlated reporters, never auto-remove on report count alone</td></tr>
+<tr><td>Fairness</td><td>Dialect and identity terms trigger false positives</td><td>Slice evaluation, counterfactual augmentation, annotator priming, per-slice thresholds</td></tr>
+<tr><td>Privacy</td><td>Reviewers see sensitive content; logs hold personal data</td><td>Access controls, retention limits, purpose-limited features, no private-message scanning in this scope</td></tr>
+<tr><td>Reviewer wellbeing</td><td>Graphic content causes lasting harm</td><td>Blur and grayscale by default, exposure caps, rotation, counseling, model-first triage that spares humans clear cases</td></tr>
+</table>
+<h3>Appeals and user notice</h3>
+<p>Users get the policy category, an excerpt or region that triggered it, and a one-click appeal. Do not reveal thresholds or feature details, which gives attackers a map. A different reviewer handles each appeal. Overturns are the cleanest false-positive label available and flow back as hard negatives.</p>
+<script type="application/json" class="dg" data-cap="Appeals and feedback: each overturn is both a repaired decision and a new hard-negative training example">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"nt","t":"Author notified","s":"policy named, appeal link","c":0,"r":0,"k":"io"},
+  {"id":"ap","t":"Appeal submitted","s":"within the appeal window","c":1,"r":0,"k":"io"},
+  {"id":"rv","t":"Fresh reviewer","s":"not the original reviewer","c":2,"r":0,"k":"user"},
+  {"id":"dc","t":"Outcome","s":"uphold or overturn","c":3,"r":0},
+  {"id":"up","t":"Upheld","s":"final notice with reason","c":2,"r":1,"k":"io"},
+  {"id":"ov","t":"Overturned","s":"restore post, apologize","c":3,"r":1,"k":"io"},
+  {"id":"hn","t":"Hard-negative label","s":"added to training data","c":3,"r":2,"k":"store"},
+  {"id":"th","t":"Threshold review","s":"per class and language","c":2,"r":2}],
+ "edges":[["nt","ap"],["ap","rv"],["rv","dc"],["dc","up",{"sa":"b","sb":"t"}],["dc","ov"],["ov","hn","false positive"],["hn","th",{"hl":1}]]}
+</script>
+
+<h2>Other Talking Points</h2>
+<ul>
+<li>Adversarial evasion (character swaps, homoglyphs, text in images, cropped or mirrored video): normalize text, run OCR, use near-duplicate matching to known violators, and train on adversarial augmentations, because attackers adapt within weeks of any deployment.</li>
+<li>Graph and account-level signals: coordinated networks reveal themselves through shared posting patterns even when each post looks benign, so add a network detector next to the content model.</li>
+<li>Context-dependent policy: news reporting, satire, and condemnation use the same words as violations, so give the model author, group, and reply context and measure hard-negative slices separately.</li>
+<li>Explainability: show the policy category and the triggering region, because a vague "this violated our rules" drives appeals and distrust, but withhold thresholds to avoid teaching evasion.</li>
+<li>Privacy and reviewer wellbeing: minimize who sees raw content, blur by default, cap exposure, and keep model-first triage so the worst material reaches fewer humans.</li>
+<li>Calibration drift: every retrain shifts the score distribution, so refit calibrators and thresholds on a fresh holdout before each release or a threshold of 0.95 will silently mean something else.</li>
+<li>Policy versioning: keep policy text, label guidelines, model version, and thresholds linked, so you can reconstruct why a decision was made and re-label history when policy changes.</li>
+<li>Few-shot and LLM assistance: use them to bootstrap new harms and speed up labeling, but never as the sole basis of removal, because they are uncalibrated and expensive.</li>
+<li>Regional rules: laws differ by country, so the policy engine applies country overlays outside the model, which keeps one global model and avoids retraining per jurisdiction.</li>
+<li>Known illegal imagery: match perceptual hashes against curated databases with a legal reporting path, because exact policy compliance matters more than model accuracy for that category.</li>
+</ul>
+
+<h2 class="nonum">Check yourself</h2>
+<p class="qa-intro">Questions are tagged by the level they target. The first set checks Senior-level fundamentals and arithmetic; Staff and Principal questions probe trade-offs, operations, experimentation and organization. Try to answer aloud for two minutes before opening one.</p>
+<div class="qa-bar" data-qa></div>
+<details class="ans" data-lvl="sr"><summary>A colleague reports ROC-AUC 0.99 and says the model is ready. Prevalence is 0.1% and the system flags at a 1% false positive rate with 97% recall. What do you reply?</summary>For 100M posts a day there are 100,000 violations and 99.9M clean posts. A 1% false positive rate is 999,000 wrongly flagged posts, against 97,000 true catches, so precision is 97,000 / 1,096,000 &asymp; 8.9%. Over 90% of removals or review items would be wrong. Report PR-AUC and recall at 95% precision, and choose the threshold from the precision-recall curve, not from ROC.</details>
+<details class="ans" data-lvl="sr"><summary>Derive the auto-removal threshold when a wrongful removal is 20 times as costly as one human review. What happens if reviewers get twice as expensive?</summary>Removing is better than reviewing when (1 &minus; p) &times; W &lt; R, so p &gt; 1 &minus; R/W = 1 &minus; 1/20 = 0.95. If R doubles to 2 while W stays 20, the threshold is 1 &minus; 2/20 = 0.90, so more posts are removed automatically because review is dearer. The calibrated probability is what makes these thresholds meaningful, which is why calibration happens on an unbiased holdout.</details>
+<details class="ans" data-lvl="sr"><summary>You trained with 1% of clean posts and the model outputs 0.9 for a post. What is the true probability? What if you had kept 10%?</summary>True odds = keep rate &times; sampled odds. At 1%: sampled odds 9, true odds 0.09, probability 0.09 / 1.09 &asymp; 0.083. At 10%: true odds 0.9, probability 0.9 / 1.9 &asymp; 0.47. Either way the raw score is inflated. Fit a calibrator on a random holdout with the true prior and apply it before comparing to thresholds.</details>
+<details class="ans" data-lvl="st"><summary>A post gets 5,000 reports in ten minutes. Should it be removed automatically?</summary>No. Report volume can be an organized attack to silence a victim or a rival, and it is only a second-pass feature. Weight each report by the reporter's historical accuracy, look for correlated reporters (same group, new accounts), and check how the rate compares with views. Escalate the post to the review queue with a temporary demotion, and let a human decide. Auto-removal needs the model's calibrated score above 0.95 independent of report counts, or a trusted-reporter threshold that has itself been validated.</details>
+<details class="ans" data-lvl="st"><summary>Burmese has 300 labeled positives and recall at 95% precision of 0.25. What do you do?</summary>First confirm the slice is measured on enough data (300 positives gives a wide interval), then raise coverage in layers: oversample and translate positives from other languages, use multilingual pretraining and few-shot adaptation, hire native-language reviewers and focus active learning there, and calibrate and threshold the language separately. Until recall improves, route more Burmese content into review rather than raising the removal threshold, and report the gap openly in dashboards.</details>
+<details class="ans" data-lvl="sr"><summary>How many labeled views do you need to estimate prevalence of 0.1% to within plus or minus 0.01 percentage points?</summary>n = 1.96<sup>2</sup> &times; p(1 &minus; p) / d<sup>2</sup> = 3.8416 &times; 0.000999 / 0.0001<sup>2</sup> &asymp; 384,000 labeled views at 95% confidence. Stratified sampling that oversamples surfaces where violations are more likely reduces this, as does labeling in two stages, but the order of magnitude explains why prevalence needs an organized, funded sampling program rather than ad hoc labels.</details>
+<details class="ans" data-lvl="st"><summary>A new scam format spreads on Friday and your model has never seen it. Walk through the first 72 hours.</summary><p>Hours 0 to 6: detect and size the problem from report spikes and embedding-cluster anomalies, and get the policy team to define the violation precisely. Contain: add exact and near-duplicate hash matching, text patterns, and a nearest-neighbor lookup against a small seed set embedded with the frozen backbone, with conservative actions (demote and queue for review, not auto-remove). Hours 6 to 24: stand up labeling, sample the flagged content to estimate precision, and tune thresholds so the review queue is manageable.</p><p>Hours 24 to 72: train a lightweight head on the first one to two thousand labels using the frozen backbone, check calibration and recall on a fresh sample, and promote the temporary rules into the model. Give every temporary rule an expiry and an owner, and document the incident. Watch for over-removal of legitimate content (news reporting about the scam).</p><p class="probe"><b>Likely follow-ups:</b> How many labels do you need before a trained head beats the rules? &middot; How do you prevent the temporary rules from becoming permanent?</p><p class="signal"><b>What makes this Staff-level:</b> You sequence containment, measurement and learning, and you protect against over-enforcement while the model catches up.</p></details>
+<details class="ans" data-lvl="st"><summary>Adversaries change tactics weekly. How do you build robustness that outlasts whack-a-mole fixes?</summary><p>Combine data, model and process. Data: augment training with the known evasions (homoglyphs, spacing, text-in-image, crops, mirrors, filters) and add a stream of fresh labels from reviewers, appeals and honeypot accounts. Model: use signals that are hard to change, such as account behavior and network structure, alongside content, and ensemble different views so one evasion does not defeat all of them. Process: a red-team that attacks each release, and an "escaped violations" audit: sample content the system passed, have humans label it, and track the escape rate as a first-class metric.</p><p>Also avoid leaking decision boundaries: do not expose exact thresholds or scores to users, and delay or randomize some enforcement so attackers cannot probe cheaply. Robustness is measured by how quickly escape rate recovers after a new tactic, not by a static test set.</p><p class="probe"><b>Likely follow-ups:</b> How do you estimate the escape rate when positives are 0.1 percent of traffic? &middot; What does adversarial training cost you on clean data?</p><p class="signal"><b>What makes this Staff-level:</b> You measure what gets through, not just what you caught, and you attack the economics of evasion.</p></details>
+<details class="ans" data-lvl="pr"><summary>Two countries have conflicting legal standards for the same content. How do the architecture and the organization handle it?</summary><p>Separate perception from policy. One global model predicts calibrated probabilities for each harm class; a policy layer maps probabilities and context (country, surface, age of viewer) to actions with locale-specific thresholds and remedies (geo-restrict, label, remove globally). That layer is versioned, audited and owned jointly with legal and policy teams, so a law change is a configuration change, not a model retrain.</p><p>Evaluate per locale with locale-native reviewers and per-locale labeled sets, because language and context differ. Log every action with the rule version for appeals and regulator requests. Organizationally, define who can change which part: policy owns definitions, ML owns models and calibration, legal approves region rules, and an escalation path handles conflicts.</p><p class="probe"><b>Likely follow-ups:</b> What if a region requires removal within an hour? &middot; How do you keep the model consistent across regions while thresholds differ?</p><p class="signal"><b>What makes this Principal-level:</b> You decouple what changes quickly from what changes slowly and assign ownership of each.</p></details>
+<details class="ans" data-lvl="st"><summary>100 million posts a day, 0.1 percent violating, a review budget of 200,000 items a day. How do you decide what humans see?</summary><p>Rank the review queue by expected harm prevented per review, not by model score. Expected value of reviewing an item is roughly p times predicted reach times severity. Example: item A has p = 0.50 and 100 expected views (50 harm-views); item B has p = 0.05 and 10,000 expected views (500 harm-views). B is the better use of a reviewer even though its score is lower.</p><p>Then close the loop: auto-action above a high-confidence threshold, queue by value density between thresholds, and ignore the low-value remainder. Reserve a small random sample for unbiased measurement of precision and recall, since the queue is a biased sample. Recompute capacity-aware thresholds daily as volume and reviewer throughput change.</p><p class="probe"><b>Likely follow-ups:</b> How do you estimate predicted reach for a post that was just created? &middot; What does the random audit sample cost, and why do you still pay for it?</p><p class="signal"><b>What makes this Staff-level:</b> You optimize human attention as a scarce resource and keep an unbiased sample for measurement.</p></details>
+
+<h2 class="nonum">References</h2>
+<ol class="refs">
+<li>Meta AI. Harmful content can evolve quickly: Few-Shot Learner (2021). <a href="https://ai.meta.com/blog/harmful-content-can-evolve-quickly-our-new-ai-system-adapts-to-tackle-it/">ai.meta.com</a></li>
+<li>Meta AI. The shift to generalized AI to better identify violating content (WPIE, cross-problem classifiers, 2021). <a href="https://ai.meta.com/blog/the-shift-to-generalized-ai-to-better-identify-violating-content/">ai.meta.com</a></li>
+<li>Meta Transparency Center. Prevalence. <a href="https://transparency.meta.com/policies/improving/prevalence-metric/">transparency.meta.com</a></li>
+<li>Kiela et al. The Hateful Memes Challenge: Detecting Hate Speech in Multimodal Memes. arXiv:2005.04790. <a href="https://arxiv.org/abs/2005.04790">arxiv.org</a></li>
+<li>Conneau et al. Unsupervised Cross-lingual Representation Learning at Scale (XLM-R). arXiv:1911.02116. <a href="https://arxiv.org/abs/1911.02116">arxiv.org</a></li>
+<li>Lu et al. ViLBERT: Pretraining Task-Agnostic Visiolinguistic Representations. arXiv:1908.02265. <a href="https://arxiv.org/abs/1908.02265">arxiv.org</a></li>
+<li>Li et al. VisualBERT: A Simple and Performant Baseline for Vision and Language. arXiv:1908.03557. <a href="https://arxiv.org/abs/1908.03557">arxiv.org</a></li>
+<li>Radford et al. Learning Transferable Visual Models From Natural Language Supervision (CLIP). arXiv:2103.00020. <a href="https://arxiv.org/abs/2103.00020">arxiv.org</a></li>
+<li>Lin et al. Focal Loss for Dense Object Detection. arXiv:1708.02002. <a href="https://arxiv.org/abs/1708.02002">arxiv.org</a></li>
+<li>Guo et al. On Calibration of Modern Neural Networks. arXiv:1706.04599. <a href="https://arxiv.org/abs/1706.04599">arxiv.org</a></li>
+<li>Saito and Rehmsmeier. The Precision-Recall Plot Is More Informative than the ROC Plot When Evaluating Binary Classifiers on Imbalanced Datasets. PLoS ONE, 2015. <a href="https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0118432">journals.plos.org</a></li>
+<li>Wang et al. Entailment as Few-Shot Learner. arXiv:2104.14690. <a href="https://arxiv.org/abs/2104.14690">arxiv.org</a></li>
+<li>Sap et al. The Risk of Racial Bias in Hate Speech Detection. ACL 2019. <a href="https://aclanthology.org/P19-1163/">aclanthology.org</a></li>
+<li>Meta ThreatExchange. PDQ perceptual image hashing reference implementation. <a href="https://github.com/facebook/ThreatExchange/tree/main/pdq">github.com</a></li>
+</ol>
+</main></div>
+<script src="assets/dg.js"></script>
+<script src="assets/nav.js"></script>
+<script src="assets/qa.js"></script>
+</body>
+</html>

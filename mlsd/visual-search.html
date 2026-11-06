@@ -1,0 +1,593 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Visual Search System</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-slug="visual-search">
+<div class="topbar"><a href="index.html">&larr; ML System Design Study Guide</a><span style="color:var(--muted)">Chapter 2 of 11</span></div>
+<div class="layout"><aside class="toc" id="toc"></aside>
+<main>
+<div class="kicker">Chapter 2</div>
+<h1>Visual Search System</h1>
+<p class="lead">A user taps an image, or drags a box around part of one, and the product returns other images that look and feel similar: the same sneaker in a studio shot, a sofa with the same silhouette, a kitchen with the same mood. Pinterest Lens and Google Lens are the reference products. The hard parts are meaning (what counts as "similar" when only pixels are available) and scale (100 billion images, answered in a fraction of a second). The core idea is to learn an encoder that turns every image into a short vector, so that similar images sit close together, and then find the nearest vectors with approximate search.</p>
+
+<h2>Clarifying Requirements</h2>
+<p>Visual search sounds simple, so the interview is mostly about pinning down what "similar" means, how big the catalog is, and which signals exist. A candidate may open with the questions below; each answer removes a branch of the design space.</p>
+<div class="dlg">
+<div class="turn c"><span>Candidate</span><p>Is the query always an image, or can users also type words to refine it?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Images only. Text-to-image search is a different product with its own chapter.</p></div>
+<div class="turn c"><span>Candidate</span><p>Can the user select a region of the photo, and are the results images only or videos too?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Crops must work. Results are still images only.</p></div>
+<div class="turn c"><span>Candidate</span><p>What does "similar" mean for the business: the same object, the same style, or the same topic?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Mostly visual and semantic similarity. A crop of a sneaker should return sneakers that look like it first, then the same style of shoe, not every picture of a foot.</p></div>
+<div class="turn c"><span>Candidate</span><p>Should results depend on who is searching?</p></div>
+<div class="turn i"><span>Interviewer</span><p>No personalization. The same query image returns the same results for everyone.</p></div>
+<div class="turn c"><span>Candidate</span><p>May we use tags, captions, or the page an image came from?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Assume pixels only at query time. Metadata can exist offline, but the system must not need it.</p></div>
+<div class="turn c"><span>Candidate</span><p>How large is the catalog, how fast does it grow, and what latency do we need?</p></div>
+<div class="turn i"><span>Interviewer</span><p>About 100 billion images, growing by roughly 50 million per day. Results should feel instant: aim for a server-side p99 near 100 ms and well under 300 ms end to end.</p></div>
+<div class="turn c"><span>Candidate</span><p>What feedback do we log that could become training labels?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Impressions, clicks, and saves on search results, with the query image and crop box.</p></div>
+<div class="turn c"><span>Candidate</span><p>Do new images need to be searchable immediately, and how do we handle unsafe or duplicate images?</p></div>
+<div class="turn i"><span>Interviewer</span><p>New images should appear within a few hours. Unsafe images must never be returned, and the first page should not be full of near-duplicates. You can assume an existing moderation classifier.</p></div>
+<div class="turn c"><span>Candidate</span><p>Any constraints on hardware or on how the query photo may be used?</p></div>
+<div class="turn i"><span>Interviewer</span><p>A shared GPU and CPU fleet. Treat user query photos as private: do not keep them or train on them without consent.</p></div>
+</div>
+<div class="summary"><p>Build an image-to-image search system over a catalog of about 100 billion images. The input is one query image or a user-selected crop, and the output is a ranked list of visually and semantically similar images. There is no personalization and no metadata at query time, results must come back within roughly 100 ms server-side, and unsafe or near-duplicate results must be filtered.</p></div>
+
+<script type="application/json" class="dg" data-cap="The product flow: a crop box turns one tap into a search request, and the clicks on results become the training signal for the next model">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"a","t":"Browsing an image","s":"photo in a feed or camera roll","c":0,"r":0,"k":"img"},
+  {"id":"b","t":"Draws a crop box","s":"optional, drag handles","c":1,"r":0,"k":"user"},
+  {"id":"c","t":"Visual search API","s":"image bytes + box x, y, w, h","c":2,"r":0,"k":"svc"},
+  {"id":"d","t":"Results grid","s":"ranked, 50 per page","c":3,"r":0,"k":"io"},
+  {"id":"e","t":"Taps or saves a result","s":"implicit relevance feedback","c":3,"r":1,"k":"user"},
+  {"id":"f","t":"Interaction logs","s":"impressions, clicks, saves","c":2,"r":1,"k":"data"},
+  {"id":"g","t":"Training pair builder","s":"nightly batch job","c":1,"r":1,"k":"svc"}],
+ "edges":[["a","b"],["b","c","crop + image"],["c","d","top 50"],["d","e"],["e","f","click event"],["f","g","joined daily"]]}
+</script>
+
+<h2>Frame the Problem as an ML Task</h2>
+<h3>ML objective</h3>
+<p>The business goal is that a user finds an image they were hoping to find. The ML translation is: given a query image, retrieve the catalog images that are most visually and semantically similar, and order them so that the most similar come first. A candidate may consider four ways to turn that sentence into a trainable objective.</p>
+<table>
+<caption>Candidate objectives for "return similar images"</caption>
+<tr><th>Objective</th><th>Idea</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Predict tags, match on tags</td><td>Classify each image into thousands of labels; return images that share labels with the query</td><td>Simple, interpretable, reuses a classifier</td><td>Too coarse: two shoes with very different shape share the tag "shoe"; the label set can never cover every visual concept</td></tr>
+<tr><td>Near-duplicate hashing</td><td>Hash pixels so copies and light edits collide</td><td>Very cheap, great for dedupe</td><td>Cannot find "same kind of thing"; fails on a different photo of the same item</td></tr>
+<tr><td>Learn an embedding where distance means similarity</td><td>Train an encoder so that similar images map to nearby vectors and dissimilar images to distant vectors</td><td>Captures meaning, generalizes to images never seen in training, plugs into standard nearest neighbor search</td><td>Needs pairs or a contrastive recipe; "similar" must be defined by the training data</td></tr>
+<tr><td>Learn to rank with clicks</td><td>Train a model that scores (query, candidate) pairs directly from engagement</td><td>Optimizes the product metric</td><td>Cannot score 100 billion candidates per query; clicks are biased and sparse for new images</td></tr>
+</table>
+<div class="callout key"><p>Decision: learn an embedding function so that cosine similarity between two embeddings approximates how similar the images look and feel. Retrieval then becomes nearest neighbor search, and any extra scoring is a cheap re-ranking step on a few hundred candidates. This is the same two-stage pattern used by Pinterest and Bing visual search.</p></div>
+
+<h3>Input and output</h3>
+<p>The input is a pixel tensor: either a whole image or a crop. The output is an ordered list of catalog image IDs, each with a similarity score. Everything else (thumbnails, links, safety status) is attached after retrieval.</p>
+<script type="application/json" class="dg" data-cap="Input and output: a crop in, a ranked list with similarity scores out (illustrative scores)">
+{"type":"ranklist","ql":"Query crop","q":"red high-top sneaker","qs":"cropped from a street photo","items":[
+ {"t":"Same shoe, studio shot","s":"cosine similarity 0.94","v":0.94,"hl":1},
+ {"t":"Same shoe, worn outdoors","s":"cosine similarity 0.91","v":0.91},
+ {"t":"Same silhouette, other color","s":"cosine similarity 0.82","v":0.82},
+ {"t":"Different shoe, similar style","s":"cosine similarity 0.74","v":0.74}]}
+</script>
+
+<h3>ML category</h3>
+<p>This is representation learning followed by nearest neighbor retrieval. The model does not predict anything about a single image; it produces a vector, and the system compares vectors. Several model families could produce that vector.</p>
+<table>
+<caption>Model families for producing image vectors</caption>
+<tr><th>Family</th><th>How it works</th><th>Strength</th><th>Weakness</th></tr>
+<tr><td>Hand-crafted features (SIFT, color histograms)</td><td>Describe local gradients or color statistics, pool into a vector</td><td>No training, cheap</td><td>No semantics: two red objects of different type look identical</td></tr>
+<tr><td>Supervised classifier features</td><td>Train a classifier, use the penultimate layer as the vector</td><td>Easy to train with existing labels</td><td>Features only encode distinctions the labels needed; fine-grained similarity is lost</td></tr>
+<tr><td>Self-supervised contrastive learning</td><td>Pull two augmented views of one image together, push other images apart (SimCLR, MoCo)</td><td>No labels needed, scales to the whole catalog</td><td>Similarity means "same image under augmentation", not "same concept"</td></tr>
+<tr><td>Supervised contrastive / metric learning</td><td>Use labeled or engagement pairs as positives, same loss family</td><td>Controls what similar means</td><td>Needs pair data; noisy if built from clicks</td></tr>
+<tr><td>Vision-language models (CLIP style)</td><td>Align image and text embeddings with web-scale captions</td><td>Strong semantics, enables text queries later</td><td>Heavy, and the caption notion of similarity is not always the visual one</td></tr>
+</table>
+<div class="callout tip"><p>In an interview, name the family that matches the labels you actually have. Pixels-only with no curated labels points to contrastive learning, then fine-tuning with engagement pairs once the baseline works.</p></div>
+
+<p>Why not tags or hashes? The diagram shows the failure modes side by side: tags are too coarse, hashes are too literal, and an embedding sits between them.</p>
+<script type="application/json" class="dg" data-cap="Three ways to answer the same query: tags are too coarse, hashes only find copies, embeddings return look-alikes">
+{"type":"graph","cols":3,
+ "nodes":[
+  {"id":"q","t":"Query crop","s":"red high-top sneaker","c":0,"r":1,"k":"img"},
+  {"id":"t","t":"Tag matching","s":"predict labels, match labels","c":1,"r":0,"k":"svc"},
+  {"id":"h","t":"Perceptual hashing","s":"match near-duplicate pixels","c":1,"r":1,"k":"svc"},
+  {"id":"e","t":"Learned embedding","s":"match by meaning in vector space","c":1,"r":2,"k":"model"},
+  {"id":"tr","t":"Every shoe","s":"boots, sandals, heels: too coarse","c":2,"r":0,"k":"io"},
+  {"id":"hr","t":"Only copies","s":"misses other photos of the item","c":2,"r":1,"k":"io"},
+  {"id":"er","t":"Look-alikes first","s":"same item, then same style","c":2,"r":2,"k":"io"}],
+ "edges":[["q","t"],["q","h"],["q","e",{"hl":1}],["t","tr"],["h","hr"],["e","er",{"hl":1}]]}
+</script>
+<script type="application/json" class="dg" data-cap="Embedding space (2-D illustration of a 128-d space): the query lands in the sneaker cluster and its nearest neighbors, highlighted, are other sneakers">
+{"type":"embed","h":340,"seed":7,"nn":3,
+ "clusters":[{"n":"Sneakers","x":170,"y":190,"r":28,"k":9},{"n":"Boots","x":340,"y":225,"r":26,"k":8,"m":"s"},{"n":"Handbags","x":520,"y":130,"r":30,"k":8,"m":"t"},{"n":"Sofas","x":640,"y":245,"r":26,"k":8}],
+ "query":{"x":180,"y":195,"t":"sneaker crop"}}
+</script>
+
+<h2>Data Preparation</h2>
+<h3>Data engineering</h3>
+<p>Three datasets matter: the image catalog (what we index), the search interaction log (what users did), and the pair dataset derived from them (what we train on). The model sees pixels only, but the catalog keeps metadata for moderation, deduplication, and evaluation slicing.</p>
+<table>
+<caption>Image catalog (about 100 billion rows; thumbnails only are read by ML jobs)</caption>
+<tr><th>image_id</th><th>uploader_id</th><th>size (px)</th><th>phash</th><th>category (optional)</th><th>safety_flag</th><th>thumb_uri</th></tr>
+<tr><td>i_8841</td><td>u_120</td><td>1080x1350</td><td>a3f09c...</td><td>footwear</td><td>safe</td><td>blob://t256/8841</td></tr>
+<tr><td>i_8842</td><td>u_977</td><td>640x640</td><td>7be214...</td><td>home decor</td><td>safe</td><td>blob://t256/8842</td></tr>
+<tr><td>i_8843</td><td>u_120</td><td>3000x2000</td><td>c1d5e8...</td><td>unknown</td><td>review</td><td>blob://t256/8843</td></tr>
+</table>
+<p>Sizing, as assumptions: originals average 200 KB, so 100 billion originals take about 20 PB of blob storage. A 256-pixel thumbnail averages 15 KB, so the thumbnail store is about 1.5 PB. Embedding jobs read thumbnails, never originals; this is a large cost saver and also matches what the model will see at query time after resizing.</p>
+<table>
+<caption>Search interaction log (assume impressions sampled 1 in 10, clicks and saves kept in full)</caption>
+<tr><th>session_id</th><th>query_id</th><th>crop (x,y,w,h)</th><th>result_id</th><th>pos</th><th>action</th><th>ts</th></tr>
+<tr><td>s_41</td><td>i_8841</td><td>0.12,0.40,0.35,0.30</td><td>i_2210</td><td>1</td><td>click</td><td>10:02:11</td></tr>
+<tr><td>s_41</td><td>i_8841</td><td>0.12,0.40,0.35,0.30</td><td>i_9035</td><td>3</td><td>save</td><td>10:02:19</td></tr>
+<tr><td>s_77</td><td>i_8842</td><td>full</td><td>i_5120</td><td>2</td><td>impression</td><td>10:05:40</td></tr>
+</table>
+<p>At an assumed 5,000 average QPS and 50 results per page, full impression logging would be about 250,000 rows per second, or 21 billion rows per day, so sampling impressions is a practical necessity. After sampling the log is on the order of 2 billion rows per day, and a nightly job turns it into the pair dataset.</p>
+<table>
+<caption>Derived training pairs</caption>
+<tr><th>anchor_image</th><th>positive_image</th><th>source</th><th>weight</th></tr>
+<tr><td>i_8841 (crop)</td><td>i_9035</td><td>save after search</td><td>1.0</td></tr>
+<tr><td>i_2210</td><td>i_2210 (augmented)</td><td>self-supervised</td><td>1.0</td></tr>
+<tr><td>i_5120</td><td>i_5133</td><td>human-rated similar</td><td>1.0</td></tr>
+</table>
+
+<h3>Feature engineering</h3>
+<p>With pixels as the only input, feature engineering is preprocessing. The goal is that the exact same transformation runs in training, in batch embedding of the catalog, and in the online query path. A mismatch between these three is one of the most common causes of a silent quality drop.</p>
+<table>
+<caption>Features by entity and how they are encoded</caption>
+<tr><th>Entity</th><th>Feature</th><th>Encoding</th></tr>
+<tr><td>Catalog image</td><td>Pixels</td><td>Decode, convert to RGB, resize the shorter side then center crop to 224x224, scale to 0-1, normalize with per-channel mean and standard deviation</td></tr>
+<tr><td>Query image</td><td>Pixels (whole image)</td><td>Same as catalog image so the query and catalog share one distribution</td></tr>
+<tr><td>Query crop</td><td>Crop box in relative coordinates</td><td>Expand the box by about 10 percent for context, clamp to the image, crop, then resize to 224x224 (pad to square rather than squash to keep shape)</td></tr>
+<tr><td>Training view</td><td>Random augmentation parameters</td><td>Sampled per example: crop scale, flip, color jitter, blur, JPEG quality</td></tr>
+<tr><td>Catalog image (non-model)</td><td>Perceptual hash, uploader, safety flag</td><td>Stored beside the vector; used only in re-ranking, never fed to the encoder</td></tr>
+</table>
+<script type="application/json" class="dg" data-cap="Input pipelines: random views during training, deterministic and gated crops while serving; both end in the same 224x224 tensor">
+{"type":"graph","cols":5,
+ "groups":[{"t":"Training: random views","c0":0,"c1":4,"r0":0,"r1":0},{"t":"Serving: deterministic","c0":0,"c1":4,"r0":1,"r1":1}],
+ "nodes":[
+  {"id":"a","t":"Catalog thumbnail","s":"256 px","c":0,"r":0,"k":"img"},
+  {"id":"b","t":"Random resized crop","s":"scale 0.2 to 1.0, aspect 3:4 to 4:3","c":1,"r":0,"k":"svc"},
+  {"id":"c","t":"Flip + mild color jitter","s":"random per view","c":2,"r":0,"k":"svc"},
+  {"id":"d","t":"Resize + normalize","s":"224x224, mean/std per channel","c":3,"r":0,"k":"svc"},
+  {"id":"e","t":"Tensor 3x224x224","c":4,"r":0,"k":"io"},
+  {"id":"f","t":"User crop box","s":"x, y, w, h from the client","c":0,"r":1,"k":"user"},
+  {"id":"g","t":"Crop with margin","s":"grow box ~10%, clamp to image","c":1,"r":1,"k":"svc"},
+  {"id":"h","t":"Quality gate","s":"flag crops under ~64 px","c":2,"r":1,"k":"svc"},
+  {"id":"i","t":"Resize + normalize","s":"same code as training","c":3,"r":1,"k":"svc"},
+  {"id":"j","t":"Tensor 3x224x224","c":4,"r":1,"k":"io"}],
+ "edges":[["a","b"],["b","c"],["c","d"],["d","e"],["f","g"],["g","h"],["h","i"],["i","j"]]}
+</script>
+<p>Crop handling deserves explicit discussion. A user crop is a small object cut out of a larger scene, and the catalog image that matches may show that object at a different scale in a different scene. Two choices follow. First, training uses random resized crops with a wide scale range (about 0.2 to 1.0 of the image area) so the encoder learns that a crop and its parent image are positives and that small objects still carry identity. Second, the product can use a quality gate: a crop of fewer than about 64 pixels is mostly interpolation noise, so the client should ask the user to select a bigger region instead of silently returning poor results.</p>
+<table>
+<caption>Augmentation choices for training views</caption>
+<tr><th>Augmentation</th><th>Why it helps</th><th>Risk</th><th>Decision</th></tr>
+<tr><td>Random resized crop</td><td>Teaches crop-to-image and scale invariance, the dominant signal for this product</td><td>Very small crops can lose the object entirely and create false positives</td><td>Use; clamp the minimum scale around 0.2</td></tr>
+<tr><td>Horizontal flip</td><td>Free viewpoint variation</td><td>Breaks text and asymmetric products, but rarely matters for similarity</td><td>Use</td></tr>
+<tr><td>Color jitter</td><td>Robustness to lighting and filters</td><td>Strong jitter makes "red shoe" and "blue shoe" a positive pair</td><td>Use mild; color is part of similarity here</td></tr>
+<tr><td>Grayscale, strong blur</td><td>Stronger self-supervised signal in research recipes</td><td>Discards cues users care about</td><td>Rare, low probability</td></tr>
+<tr><td>JPEG compression, downscale then upscale</td><td>Matches the real mix of user uploads and screenshots</td><td>None significant</td><td>Use</td></tr>
+<tr><td>Random erasing</td><td>Robust to occlusion by watermarks and hands</td><td>Can hide the object</td><td>Use with small patches</td></tr>
+</table>
+
+<h3>Labels</h3>
+<p>There is no ground truth that says two images are similar. Three sources can create positive pairs, and each has a different noise profile.</p>
+<table>
+<caption>Where positive pairs can come from</caption>
+<tr><th>Source</th><th>How it works</th><th>Scale</th><th>Noise and bias</th></tr>
+<tr><td>Self-supervised augmentation</td><td>Two random views of one image are a positive pair; other images in the batch are negatives</td><td>Unlimited, covers the full catalog</td><td>Labels are exact but narrow: it learns "same image", not "same style" or "same category"</td></tr>
+<tr><td>Engagement signals</td><td>A saved or clicked result for a query becomes a positive; sessions where two images are saved together also help</td><td>Billions of pairs per month</td><td>Position bias, popularity bias, accidental clicks, and a feedback loop with the current model</td></tr>
+<tr><td>Human judgments or taxonomy labels</td><td>Raters grade pairs, or images share a curated category or product</td><td>Thousands to millions</td><td>Accurate but expensive, slow to refresh, and limited to the categories raters cover</td></tr>
+</table>
+<div class="callout key"><p>Decision: combine all three, in stages. Self-supervised pairs pretrain the encoder on the whole catalog, filtered engagement pairs fine-tune what "similar" means to users, and human judgments are used mainly for evaluation, plus a small amount of high-quality fine-tuning. This mirrors the published Pinterest approach of mixing engagement and human-labeled data.</p></div>
+<p>Handling the usual problems:</p>
+<ul>
+<li><b>Imbalance.</b> Head categories (fashion, food, home decor) dominate. Sample pairs with category-balanced weights, or cap the number of pairs per anchor image.</li>
+<li><b>Noise.</b> Keep only strong actions (saves, long dwell, clicks on the first three positions or clicks that are not immediately reversed), and drop pairs whose current-model similarity is extremely low.</li>
+<li><b>Delay.</b> Engagement arrives hours later, so training reads a snapshot that is at least one day old. This is acceptable because visual similarity changes slowly.</li>
+<li><b>Bias.</b> Higher positions get more clicks regardless of relevance. Weight clicks by inverse position propensity, or mix in random-position exploration traffic to estimate it. Without this, the model learns to reproduce its own ranking.</li>
+<li><b>False negatives.</b> In-batch negatives sometimes show the same item or a near-duplicate. Deduplicate the catalog by hash before sampling batches.</li>
+</ul>
+
+<h2>Model Development</h2>
+<h3>Model selection</h3>
+<p>The encoder needs to be accurate and also cheap enough to run on every query and every uploaded image. The architectural choice is mostly between a convolutional network and a vision transformer.</p>
+<table>
+<caption>Backbone options (parameter and compute figures are for 224x224 inputs)</caption>
+<tr><th>Backbone</th><th>Size</th><th>Compute per image</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>ResNet-50</td><td>about 26M params</td><td>about 4 GFLOPs</td><td>Fast, mature, strong pretrained weights, easy to quantize</td><td>Lower ceiling than large transformers on semantic similarity</td></tr>
+<tr><td>ViT-S/16</td><td>about 22M params</td><td>about 4.6 GFLOPs</td><td>Similar cost to ResNet-50, strong with self-supervised pretraining</td><td>Needs more data or good pretraining</td></tr>
+<tr><td>ViT-B/16</td><td>about 86M params</td><td>about 17.5 GFLOPs</td><td>Best accuracy among these when data is plentiful</td><td>Roughly 4x the serving cost of ResNet-50; re-embedding 100B images becomes expensive</td></tr>
+</table>
+<div class="callout tip"><p>Decision: start from a pretrained ResNet-50 or ViT-S as the backbone, add a linear embedding head of 128 dimensions with L2 normalization, and make the model size a budget decision rather than a quality race. Every extra GFLOP is paid once per query and once per catalog image on every model upgrade.</p></div>
+<p>Do not train from scratch. A backbone pretrained on a large public image corpus already knows edges, textures, and objects; fine-tuning with the catalog and engagement pairs adapts it to the product. Fine-tuning needs far fewer steps and less data than training from scratch, and the pretrained weights are a safe baseline if the new recipe underperforms.</p>
+<script type="application/json" class="dg" data-cap="One backbone, two uses: the training stack ends in a contrastive loss, the serving stack ends in a unit-length 128-d vector">
+{"type":"stack","cols":[
+ {"t":"Training","layers":[
+  {"t":"Augmented view","s":"3x224x224 tensor"},
+  {"t":"Backbone","s":"pretrained ResNet-50 or ViT-S","k":"model"},
+  {"t":"Global pooling","s":"2048-d or 384-d feature"},
+  {"t":"Embedding head","s":"linear to 128-d, L2 normalize","k":"model"},
+  {"t":"Contrastive loss","s":"InfoNCE with temperature"}]},
+ {"t":"Serving","layers":[
+  {"t":"Image or crop","s":"3x224x224 tensor"},
+  {"t":"Backbone","s":"same weights, fp16","k":"model"},
+  {"t":"Global pooling","s":"same as training"},
+  {"t":"Embedding head","s":"same weights","k":"model"},
+  {"t":"128-d embedding","s":"unit length, indexed","k":"vec"}]}]}
+</script>
+
+<h3>Embedding dimension</h3>
+<p>The embedding dimension trades quality against storage, memory bandwidth, and search time. Distance cost is linear in the dimension, and index size is the number of images times the bytes per vector.</p>
+<table>
+<caption>Embedding dimension trade-off (storage if all 100B vectors were stored as float32)</caption>
+<tr><th>Dimension</th><th>Bytes per vector (float32)</th><th>Total for 100B images</th><th>Typical effect</th></tr>
+<tr><td>64</td><td>256</td><td>25.6 TB</td><td>Noticeable quality loss on fine-grained similarity</td></tr>
+<tr><td>128</td><td>512</td><td>51.2 TB</td><td>Good balance; common for web-scale systems</td></tr>
+<tr><td>256</td><td>1,024</td><td>102.4 TB</td><td>Small gains, double the cost</td></tr>
+<tr><td>512</td><td>2,048</td><td>204.8 TB</td><td>Marginal gains; search time and memory dominate</td></tr>
+<tr><td>1,024</td><td>4,096</td><td>409.6 TB</td><td>Only for small catalogs or a re-rank stage</td></tr>
+</table>
+<p>Decision: 128 dimensions for the first stage, because compression (covered under Serving) can shrink it by 30x or more, but only if the dimension is small to begin with. A longer vector, for example 512-d, can still be kept in the full-precision store for exact re-scoring.</p>
+
+<h3>Training data construction and loss</h3>
+<p>Each training example is built from an anchor image, one positive, and many negatives. In self-supervised mode the positive is a second random view of the same image. In fine-tuning mode the positive is an engagement or curated partner. Negatives are the other images in the batch, plus mined hard negatives.</p>
+<script type="application/json" class="dg" data-cap="A contrastive training example: views of the same image are positives, every other image is a negative, and mined look-alikes make the task harder">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"q","t":"Anchor view","s":"random crop of image A","c":0,"r":0,"k":"img"},
+  {"id":"p","t":"Positive view","s":"another view of A, or its partner","c":0,"r":1,"k":"img"},
+  {"id":"n","t":"In-batch negatives","s":"views of other images","c":0,"r":2,"k":"img"},
+  {"id":"enc","t":"Shared encoder","s":"identical weights for all views","c":1,"r":1,"k":"model"},
+  {"id":"v","t":"Embeddings","s":"128-d, unit length","c":2,"r":1,"k":"vec"},
+  {"id":"hn","t":"Hard-negative bank","s":"look-alikes mined from the index","c":2,"r":2,"k":"store"},
+  {"id":"l","t":"InfoNCE loss","s":"pull positives, push negatives","c":3,"r":1,"k":"svc"}],
+ "edges":[["q","enc"],["p","enc"],["n","enc"],["enc","v"],["v","l","similarities"],["hn","l","extra negatives",{"d":1}]]}
+</script>
+<p>The loss is InfoNCE, a softmax cross-entropy over similarities. For an anchor <code>z</code>, one positive <code>z+</code>, and negatives <code>z-</code>, in words: take the similarity to the positive divided by the temperature, take the same for every candidate (positive and negatives), and train so that the positive gets as large a share of the softmax as possible. The loss for one anchor is minus the log of that share.</p>
+<p>If you stack the batch of anchor views against the batch of positive views, you get a square similarity matrix. Training pushes the diagonal (true pairs) up and everything else down. The off-diagonal cell between images 2 and 3 below is the hard case: two different but similar-looking items.</p>
+<script type="application/json" class="dg" data-cap="Similarity matrix for a batch of 4 images (illustrative values): the diagonal holds true pairs, and the 0.6 cells are look-alike negatives that the loss must push below the diagonal">
+{"type":"matrix","rl":"View A","cl":"View B","rows":["img 1","img 2","img 3","img 4"],"cols":["img 1","img 2","img 3","img 4"],
+ "v":[[0.9,0.2,0.1,0.1],[0.2,0.8,0.6,0.1],[0.1,0.6,0.8,0.2],[0.1,0.1,0.2,0.9]],"hl":"diag"}
+</script>
+<div class="callout math"><p>Worked example of the temperature. One anchor has a positive similarity of 0.80, a hard negative at 0.70 and an easy negative at 0.10. With temperature 1.0 the logits are 0.8, 0.7, 0.1, so exp gives 2.2255, 2.0138, 1.1052 (sum 5.3445); the positive's share is 0.416 and the loss is -ln(0.416) = 0.876. With temperature 0.1 the logits are 8, 7, 1, so exp gives 2980.96, 1096.63, 2.72 (sum 4080.31); the positive's share is 0.731 and the loss is 0.314. Lower temperature sharpens the softmax, so the hard negative dominates the penalty.</p></div>
+<script type="application/json" class="dg" data-cap="Same example at four temperatures: the share of the negative-side gradient that lands on the hard negative rises from about 65 percent to over 99 percent as temperature falls">
+{"type":"bars","labels":["temperature 1.0","temperature 0.5","temperature 0.2","temperature 0.1"],"series":[{"n":"Hard-negative share of push (%)","v":[64.6,76.9,95.3,99.7]}],"max":110}
+</script>
+<p>The gradient on each negative is proportional to its softmax probability divided by the temperature, so the share of the negative push held by the hard negative is its probability divided by the sum of all negative probabilities. The chart is that quantity for the example above: 2.0138 / (2.0138 + 1.1052) = 0.646 at temperature 1.0, and 1096.63 / (1096.63 + 2.72) = 0.998 at temperature 0.1.</p>
+<div class="callout warn"><p>A temperature that is too low is not free. The loss concentrates on the single nearest negative, and when that negative is really a near-duplicate labeled as a negative (a false negative), the model is pushed to separate images that humans would call the same. Typical values lie between 0.05 and 0.2; tune on the golden set and treat temperature as a hyperparameter that interacts with batch size and with how clean the negatives are.</p></div>
+
+<h3>Negatives: in-batch, memory queue, hard</h3>
+<p>The number and quality of negatives control embedding quality, so the candidate should compare three sources.</p>
+<ul>
+<li><b>In-batch negatives.</b> Every other image in the batch is a negative, for free. Quality improves with batch size (SimCLR uses thousands), but memory limits it.</li>
+<li><b>Memory queue.</b> MoCo keeps a queue of embeddings from earlier batches produced by a slowly updated momentum encoder, decoupling the number of negatives from the batch size.</li>
+<li><b>Hard negatives.</b> Images that the current model places near the anchor but that are not positives. After a first model exists, mine them by searching the index with training anchors and taking ranks 20 to 200, skipping the closest ones to reduce false negatives. Distance-weighted sampling works better than always taking the single hardest example, which tends to destabilize training.</li>
+</ul>
+<script type="application/json" class="dg" data-cap="The geometry of hard negatives (illustrative): look-alikes sit just outside the positives, while unrelated images are already far away and teach little">
+{"type":"embed","h":300,"seed":21,"nn":3,
+ "clusters":[{"n":"Same item (positives)","x":140,"y":170,"r":22,"k":7},{"n":"Look-alikes (hard negatives)","x":330,"y":180,"r":24,"k":8,"m":"s"},{"n":"Unrelated (easy negatives)","x":610,"y":210,"r":30,"k":8,"m":"t"}],
+ "query":{"x":215,"y":175,"t":"anchor"}}
+</script>
+<div class="callout tip"><p>Hard negatives are where most of the quality gain comes from after the first working model, and also where most of the training instability comes from. Say both. A defensible plan is: warm up with in-batch negatives only, add mined hard negatives in a later epoch, and watch the golden-set metric after each change.</p></div>
+
+<h3>Training pipeline</h3>
+<script type="application/json" class="dg" data-cap="Training pipeline: pretrain, adapt to the catalog, fine-tune on pairs, and promote only models that pass the golden-set gates">
+{"type":"graph","cols":5,
+ "groups":[{"t":"Training pipeline","c0":0,"c1":4,"r0":0,"r1":0},{"t":"Data sources","c0":1,"c1":3,"r0":1,"r1":1}],
+ "nodes":[
+  {"id":"a","t":"Pretrained backbone","s":"public or in-house weights","c":0,"r":0,"k":"model"},
+  {"id":"b","t":"Self-supervised stage","s":"augmentation pairs, catalog-wide","c":1,"r":0,"k":"svc"},
+  {"id":"c","t":"Pair fine-tuning","s":"engagement + curated + hard neg.","c":2,"r":0,"k":"svc"},
+  {"id":"d","t":"Offline evaluation","s":"nDCG, MRR, recall on golden set","c":3,"r":0,"k":"svc"},
+  {"id":"e","t":"Model registry","s":"versioned, signed off","c":4,"r":0,"k":"store"},
+  {"id":"f","t":"Catalog thumbnails","s":"deduplicated sample","c":1,"r":1,"k":"data"},
+  {"id":"g","t":"Filtered click pairs","s":"saves, de-biased","c":2,"r":1,"k":"data"},
+  {"id":"h","t":"Golden eval set","s":"human-graded, frozen","c":3,"r":1,"k":"data"}],
+ "edges":[["a","b","init"],["b","c","checkpoint"],["c","d"],["d","e","if gates pass"],["f","b"],["g","c"],["h","d"]]}
+</script>
+<p>Two operational points. First, every stage logs the embedding dimension, preprocessing version, and temperature, because the index and the query encoder must be built from exactly the same model version. Second, retraining is a heavy event for this system: a new model means re-embedding 100 billion images, so releases are batched and gated rather than daily.</p>
+
+<h2>Evaluation</h2>
+<h3>Offline metrics</h3>
+<p>An offline evaluation needs a labeled set: queries (images or crops) with graded relevance judgments for a pool of candidates. The next section describes how to build it. Given such judgments, a candidate can pick from several ranking metrics. Each is defined once below in plain words.</p>
+<table>
+<caption>Offline ranking metrics</caption>
+<tr><th>Metric</th><th>Definition in words</th><th>Hand-checked example</th><th>Flaw</th><th>Decision</th></tr>
+<tr><td>Precision@k</td><td>Fraction of the top k results that are relevant</td><td>Top 5 judged [1,0,1,1,0] gives 3/5 = 0.60</td><td>Ignores order and relevance degree; a hit at rank 1 equals a hit at rank 5</td><td>Report as a sanity check</td></tr>
+<tr><td>Recall@k (against judgments)</td><td>Relevant results found in the top k divided by all relevant results for the query</td><td>3 found, 4 relevant in total gives 0.75</td><td>Needs the full relevant set, which is unknown for a 100B catalog</td><td>Use only on the pooled golden set, and for ANN recall below</td></tr>
+<tr><td>mAP</td><td>For each query, average the precision at every rank where a relevant item appears, then average over queries</td><td>Matrix example below gives 0.539</td><td>Binary relevance only; hard to interpret for graded judgments</td><td>Report as a secondary metric</td></tr>
+<tr><td>MRR</td><td>Average over queries of 1 divided by the rank of the first relevant result</td><td>Ranks 1, 3, 2 give (1 + 1/3 + 1/2)/3 = 0.611</td><td>Looks only at the first hit; blind to how good the rest of the page is</td><td>Use for "find the exact item" slices (shop-the-look, dedupe)</td></tr>
+<tr><td>nDCG@k</td><td>Gain of each result (relevance) discounted by log of its rank, summed, divided by the same sum for the ideal order</td><td>Relevances [3,2,3,0,1] give 6.149 / 6.323 = 0.972</td><td>Needs graded labels; sensitive to how grades are defined</td><td>Primary offline metric</td></tr>
+<tr><td>ANN recall@k</td><td>Overlap between ANN results and exact search results for the same embedding</td><td>9 of the exact top 10 returned gives 0.90</td><td>Measures only the index, not model quality</td><td>Use as an index-health gate, not a model metric</td></tr>
+</table>
+<p>Worked example for nDCG. The gain at rank <code>i</code> is the relevance divided by log2(i + 1). With relevance grades [3, 2, 3, 0, 1], the gains are 3.000, 1.262, 1.500, 0, 0.387, so DCG = 6.149. The ideal order is [3, 3, 2, 1, 0], with gains 3.000, 1.893, 1.000, 0.431, 0, so IDCG = 6.323. nDCG@5 = 6.149 / 6.323 = 0.972. Putting a grade-2 result above a grade-3 result cost only a little, because both are near the top.</p>
+<script type="application/json" class="dg" data-cap="nDCG@5 worked example: gain per rank for the actual ranking versus the ideal ranking; the two sums are 6.149 and 6.323">
+{"type":"bars","labels":["Rank 1","Rank 2","Rank 3","Rank 4","Rank 5"],"series":[{"n":"Actual order","v":[3,1.26,1.5,0,0.39]},{"n":"Ideal order","v":[3,1.89,1,0.43,0]}]}
+</script>
+<p>For MRR and mAP, the matrix below holds binary judgments for three queries. Dark cells with an outline are the first relevant result.</p>
+<script type="application/json" class="dg" data-cap="Binary relevance of the top 5 results for three queries (1 means relevant); outlined cells mark the first relevant result used by MRR">
+{"type":"matrix","rl":"Queries","cl":"Result rank","rows":["q1","q2","q3"],"cols":["1","2","3","4","5"],
+ "v":[[1,0,0,1,0],[0,0,1,0,1],[0,1,0,0,0]],"hl":[[0,0],[1,2],[2,1]]}
+</script>
+<div class="callout math"><p>From the matrix. MRR: first relevant ranks are 1, 3, 2, so (1 + 0.333 + 0.5) / 3 = 0.611. mAP: q1 has hits at ranks 1 and 4, so AP = (1/1 + 2/4) / 2 = 0.750; q2 has hits at ranks 3 and 5, so AP = (1/3 + 2/5) / 2 = 0.367; q3 has one hit at rank 2, so AP = (1/2) / 1 = 0.500. mAP = (0.750 + 0.367 + 0.500) / 3 = 0.539. This assumes the only relevant items are the ones shown.</p></div>
+<p>Model comparisons are easiest to read as an ablation. The numbers below are illustrative, but the pattern is typical: the biggest early jump comes from adapting to the catalog and to engagement pairs, with a smaller but real jump from hard negatives.</p>
+<script type="application/json" class="dg" data-cap="Offline ablation on the golden set (illustrative): each training stage lifts both the ranking metric and recall">
+{"type":"bars","labels":["Pretrained only","+ self-supervised on catalog","+ click and curated pairs","+ hard negatives"],"series":[{"n":"nDCG@10","v":[0.58,0.64,0.72,0.76]},{"n":"Recall@100","v":[0.71,0.78,0.86,0.90]}],"max":1}
+</script>
+
+<h3>Building the evaluation set</h3>
+<p>An evaluation set for visual search cannot be a random sample of image pairs, because almost every random pair is irrelevant. Build it from queries and a pooled set of candidates.</p>
+<script type="application/json" class="dg" data-cap="Golden set construction: stratified queries, pooled candidates from several systems, graded by human raters, then frozen">
+{"type":"graph","cols":5,
+ "nodes":[
+  {"id":"a","t":"Query sampler","s":"stratified by category and crop type","c":0,"r":0,"k":"svc"},
+  {"id":"b","t":"Candidate pooling","s":"union of top 50 from 3 systems","c":1,"r":0,"k":"svc"},
+  {"id":"c","t":"Human raters","s":"grade 0 to 3, 3 raters per pair","c":2,"r":0,"k":"user"},
+  {"id":"d","t":"Adjudication","s":"majority vote, audit sample","c":3,"r":0,"k":"svc"},
+  {"id":"e","t":"Golden set","s":"frozen, versioned, sliced","c":4,"r":0,"k":"store"},
+  {"id":"f","t":"Production queries","s":"crops, screenshots, camera photos","c":0,"r":1,"k":"data"},
+  {"id":"g","t":"Rater guidelines","s":"definitions of grades 0 to 3","c":2,"r":1,"k":"data"}],
+ "edges":[["a","b"],["b","c","pairs"],["c","d"],["d","e"],["f","a"],["g","c"]]}
+</script>
+<ul>
+<li><b>Query sampling.</b> Stratify by category, by whole image versus crop, by source (camera photo, web image, screenshot), and by popularity. Include an explicit slice of hard queries: small crops, cluttered scenes, low light.</li>
+<li><b>Candidate pooling.</b> Run the new model, the old model, and a simple baseline; take the union of each top 50. Judging only the new model's results would reward models that resemble the system that picked the candidates.</li>
+<li><b>Grades.</b> Define 0 (unrelated), 1 (same category), 2 (same style or very similar), 3 (same item or near-identical). Use three raters, adjudicate disagreements, and measure inter-rater agreement.</li>
+<li><b>Size.</b> About 5,000 queries with about 100 judged candidates each is enough to detect an nDCG change of roughly one point with narrow confidence intervals, and it can be refreshed quarterly. Keep the set frozen between comparisons.</li>
+</ul>
+<div class="callout warn"><p>The golden set can leak. If training pairs include the same images (or near-duplicates) as the evaluation queries, offline numbers look better than reality. Deduplicate the training pairs against the golden set by perceptual hash before every training run.</p></div>
+
+<h3>Online metrics and guardrails</h3>
+<table>
+<caption>Online metrics for A/B tests</caption>
+<tr><th>Type</th><th>Metric</th><th>Definition</th><th>Why it matters</th></tr>
+<tr><td>Engagement</td><td>Click-through rate on results</td><td>Clicks divided by impressions in the first page</td><td>Direct signal of relevance, but biased by position</td></tr>
+<tr><td>Engagement</td><td>Save or share rate</td><td>Saves divided by sessions with results</td><td>Stronger intent than a click</td></tr>
+<tr><td>Business</td><td>Successful search sessions</td><td>Sessions with a click or save that are not followed by an immediate re-query or back within 5 seconds</td><td>Closest to "user found something"</td></tr>
+<tr><td>Business</td><td>Downstream conversion</td><td>Clicks through to shopping or the source page per search</td><td>Revenue relevance for the shopping surface</td></tr>
+<tr><td>Guardrail</td><td>Latency p50, p99</td><td>Server-side time to first results</td><td>Slower search loses users even if results are better</td></tr>
+<tr><td>Guardrail</td><td>Unsafe-result rate</td><td>User reports and classifier hits per 1,000 results</td><td>Must not rise with a new model or index</td></tr>
+<tr><td>Guardrail</td><td>Duplicate rate</td><td>Share of the top 50 that are near-duplicates of each other</td><td>Duplicates waste screen space</td></tr>
+<tr><td>Guardrail</td><td>Empty or low-confidence rate, cost per query</td><td>Queries below a similarity floor; GPU and RAM cost per 1,000 searches</td><td>Catches silent failures and runaway cost</td></tr>
+</table>
+<div class="callout warn"><p>A/B pitfalls specific to this system: an embedding change is not a drop-in swap, because the new query encoder only works with an index built by the new model. A treatment arm therefore needs its own index (about 2.4 TB of RAM per replica in this design), which makes experiments costly and argues for fewer, larger model changes. Also segment results: a model can win on whole images and lose on small crops, and an overall average hides that. Watch for novelty effects in the first days, check for sample ratio mismatch, and run at least a full weekly cycle to cover usage patterns.</p></div>
+
+<h2>Serving</h2>
+<h3>Architecture</h3>
+<p>The system has two paths. The online path embeds the query and searches the index. The offline path embeds new images and keeps the index fresh. They meet at the embedding index, and they must always use the same model version.</p>
+<script type="application/json" class="dg" data-cap="Serving architecture: an online path that embeds and searches, and an offline path that embeds new images and builds the index">
+{"type":"graph","cols":5,
+ "groups":[{"t":"Online: search path","c0":0,"c1":4,"r0":0,"r1":0},{"t":"Offline: indexing path","c0":0,"c1":3,"r0":1,"r1":1}],
+ "nodes":[
+  {"id":"q","t":"Query image + crop","s":"from the client","c":0,"r":0,"k":"img"},
+  {"id":"emb","t":"Embedding service","s":"preprocess + GPU encoder","c":1,"r":0,"k":"model"},
+  {"id":"ann","t":"ANN service","s":"fan-out to index shards","c":2,"r":0,"k":"svc"},
+  {"id":"rr","t":"Re-ranking service","s":"rescore, dedupe, policy","c":3,"r":0,"k":"svc"},
+  {"id":"res","t":"Ranked results","s":"50 per page","c":4,"r":0,"k":"io"},
+  {"id":"up","t":"New or updated image","s":"upload event","c":0,"r":1,"k":"img"},
+  {"id":"emb2","t":"Batch embedding job","s":"same model version","c":1,"r":1,"k":"model"},
+  {"id":"idx","t":"Indexing service","s":"assign list, PQ-encode","c":2,"r":1,"k":"svc"},
+  {"id":"vdb","t":"Embedding index","s":"IVF-PQ shards in RAM","c":3,"r":1,"k":"store"}],
+ "edges":[["q","emb","tensor"],["emb","ann","128-d vector"],["ann","rr","top 500"],["rr","res"],["up","emb2"],["emb2","idx","128-d vector"],["idx","vdb"],["vdb","ann","searched by",{"d":1,"sa":"t","sb":"b"}]]}
+</script>
+<p>Component roles in one line each. <b>Embedding service</b>: decodes, preprocesses, and batches queries onto GPUs; if the query is a whole catalog image the stored vector is fetched instead and the GPU is skipped. <b>ANN service</b>: fans out to shards and merges. <b>Re-ranking service</b>: fetches full-precision vectors and metadata for the candidates, rescored exactly, then removes duplicates and policy violations. <b>Indexing service</b>: builds and publishes shards. <b>Embedding index</b>: compressed vectors in RAM; a separate store of float16 vectors and metadata on SSD backs re-ranking.</p>
+
+<h3>Latency and scale math</h3>
+<p>These numbers are explicit assumptions so they can be challenged and re-derived in an interview.</p>
+<table>
+<caption>Server-side latency budget at p99 (assumed targets)</caption>
+<tr><th>Stage</th><th>Budget (ms)</th><th>Notes</th></tr>
+<tr><td>Gateway, auth, crop validation</td><td>10</td><td>Client sends a downscaled crop (at most 448 px) to save upload time</td></tr>
+<tr><td>Decode and preprocess</td><td>8</td><td>CPU, parallel with GPU queue</td></tr>
+<tr><td>GPU encoder</td><td>15</td><td>Dynamic batching with a small wait window</td></tr>
+<tr><td>ANN fan-out, shard search, merge</td><td>35</td><td>Includes tail from hedged requests and a hard deadline per shard</td></tr>
+<tr><td>Exact rescore of 500 candidates</td><td>15</td><td>fp16 vectors fetched from local SSD</td></tr>
+<tr><td>Dedupe and policy filters</td><td>7</td><td>Hash and flag lookups, no model calls</td></tr>
+<tr><td>Response assembly</td><td>10</td><td>Thumbnail URLs, metadata</td></tr>
+<tr><td><b>Total</b></td><td><b>100</b></td><td>End-to-end p99 target under 300 ms including mobile network</td></tr>
+</table>
+<table>
+<caption>Capacity estimates (assumptions in the first column)</caption>
+<tr><th>Quantity</th><th>Calculation</th><th>Result</th></tr>
+<tr><td>Peak query rate</td><td>Assume 5,000 QPS average and a 4x peak factor</td><td>20,000 QPS</td></tr>
+<tr><td>Encoder GPUs</td><td>Assume 2,000 images per second per GPU in fp16 for a ResNet-50 class model; 20,000 / 2,000 = 10 GPUs at full load</td><td>About 24 with headroom and zone redundancy</td></tr>
+<tr><td>Shard queries per second</td><td>20,000 QPS x 100 shards</td><td>2,000,000 per second</td></tr>
+<tr><td>Index nodes</td><td>Assume 32 cores and 4.5 ms CPU per shard query, so about 7,100 shard queries per second per node; 2,000,000 / 7,100 = 282 nodes at full load</td><td>About 400 nodes at 70 percent target utilization: 4 replicas of 100 shards</td></tr>
+<tr><td>Index RAM</td><td>Each vector uses a 16 B PQ code plus an 8 B id = 24 B; 100B x 24 B = 2.4 TB, so 24 GB per shard; 4 replicas = 9.6 TB</td><td>Fits easily in 256 GB nodes</td></tr>
+<tr><td>Full-precision store</td><td>100B x 256 B (fp16, 128-d) = 25.6 TB, i.e. 256 GB per shard on NVMe</td><td>102 TB across 4 replicas</td></tr>
+<tr><td>Fresh uploads</td><td>50M per day / 86,400 s</td><td>About 580 images per second, well under one GPU</td></tr>
+</table>
+<div class="callout key"><p>The fleet size is set by compute (fan-out multiplies every query by the shard count), not by memory: memory alone would need only about 12 nodes per replica (2.4 TB / 200 GB). That is why shard count, per-shard search cost, and hedging are the real knobs in a billion-scale design.</p></div>
+
+<h3>Memory math and compression</h3>
+<p>Storing 100 billion float32 vectors would take 51.2 TB (100 billion x 512 B) in RAM per replica, which is not realistic. Compression is therefore a requirement. Product quantization (PQ) splits each vector into <code>m</code> sub-vectors and replaces each with the index of its nearest centroid in a small learned codebook, usually 256 centroids per sub-vector, so each sub-vector costs 1 byte.</p>
+<script type="application/json" class="dg" data-cap="Index memory for 100 billion 128-d vectors, in terabytes, before ids and overhead: product quantization brings 51 TB down to 1.6 to 3.2 TB">
+{"type":"bars","horiz":true,"labels":["float32 (512 B per vector)","float16 (256 B)","int8 (128 B)","PQ, 32 B per vector","PQ, 16 B per vector"],"series":[{"n":"Terabytes","v":[51.2,25.6,12.8,3.2,1.6]}],"fmt":null}
+</script>
+<p>PQ is lossy, so distances computed from codes are approximate. The standard remedy is a two-step search: use PQ codes to find a few hundred candidates, then rescore them with the original vectors. The Pinterest unified-embedding work also reports that binarized embeddings keep precision and recall, which is another route to the same memory saving.</p>
+
+<h3>ANN algorithm choice</h3>
+<table>
+<caption>Approximate nearest neighbor families</caption>
+<tr><th>Family</th><th>How it works</th><th>Memory</th><th>Recall and speed</th><th>Verdict at 100B</th></tr>
+<tr><td>Exact (flat)</td><td>Compare to every vector</td><td>Full vectors</td><td>Perfect recall, linear time: seconds per query at this scale</td><td>Only for the golden set and for rescoring candidates</td></tr>
+<tr><td>LSH</td><td>Hash similar vectors into the same buckets</td><td>Moderate</td><td>Predictable but lower recall at equal cost</td><td>Rarely the best choice today</td></tr>
+<tr><td>IVF-PQ</td><td>Cluster vectors, probe a few clusters, score codes (FAISS)</td><td>Very small (16 to 32 B per vector)</td><td>Good recall with rescoring; tunable by the number of probed lists</td><td><b>Chosen</b> for the main index</td></tr>
+<tr><td>HNSW</td><td>Navigable small-world graph, greedy search through layers</td><td>Full vectors plus links: with M=16 about 128 B of links per vector, roughly 64 TB at fp32 for 100B</td><td>Best recall per millisecond</td><td>Excellent for small shards and the fresh tier, too costly for the whole catalog</td></tr>
+<tr><td>ScaNN-style anisotropic quantization</td><td>Quantizer that preserves the inner product error that matters for ranking</td><td>Small</td><td>Higher recall than plain PQ at the same code size</td><td>Strong alternative to evaluate</td></tr>
+<tr><td>Disk-based graphs (DiskANN family)</td><td>Graph on SSD with compressed vectors in RAM</td><td>RAM for codes, SSD for graph</td><td>Good recall, higher latency</td><td>Option if RAM is the tighter budget</td></tr>
+</table>
+<p>The decision is IVF-PQ for the main index, with exact rescoring, and a small HNSW tier for fresh images. The mechanics of one shard search follow.</p>
+<script type="application/json" class="dg" data-cap="One IVF-PQ shard search (online) and what must be trained once per model version (offline): centroids route the query, codebooks make distances cheap">
+{"type":"graph","cols":5,
+ "groups":[{"t":"Online: search one shard","c0":0,"c1":4,"r0":0,"r1":0},{"t":"Offline: train once per model version","c0":1,"c1":3,"r0":1,"r1":1}],
+ "nodes":[
+  {"id":"q","t":"Query vector","s":"128-d","c":0,"r":0,"k":"vec"},
+  {"id":"cq","t":"Coarse quantizer","s":"nearest 32 of 131k centroids","c":1,"r":0,"k":"svc"},
+  {"id":"il","t":"Inverted lists","s":"about 7.6k codes per list","c":2,"r":0,"k":"store"},
+  {"id":"pq","t":"PQ distance scan","s":"table lookups over 16 sub-vectors","c":3,"r":0,"k":"model"},
+  {"id":"cand","t":"Shard candidates","s":"top 50 by approximate distance","c":4,"r":0,"k":"io"},
+  {"id":"tc","t":"Train centroids","s":"k-means, 131k lists","c":1,"r":1,"k":"svc"},
+  {"id":"sm","t":"Sample 10M vectors","s":"from the same model version","c":2,"r":1,"k":"data"},
+  {"id":"tp","t":"Train PQ codebooks","s":"k-means per sub-vector","c":3,"r":1,"k":"svc"}],
+ "edges":[["q","cq"],["cq","il","nprobe = 32"],["il","pq","244k codes"],["pq","cand"],["sm","tc"],["sm","tp"],["tc","cq"],["tp","pq"]]}
+</script>
+<p>Numbers for one shard of 1 billion vectors, as design assumptions: 131,072 inverted lists give about 7,600 vectors per list on average; probing 32 lists scans roughly 244,000 codes, or about 3.9 MB of memory at 16 bytes per code, which a core can do in a few milliseconds using a lookup table built once per query. The recall that results depends on how many lists are probed.</p>
+<script type="application/json" class="dg" data-cap="Recall@10 versus per-shard latency (illustrative): plain PQ plateaus because of quantization error, exact rescoring removes the plateau, and HNSW is fastest but needs far more memory">
+{"type":"curve","xl":"Per-shard search time (ms, one core)","yl":"Recall@10 vs exact search","xmax":20,"ymin":0.6,"ymax":1,
+ "series":[
+  {"n":"HNSW (fp32)","c":0,"lp":2,"pts":[[1,0.8],[2,0.9],[4,0.95],[8,0.98],[16,0.99],[20,0.993]]},
+  {"n":"IVF-PQ + exact rescore","c":2,"lp":2,"pts":[[1,0.7],[2,0.82],[4,0.91],[8,0.96],[16,0.98],[20,0.985]]},
+  {"n":"IVF-PQ only (16 B)","c":1,"d":1,"lp":3,"pts":[[1,0.62],[2,0.7],[4,0.76],[8,0.8],[16,0.82],[20,0.825]]}],
+ "marks":[{"x":8,"y":0.96,"t":"chosen: 32 lists + rescore"}]}
+</script>
+
+<h3>Sharding and fan-out</h3>
+<p>The index is split into 100 shards of about 1 billion vectors. Random (hash-based) sharding keeps load even and makes every shard statistically alike, at the cost of every query going to every shard. The ANN coordinator sends the query vector, each shard returns its local top 50 with approximate distances, and the coordinator merges them.</p>
+<script type="application/json" class="dg" data-cap="Fan-out search: every shard searches its slice in parallel, returns a local top 50, and the coordinator merges 5,000 candidates into 500 for exact rescoring">
+{"type":"graph","cols":5,
+ "groups":[{"t":"100 shards x 4 replicas","c0":2,"c1":2,"r0":0,"r1":2}],
+ "nodes":[
+  {"id":"q","t":"Query vector","s":"128-d","c":0,"r":1,"k":"vec"},
+  {"id":"co","t":"ANN coordinator","s":"fan-out with deadline","c":1,"r":1,"k":"svc"},
+  {"id":"s1","t":"Shard 1","s":"1B vectors, IVF-PQ","c":2,"r":0,"k":"store"},
+  {"id":"s2","t":"Shard 2","s":"1B vectors, IVF-PQ","c":2,"r":1,"k":"store"},
+  {"id":"s3","t":"Shard 100","s":"and 97 more shards","c":2,"r":2,"k":"store"},
+  {"id":"m","t":"Merge","s":"5,000 to 500 by distance","c":3,"r":1,"k":"svc"},
+  {"id":"x","t":"Exact rescore","s":"fp16 vectors from SSD","c":4,"r":1,"k":"model"}],
+ "edges":[["q","co"],["co","s1","query"],["co","s2"],["co","s3"],["s1","m","top 50 each"],["s2","m"],["s3","m"],["m","x"]]}
+</script>
+<ul>
+<li><b>Tail latency.</b> A query is as slow as its slowest shard. Send a hedged duplicate to another replica after the p95 latency, and set a hard deadline (for example 40 ms) after which the coordinator merges whatever it has.</li>
+<li><b>Partial results.</b> Losing 1 shard of 100 loses about 1 percent of the catalog for that query, which users will not notice, so returning partial results is better than failing the request.</li>
+<li><b>Cluster-aware sharding.</b> An alternative is to shard by the coarse centroid so that a query visits only a few shards. It reduces fan-out cost but creates hot shards for popular topics and complicates rebalancing, so start with random sharding and revisit if compute is the bottleneck.</li>
+<li><b>Adaptive probing.</b> Under load, reduce the number of probed lists; the recall curve is gentle near the chosen operating point, so a small cut saves a lot of CPU.</li>
+</ul>
+
+<h3>Re-ranking</h3>
+<p>Retrieval returns candidates by embedding similarity alone. A short re-ranking stage applies exact scores and product rules that a vector index cannot express.</p>
+<script type="application/json" class="dg" data-cap="From 5,000 approximate candidates to a 50-result page (illustrative counts): exact rescoring sharpens the order, then dedupe and policy shrink the list">
+{"type":"funnel","stages":[
+ {"t":"Per-shard ANN","s":"IVF-PQ, top 50 each","n":"5,000","m":"100 shards"},
+ {"t":"Merge + exact rescore","s":"top 500 by PQ, rescored in fp16","n":"500"},
+ {"t":"Dedupe + policy filters","s":"near-duplicates, unsafe, blocked","n":"~120"},
+ {"t":"Final page","s":"diversity cap, similarity floor","n":"50"}]}
+</script>
+<table>
+<caption>Re-ranking rules</caption>
+<tr><th>Rule</th><th>How it works</th><th>Why</th></tr>
+<tr><td>Exact rescore</td><td>Recompute the cosine similarity with the float16 vectors</td><td>Removes the error PQ introduced so close ranks are correct</td></tr>
+<tr><td>Near-duplicate collapse</td><td>Group results by perceptual hash or by embedding similarity above a threshold such as 0.98; keep the highest-quality member</td><td>Keeps the first page from being ten copies of one photo</td></tr>
+<tr><td>Safety and policy</td><td>Drop images flagged by the moderation system; fail closed if the flag lookup is unavailable</td><td>Unsafe results must never ship, even under degradation</td></tr>
+<tr><td>Self-match removal</td><td>Remove the query image itself and its exact copies when the query is a catalog image</td><td>A user does not want to see the image they started with</td></tr>
+<tr><td>Diversity cap</td><td>Limit results per uploader and per tight cluster</td><td>Avoids one account dominating the page</td></tr>
+<tr><td>Similarity floor</td><td>If the best score is below a threshold, show fewer results or an empty state</td><td>A low-confidence result list is worse than an honest one</td></tr>
+</table>
+<div class="callout tip"><p>A common follow-up is "where does personalization go?" The answer for this problem is nowhere: the requirement is that the same query gives the same results. If it were added later, it would be another re-ranking feature on the 500 candidates, not a change to the embedding.</p></div>
+
+<h3>Freshness and model upgrades</h3>
+<p>Two different lifecycles need to be handled. For freshness, the main index is rebuilt in batch (for example weekly) because training centroids and codebooks is expensive. New uploads are embedded within minutes and inserted into a small delta tier (an HNSW or flat index over the last few days of images). Each query searches both tiers and merges. At 580 new images per second, the delta tier holds about 50 million vectors per day, so it fits in RAM across a few nodes for the multi-day period before it is merged into the main index.</p>
+<p>For model upgrades, the embedding space itself changes, so old vectors and new query vectors are not comparable. The only safe approach is a new index built by the new model, and cut over with a blue/green switch.</p>
+<script type="application/json" class="dg" data-cap="Blue/green model rollout: v1 keeps serving while v2 is backfilled and checked in shadow; the router flips the encoder and index together">
+{"type":"graph","cols":5,
+ "groups":[{"t":"Live path (model v1)","c0":0,"c1":4,"r0":0,"r1":0},{"t":"Rollout (model v2)","c0":0,"c1":4,"r0":1,"r1":1}],
+ "nodes":[
+  {"id":"t","t":"Search traffic","c":0,"r":0,"k":"io"},
+  {"id":"rt","t":"Traffic router","s":"pins encoder + index version","c":1,"r":0,"k":"svc"},
+  {"id":"e1","t":"Query encoder v1","c":2,"r":0,"k":"model"},
+  {"id":"i1","t":"Index v1","s":"serving 100% of traffic","c":3,"r":0,"k":"store"},
+  {"id":"r","t":"Results","c":4,"r":0,"k":"io"},
+  {"id":"m2","t":"Model v2 trained","s":"passed offline gates","c":0,"r":1,"k":"model"},
+  {"id":"bf","t":"Backfill embeddings","s":"all thumbnails, about 14k GPU-hours","c":1,"r":1,"k":"svc"},
+  {"id":"i2","t":"Index v2 (shadow)","s":"built, not yet serving","c":2,"r":1,"k":"store"},
+  {"id":"g","t":"Shadow + A/B gates","s":"recall, nDCG, latency, cost","c":3,"r":1,"k":"svc"},
+  {"id":"ret","t":"Retire index v1","s":"after a rollback window","c":4,"r":1,"k":"store"}],
+ "edges":[["t","rt"],["rt","e1"],["e1","i1","v1 vectors"],["i1","r"],["m2","bf"],["bf","i2"],["i2","g"],["g","rt","flip on pass",{"d":1,"sa":"t","sb":"b"}],["g","ret","7-day window"]]}
+</script>
+<div class="callout math"><p>Re-embedding cost. At an assumed 2,000 thumbnails per second per GPU, 100 billion images need 100e9 / 2,000 = 5e7 GPU-seconds, about 13,900 GPU-hours. A pool of 1,000 GPUs finishes in roughly 14 hours, if decoding and I/O keep up (reading 1.5 PB of thumbnails in 14 hours is about 30 GB/s of aggregate throughput). A ViT-B encoder, at roughly 4x the compute, would make the same job about 56 hours on 1,000 GPUs, which is why the backbone choice is also a budget choice.</p></div>
+<p>While v2 builds, v1 must keep serving and keep ingesting new uploads, so new images are embedded twice during the transition. Alternatives to a full rebuild exist: backward-compatible training constrains the new model so that new queries can search old vectors, and a learned adapter can map new queries into the old space. Both trade some quality for avoiding the backfill and are worth naming.</p>
+
+<h3>Failure modes and monitoring</h3>
+<ul>
+<li><b>Slow or dead shard.</b> Hedged requests, deadlines, and partial results as above; alert on shard error rate and skew.</li>
+<li><b>Encoder GPU outage.</b> Whole-image queries can use stored vectors; crops queue briefly, then return a clear error rather than stale results.</li>
+<li><b>Re-ranking dependency down.</b> Skip optional signals such as diversity, but never skip the safety flag: fail closed.</li>
+<li><b>Version mismatch.</b> A query vector from model v2 against an index built by v1 returns plausible but wrong results with no error. The router pins both versions together, and a version tag is carried in every request and checked at the shard.</li>
+</ul>
+<table>
+<caption>Monitoring signals</caption>
+<tr><th>Signal</th><th>What it detects</th><th>How</th></tr>
+<tr><td>Embedding drift</td><td>Changes in the input distribution, new image types, a broken preprocessing step</td><td>Track the mean and spread of embedding norms before normalization, and the distribution of nearest-neighbor distances</td></tr>
+<tr><td>ANN recall against exact search</td><td>Index degradation, bad centroids, an under-probing configuration</td><td>Nightly: run exact search on a 10-million-vector sample for 10,000 sampled queries and compare recall@10 to a gate such as 0.95</td></tr>
+<tr><td>Index freshness</td><td>Upload-to-searchable lag</td><td>p95 of (indexed time minus upload time); alert beyond the hours promised in the requirements</td></tr>
+<tr><td>Query mix</td><td>Shifts in crop size, source, or category</td><td>Histograms of crop area and source; compare against the golden-set strata</td></tr>
+<tr><td>Result quality proxies</td><td>Regressions seen only by users</td><td>Successful-search rate, top-1 similarity distribution, empty-state rate, report rate per 1,000 results</td></tr>
+<tr><td>Cost and capacity</td><td>Overload before it becomes latency</td><td>Shard CPU, GPU queue depth, SSD read latency, cache hit rate</td></tr>
+</table>
+
+<h3>Challenges</h3>
+<table>
+<caption>Typical challenges and responses</caption>
+<tr><th>Challenge</th><th>Why it is hard</th><th>Response</th></tr>
+<tr><td>Cold start</td><td>New images have no engagement and may be from a new domain</td><td>Embeddings need no engagement, so a new image is searchable once embedded and indexed; the delta tier makes this minutes, not days</td></tr>
+<tr><td>Speed</td><td>Fan-out multiplies cost; tail latency dominates</td><td>Compression, hedging, deadlines, adaptive probing, an encoder-skipping path for catalog images</td></tr>
+<tr><td>Diversity</td><td>Near-duplicates and a single popular uploader can fill the page</td><td>Duplicate collapse and per-uploader caps in re-ranking</td></tr>
+<tr><td>Fairness</td><td>Quality may be lower for domains underrepresented in training, such as certain regional products or skin tones</td><td>Evaluate on slices, balance sampling, add curated data for weak slices</td></tr>
+<tr><td>Privacy</td><td>Query photos are private and may contain faces</td><td>Do not store query images; do not use them for training without consent; treat face-like embeddings as sensitive and restrict person search</td></tr>
+<tr><td>Abuse and copyright</td><td>Users can search to find and copy others' images; adversarial perturbations can poison results</td><td>Rate limits, takedown flows, and robustness tests in the evaluation set</td></tr>
+</table>
+
+<h2>Other Talking Points</h2>
+<ul>
+<li>Object-aware indexing: run a detector at upload time and add one embedding per detected object, so a small crop of a handbag matches the handbag, not the whole outfit photo. It multiplies index size by the number of regions, which is why it is usually limited to categories like shopping.</li>
+<li>Binary or heavily quantized embeddings: Pinterest reports that binarized embeddings keep precision and recall, which cuts storage and speeds Hamming-distance search, a useful lever when RAM is the bottleneck.</li>
+<li>Multi-task embeddings: one embedding trained for several surfaces (related content, shopping, search) removes the cost of keeping several indexes and benefits from the pooled data.</li>
+<li>Version every embedding with the model hash and preprocessing version, and refuse to compare vectors across versions; this one invariant prevents the worst silent failure in the system.</li>
+<li>Distill a smaller query encoder from the large model for on-device or low-latency use, but only if it is trained to live in the same space as the indexed vectors.</li>
+<li>Text and image together: a CLIP-style model lets users refine a visual query with words ("same, but in blue"), which is a natural extension but changes the evaluation and the index.</li>
+<li>Explicit negative feedback ("not relevant") is a cleaner signal than clicks and can be used to mine hard negatives directly.</li>
+<li>Test-time augmentation (embedding two or three views of the crop and averaging) improves robustness for tiny crops at several times the encoder cost; make it conditional on a low quality gate score.</li>
+<li>Use a GPU-based index for the hottest shards or for the delta tier when QPS is high, trading cost for latency.</li>
+<li>Active learning for labels: send the golden-set slices where the model is least certain or where online and offline metrics disagree to raters first, which spends rater budget where it changes decisions.</li>
+</ul>
+
+<h2 class="nonum">Check yourself</h2>
+<p class="qa-intro">Questions are tagged by the level they target. The first set checks Senior-level fundamentals and arithmetic; Staff and Principal questions probe trade-offs, operations, experimentation and organization. Try to answer aloud for two minutes before opening one.</p>
+<div class="qa-bar" data-qa></div>
+<details class="ans" data-lvl="sr"><summary>1. Why is training a tag classifier and matching on tags not enough for visual search?</summary>Tags only encode the distinctions the label set defines, so two very different shoes share the tag "shoe", and no label set covers every visual concept or style. A classifier's penultimate features discard information the labels did not need. Contrastive embedding learning optimizes distance directly, generalizes to unseen images, and its output plugs into nearest neighbor search. Tags and hashes are still useful as signals for filtering and deduplication.</details>
+<details class="ans" data-lvl="sr"><summary>2. Memory alone needs about 12 nodes per replica, yet the design runs about 400 nodes. Explain the gap.</summary>With 24 bytes per vector (16 B PQ code plus 8 B id), 100 billion vectors take 2.4 TB, which fits in about 12 nodes with 200 GB usable RAM. The fleet size is set by compute: with 100 shards every query becomes 100 shard queries, so 20,000 QPS gives 2 million shard queries per second. At about 7,100 shard queries per second per node that is 282 nodes at full load, and about 400 at a 70 percent utilization target. Fewer shards would reduce fan-out cost but increase per-shard latency; cluster-aware routing would reduce it further at the price of hot shards.</details>
+<details class="ans" data-lvl="sr"><summary>3. A relevance list for a query is [2, 3, 0] at ranks 1 to 3. Compute nDCG@3.</summary>DCG = 2/log2(2) + 3/log2(3) + 0/log2(4) = 2 + 1.893 + 0 = 3.893. The ideal order is [3, 2, 0], so IDCG = 3/1 + 2/1.585 + 0 = 3 + 1.262 = 4.262. nDCG@3 = 3.893 / 4.262 = 0.913. The 0.087 loss is entirely due to swapping the grade-3 and grade-2 results.</details>
+<details class="ans" data-lvl="sr"><summary>4. What happens if you set the contrastive temperature too low, and how do you detect it?</summary>The softmax becomes very sharp, so nearly all of the gradient lands on the single closest negative. If that negative is a false negative (a near-duplicate or the same item), the model is pushed to separate images that users consider the same, and training becomes unstable or the embedding fragments clusters. Symptoms: training loss is noisy, golden-set recall for near-duplicate pairs falls while precision at the top rises, and the nearest-neighbor distance distribution becomes bimodal. Fixes: raise the temperature, deduplicate and filter negatives, or sample hard negatives by distance weighting instead of always taking the nearest.</details>
+<details class="ans" data-lvl="st"><summary>5. Users complain that a crop of a handbag returns photos of whole outfits. How do you diagnose and fix it?</summary>First check the slice: golden-set nDCG for small crops versus whole images, and the distribution of crop areas at query time. Likely causes: the catalog vectors describe the whole image, so the handbag is a small part of the signal; training views did not include small crops as positives of the parent; the quality gate lets through tiny crops. Fixes in order of cost: widen the random-resized-crop range and add crop-to-parent pairs; add a margin and a minimum crop size at the client; add object-level embeddings for the shopping category with a detector at upload time; add crop-size slices to the evaluation and the online guardrails.</details>
+<details class="ans" data-lvl="st"><summary>6. The team wants to ship a better encoder next week. What must happen before the first query is served by it?</summary>The new encoder produces vectors in a different space, so the entire catalog must be re-embedded and a new index built, which is about 13,900 GPU-hours for 100 billion images at 2,000 images per second per GPU (assumption), plus a new set of centroids and PQ codebooks. Run it in shadow, check ANN recall against exact search and golden-set metrics, check latency and cost, run an A/B with its own index, then flip the router so the encoder and index change together, keeping the old index for a rollback window. If a week is not enough time, use a backward-compatible training approach or an adapter, accepting some quality loss.</details>
+<details class="ans" data-lvl="st"><summary>Serving cost is 40 percent over budget but quality must not drop. Where do you cut, and in what order?</summary><p>Start from a cost breakdown, because the chapter's math shows that fan-out compute, not raw memory, sets the fleet size. Rank levers by saved dollars per point of recall lost: (1) remove near-duplicate images before indexing, which shrinks N for free; (2) tighten the probe budget (fewer lists visited per query) by routing queries to a subset of shards through a coarse quantizer instead of broadcasting to all; (3) move the cold tail to SSD-backed or disk-based indexes while keeping the hot head in memory; (4) lower the re-ranking depth; (5) cache embeddings and results for head queries; (6) distill the query-side encoder.</p><p>For each lever, measure the recall@k loss against brute-force ground truth on a held-out query set and plot recall against cost per query. Pick the knee of that frontier, then confirm in an A/B test with guardrails on engagement and null-result rate. Do not quantize further just because it is cheap; make the recall-versus-dollar trade explicit.</p><p class="probe"><b>Likely follow-ups:</b> How do you build the ground truth for recall@k at this scale? &middot; What if the cheapest lever hurts only tail queries?</p><p class="signal"><b>What makes this Staff-level:</b> You frame the answer as a Pareto frontier with measurements, and you separate offline recall loss from user-visible loss.</p></details>
+<details class="ans" data-lvl="st"><summary>The new encoder is clearly better offline, but re-embedding 100 billion images takes weeks. How do you migrate without downtime or a quality dip?</summary><p>Embeddings from different models live in different spaces, so you cannot mix them in one index. Two clean options. Option A, backward-compatible training: train the new encoder with an extra loss that aligns it to the old classifier or old embedding space, so new query vectors can search the old index immediately, and new images are embedded with the new model (the idea in backward-compatible representation learning, Shen et al., CVPR 2020). Option B, a shadow index: build the v2 index in the background, backfill in popularity order, replay live traffic against it in shadow, compare metrics, then cut over by market or by traffic percentage, keeping v1 for rollback for a couple of weeks.</p><p>Budget it: compute for 100 billion forward passes, storage for two indexes during the overlap, and the engineering cost of dual-writing new uploads to both versions. Version every vector with a model hash so a bug can never compare across spaces.</p><p class="probe"><b>Likely follow-ups:</b> Which option would you pick if the new model changes the embedding dimension? &middot; How do you handle images uploaded during the backfill?</p><p class="signal"><b>What makes this Staff-level:</b> You see that the real constraint is the index, not the model, and you present a cutover plan with rollback and cost.</p></details>
+<details class="ans" data-lvl="st"><summary>A user's crop of a face in a public photo returns visually similar photos of strangers. What are the product and ML risks, and what do you change?</summary><p>The system can act as an identity-matching tool. Mitigations: exclude face-dominant crops from retrieval or return only non-face matches for them; do not train embeddings with identity labels; apply a safety classifier at index time (explicit content, minors) and filter at query time; and honor deletions by propagating tombstones to every shard, replica and cache within a defined time (for example hours, not days).</p><p>Measure it: an audit set of face-dominant queries with a human check on the results, the rate of unsafe results per million queries, and the deletion-propagation latency at the 99th percentile. Put these on the launch checklist as gates, and keep a red-team process that tries abusive queries before every encoder upgrade.</p><p class="probe"><b>Likely follow-ups:</b> How do you prove a deleted image is gone from every cache? &middot; Who signs off on shipping an encoder that is better on metrics but worse on the audit?</p><p class="signal"><b>What makes this Staff-level:</b> You treat privacy as a design constraint with metrics and propagation SLAs, not a policy paragraph.</p></details>
+<details class="ans" data-lvl="pr"><summary>One embedding now serves shopping, related-pins and search. How do you govern quality when each surface wants a different trade-off?</summary><p>Run the embedding as a platform product with a contract: a versioned API, a compatibility policy (no breaking vector-space changes without a migration window), and per-surface golden sets. A release gate says no surface may regress more than a stated threshold on its own golden set unless its owner signs a waiver. Surfaces keep their own re-rankers and filters so they can tune locally without retraining the shared encoder.</p><p>Decide when to fork: if joint training lifts every surface by less than the cost of the coupling (blocked launches, compromised objectives), split into a shared backbone with surface-specific heads or adapters. Measure it with an ablation (joint versus separate) and review it each half-year. The outcome you want is fewer parallel stacks without a platform team that becomes a bottleneck.</p><p class="probe"><b>Likely follow-ups:</b> How do you price the platform team's work to the surfaces? &middot; What would make you split the encoder in two?</p><p class="signal"><b>What makes this Principal-level:</b> You reason about ownership, contracts and the cost of coupling, and you give a data-driven rule for revisiting the decision.</p></details>
+
+<h2 class="nonum">References</h2>
+<ol class="refs">
+<li>Y. Jing et al., "Visual Search at Pinterest," KDD 2015. <a href="https://arxiv.org/abs/1505.07647">arxiv.org/abs/1505.07647</a></li>
+<li>A. Zhai et al., "Learning a Unified Embedding for Visual Search at Pinterest," KDD 2019. <a href="https://arxiv.org/abs/1908.01707">arxiv.org/abs/1908.01707</a></li>
+<li>Pinterest Engineering, "Unifying visual embeddings for visual search at Pinterest." <a href="https://medium.com/pinterest-engineering/unifying-visual-embeddings-for-visual-search-at-pinterest-74ea7ea103f0">medium.com/pinterest-engineering</a></li>
+<li>H. Hu et al., "Web-Scale Responsive Visual Search at Bing," KDD 2018. <a href="https://arxiv.org/abs/1802.04914">arxiv.org/abs/1802.04914</a></li>
+<li>T. Chen et al., "A Simple Framework for Contrastive Learning of Visual Representations" (SimCLR), ICML 2020. <a href="https://arxiv.org/abs/2002.05709">arxiv.org/abs/2002.05709</a></li>
+<li>K. He et al., "Momentum Contrast for Unsupervised Visual Representation Learning" (MoCo), CVPR 2020. <a href="https://arxiv.org/abs/1911.05722">arxiv.org/abs/1911.05722</a></li>
+<li>A. Radford et al., "Learning Transferable Visual Models From Natural Language Supervision" (CLIP), 2021. <a href="https://arxiv.org/abs/2103.00020">arxiv.org/abs/2103.00020</a></li>
+<li>C.-Y. Wu et al., "Sampling Matters in Deep Embedding Learning," ICCV 2017. <a href="https://arxiv.org/abs/1706.07567">arxiv.org/abs/1706.07567</a></li>
+<li>J. Johnson, M. Douze, H. Jegou, "Billion-scale similarity search with GPUs" (FAISS), 2017. <a href="https://arxiv.org/abs/1702.08734">arxiv.org/abs/1702.08734</a></li>
+<li>H. Jegou, M. Douze, C. Schmid, "Product Quantization for Nearest Neighbor Search," IEEE TPAMI, 2011. <a href="https://doi.org/10.1109/TPAMI.2010.57">doi.org/10.1109/TPAMI.2010.57</a></li>
+<li>Y. Malkov, D. Yashunin, "Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs" (HNSW), 2016. <a href="https://arxiv.org/abs/1603.09320">arxiv.org/abs/1603.09320</a></li>
+<li>R. Guo et al., "Accelerating Large-Scale Inference with Anisotropic Vector Quantization" (ScaNN), ICML 2020. <a href="https://arxiv.org/abs/1908.10396">arxiv.org/abs/1908.10396</a></li>
+<li>K. Jarvelin, J. Kekalainen, "Cumulated gain-based evaluation of IR techniques" (nDCG), ACM TOIS, 2002. <a href="https://doi.org/10.1145/582415.582418">doi.org/10.1145/582415.582418</a></li>
+<li>M. Douze et al., "The 2021 Image Similarity Dataset and Challenge," 2021. <a href="https://arxiv.org/abs/2106.09672">arxiv.org/abs/2106.09672</a></li>
+</ol>
+</main></div>
+<script src="assets/dg.js"></script>
+<script src="assets/nav.js"></script>
+<script src="assets/qa.js"></script>
+</body>
+</html>

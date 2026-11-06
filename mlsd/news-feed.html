@@ -1,0 +1,498 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Personalized News Feed</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-slug="news-feed">
+<div class="topbar"><a href="index.html">&larr; ML System Design Study Guide</a><span style="color:var(--muted)">Chapter 10 of 11</span></div>
+<div class="layout"><aside class="toc" id="toc"></aside>
+<main>
+<div class="kicker">Chapter 10</div>
+<h1>Personalized News Feed</h1>
+<p class="lead">A social feed shows each user the posts from friends, pages, and groups they are most likely to value. A user who follows a few hundred sources has far more unseen posts than time, so order matters more than membership. The core idea is a multi-stage funnel (retrieve, rank, re-rank) whose ranker predicts several kinds of reaction per post and blends those predictions into one score using weights that encode product values.</p>
+
+<h2>Clarifying Requirements</h2>
+<p>The feed looks like a simple sorted list, but almost every requirement changes the design: what counts as a candidate, which reactions we can learn from, and how much of the page we may compute per request. Spend the first few minutes pinning these down.</p>
+<div class="dlg">
+<div class="turn c"><span>Candidate</span><p>What is the business goal of the feed?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Increase engagement by showing each user the posts they will care about most.</p></div>
+<div class="turn c"><span>Candidate</span><p>Which posts are eligible, and where do they come from?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Unseen posts from friends, followed pages, and groups, plus posts the user already saw that have new comments they have not seen.</p></div>
+<div class="turn c"><span>Candidate</span><p>What can a post contain?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Text, images, video, or any combination.</p></div>
+<div class="turn c"><span>Candidate</span><p>Which reactions do we log, and are they the training signal?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Clicks, dwell time, likes, comments, shares, and hides. Use them as you see fit.</p></div>
+<div class="turn c"><span>Candidate</span><p>What is the scale and the latency expectation?</p></div>
+<div class="turn i"><span>Interviewer</span><p>About 500 million daily users. The first page should render within a few hundred milliseconds.</p></div>
+<div class="turn c"><span>Candidate</span><p>Is there a large group of users who rarely react?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Yes. Many users are passive: they scroll and read but rarely like or comment.</p></div>
+<div class="turn c"><span>Candidate</span><p>How do we treat harmful, misleading, or low-quality posts?</p></div>
+<div class="turn i"><span>Interviewer</span><p>They must not rank high. Describe where that logic lives, but assume a separate harmful-content system produces the classifier scores.</p></div>
+<div class="turn c"><span>Candidate</span><p>Do we need to handle new users and new authors?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Yes. Cold start matters for both, but start with the mature case.</p></div>
+<div class="turn c"><span>Candidate</span><p>Are ads, notifications, and stories in scope?</p></div>
+<div class="turn i"><span>Interviewer</span><p>No. Leave ad auctions and notification ranking out; just reserve slots for ads.</p></div>
+</div>
+<div class="summary"><p>Build a ranked, personalized feed of unseen posts and posts with unseen comments for about 500 million daily users, to maximize engagement. Posts contain text and media; users react in several ways, and many react rarely. Harmful content must be demoted, new users and authors must work, and the first page must load in a few hundred milliseconds.</p></div>
+
+<script type="application/json" class="dg" data-cap="The feed loop: a request is ranked, the user scrolls and reacts, and logged reactions flow back as features and training data">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"open","t":"Open app","s":"or pull to refresh","c":0,"r":0,"k":"io"},
+  {"id":"req","t":"Feed request","s":"user, device, last-seen cursor","c":1,"r":0},
+  {"id":"rank","t":"Feed ranker","s":"retrieve, score, re-rank","c":2,"r":0,"k":"model"},
+  {"id":"page","t":"Ranked page","s":"first ~10 posts, more on scroll","c":3,"r":0,"k":"io"},
+  {"id":"fs","t":"Feature store","s":"affinity rates, post counters","c":1,"r":1,"k":"store"},
+  {"id":"log","t":"Event log","s":"impressions + reactions","c":2,"r":1,"k":"data"},
+  {"id":"usr","t":"User scrolls and reacts","s":"dwell, like, comment, share, hide","c":3,"r":1,"k":"user"}],
+ "edges":[["open","req"],["req","rank"],["rank","page","top posts",{"hl":1}],["page","usr"],["usr","log","events"],["log","fs","streaming"],["fs","rank","features",{"d":1,"sa":"t","sb":"b"}]]}
+</script>
+
+<h2>Frame the Problem as an ML Task</h2>
+<h3>ML objective</h3>
+<p>"Engagement" is a business word, not a training label. The first design decision is which observable behavior the model should predict. A candidate may weigh three families of options.</p>
+<table>
+<caption>Candidate objectives for the feed ranker</caption>
+<tr><th>Objective</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Maximize implicit signals (clicks, dwell time)</td><td>Plentiful, including for passive users; fast feedback</td><td>Rewards clickbait, sensational posts, and long videos regardless of satisfaction</td></tr>
+<tr><td>Maximize explicit signals (likes, comments, shares)</td><td>Clear intent; closer to "this was worth my time"</td><td>Sparse (well under a few percent of impressions); passive users give almost none; easy to game with engagement bait</td></tr>
+<tr><td><b>Predict each reaction, then blend into one value score</b></td><td>Uses dense and sparse signals together; weights express product values and can change without retraining; negative signals (hide) join the same formula</td><td>Needs calibrated probabilities and a process to choose weights</td></tr>
+<tr><td>Predict a single learned "engagement" score end to end</td><td>One model, one label</td><td>Hides what is being optimized; cannot retune the mix; label must still be hand-built from the same reactions</td></tr>
+</table>
+<div class="callout key"><p>Predict several reaction probabilities and combine them linearly: <code>value = &sum; w<sub>k</sub> &middot; P(reaction k)</code>, with a negative weight for hides. The model answers "what will this user do?"; the weights answer "what do we value?". Keeping those two questions separate is the central design idea.</p></div>
+<p>Why blend instead of training one engagement score? There are four reasons worth saying aloud. First, reactions mean different things: a comment usually reflects more investment than a click. Second, they have very different base rates, so a single pooled label would be dominated by the most frequent reaction. Third, product teams change priorities (more conversation, fewer videos) and should not need to retrain. Fourth, negative feedback such as hide has to enter the objective with a minus sign; a pooled "engaged or not" label cannot express that. The linear form also has a convenient property: a reaction a user almost never performs gets a probability near zero, so it automatically has little influence on that user's ranking.</p>
+<p>Weights come from two sources, used together. Surveys and holdout studies tell the team which interactions people call meaningful, which gives a starting ordering of weights. Online experiments then test several weight vectors as parallel arms and choose the one that improves long-term metrics (retention, survey quality) while keeping guardrails (hides, reports) flat. Mature systems treat the weights as a small search problem, sometimes with constrained or Bayesian optimization, and may personalize them for users whose behavior differs, but a fixed global vector is the right starting answer.</p>
+<table>
+<caption>Assumed weights used in the worked example (assumptions for illustration)</caption>
+<tr><th>Reaction</th><th>Weight</th><th>Reasoning</th></tr>
+<tr><td>Click</td><td>1</td><td>Cheap, noisy interest signal</td></tr>
+<tr><td>Dwell &ge; 10 s</td><td>1</td><td>Passive but satisfying read; filters accidental clicks</td></tr>
+<tr><td>Like</td><td>2</td><td>Explicit approval, low effort</td></tr>
+<tr><td>Comment</td><td>5</td><td>High effort, starts conversation</td></tr>
+<tr><td>Share</td><td>6</td><td>Strong endorsement, spreads the post</td></tr>
+<tr><td>Hide / "see less"</td><td>&minus;20</td><td>Rare but costly; strong negative feedback</td></tr>
+</table>
+<p>Consider three candidate posts for one viewer. Post A is a photo from a close friend, post B is a viral video from a page, and post C is a question in a group the viewer follows. The model outputs these probabilities:</p>
+<table>
+<caption>Predicted reaction probabilities for one viewer (illustrative)</caption>
+<tr><th>Post</th><th>Click</th><th>Dwell &ge; 10 s</th><th>Like</th><th>Comment</th><th>Share</th><th>Hide</th></tr>
+<tr><td>A: friend photo</td><td>0.30</td><td>0.35</td><td>0.20</td><td>0.06</td><td>0.02</td><td>0.005</td></tr>
+<tr><td>B: viral page video</td><td>0.45</td><td>0.40</td><td>0.10</td><td>0.01</td><td>0.03</td><td>0.030</td></tr>
+<tr><td>C: group question</td><td>0.20</td><td>0.25</td><td>0.08</td><td>0.12</td><td>0.01</td><td>0.004</td></tr>
+</table>
+<div class="callout math"><p>Post A: 0.30&middot;1 + 0.35&middot;1 + 0.20&middot;2 + 0.06&middot;5 + 0.02&middot;6 &minus; 0.005&middot;20 = 0.30 + 0.35 + 0.40 + 0.30 + 0.12 &minus; 0.10 = <b>1.37</b>. Post B: 0.45 + 0.40 + 0.20 + 0.05 + 0.18 &minus; 0.60 = <b>0.68</b>. Post C: 0.20 + 0.25 + 0.16 + 0.60 + 0.06 &minus; 0.08 = <b>1.19</b>. Final order: A, C, B. Sorting by P(click) alone would have put B first.</p></div>
+<script type="application/json" class="dg" data-cap="Worked example (illustrative probabilities, assumed weights): post B has the most clicks but a large hide penalty, so it ends last">
+{"type":"bars","labels":["Post A: friend photo","Post B: viral page video","Post C: group question"],"series":[{"n":"Positive terms","v":[1.47,1.28,1.27]},{"n":"Hide penalty","v":[0.10,0.60,0.08],"c":3}]}
+</script>
+<script type="application/json" class="dg" data-cap="Resulting feed order: the blended value (positive terms minus hide penalty) decides, not any single reaction">
+{"type":"ranklist","ql":"Viewer","q":"Three candidates","qs":"weights from the table above","items":[
+ {"t":"A: photo from a close friend","s":"1.47 positive - 0.10 hide penalty","v":0.91,"sc":"1.37","hl":1},
+ {"t":"C: question in a followed group","s":"1.27 positive - 0.08 hide penalty","v":0.79,"sc":"1.19"},
+ {"t":"B: viral video from a page","s":"1.28 positive - 0.60 hide penalty","v":0.45,"sc":"0.68"}]}
+</script>
+<div class="callout warn"><p>The blend only works if each probability is calibrated (a predicted 0.20 really means 20% of such impressions get that reaction). A head that over-predicts shares by 3x silently triples the share weight. Calibration is a requirement, not polish; see the Evaluation section.</p></div>
+
+<h3>Input and output</h3>
+<p>The model's input is a viewer, a candidate post, and the context of the request. Its output is a vector of reaction probabilities for that pair. The ranker applies the blend to every candidate and sorts.</p>
+<script type="application/json" class="dg" data-cap="The ranker as a black box: viewer, candidate posts, and context in; per-post reaction probabilities and an ordered feed out">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"u","t":"Viewer","s":"profile, history, affinities","c":0,"r":0,"k":"user"},
+  {"id":"p","t":"Candidate posts","s":"unseen + new-comment posts","c":0,"r":1,"k":"data"},
+  {"id":"x","t":"Context","s":"time, device, connection","c":0,"r":2,"k":"io"},
+  {"id":"m","t":"Feed ranker","s":"multi-task model + blend","c":1,"r":1,"k":"model"},
+  {"id":"s","t":"Scores per post","s":"P(click), P(like), ..., P(hide)","c":2,"r":1,"k":"vec"},
+  {"id":"o","t":"Ordered feed","s":"posts sorted by blended value","c":3,"r":1,"k":"io"}],
+ "edges":[["u","m"],["p","m",{"hl":1}],["x","m"],["m","s"],["s","o","weights, sort"]]}
+</script>
+
+<h3>ML category: learning to rank</h3>
+<p>Ranking can be learned in three ways. They differ in what one training example is and what the loss compares.</p>
+<table>
+<caption>Learning-to-rank families</caption>
+<tr><th>Family</th><th>Training example</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Pointwise</td><td>One (viewer, post) pair with a label per reaction</td><td>Simple; scales to billions of examples; probabilities plug straight into the blend; easy to calibrate</td><td>Ignores the other posts shown; does not optimize list order directly</td></tr>
+<tr><td>Pairwise</td><td>Two posts, label "which was preferred"</td><td>Directly trains order; robust to score offsets</td><td>Needs trustworthy preference pairs; scores are not probabilities, so the weighted blend loses meaning</td></tr>
+<tr><td>Listwise</td><td>A whole list with a list-level loss</td><td>Optimizes metrics such as nDCG</td><td>Expensive, hard to train, and sensitive to position bias in logged lists</td></tr>
+</table>
+<p><b>Decision.</b> Use a pointwise, multi-task model. The weighted blend needs calibrated probabilities, and only the pointwise formulation produces them. Order-aware effects (diversity, spacing) are handled afterward by a re-ranking pass that sees the whole list.</p>
+<script type="application/json" class="dg" data-cap="Three formulations of learning to rank; the pointwise path (highlighted) yields the probabilities the blend needs">
+{"type":"graph","cols":3,
+ "groups":[{"t":"Pointwise: one post at a time","c0":0,"c1":2,"r0":0,"r1":0},{"t":"Pairwise: two posts","c0":0,"c1":2,"r0":1,"r1":1},{"t":"Listwise: whole list","c0":0,"c1":2,"r0":2,"r1":2}],
+ "nodes":[
+  {"id":"a1","t":"Viewer + one post","s":"features","c":0,"r":0,"k":"data"},
+  {"id":"a2","t":"Model","s":"BCE loss per reaction","c":1,"r":0,"k":"model"},
+  {"id":"a3","t":"P(reaction) per post","s":"calibrated, blendable","c":2,"r":0,"k":"io"},
+  {"id":"b1","t":"Viewer + post pair","s":"i versus j","c":0,"r":1,"k":"data"},
+  {"id":"b2","t":"Model","s":"pairwise hinge/logistic loss","c":1,"r":1,"k":"svc"},
+  {"id":"b3","t":"P(i ranked above j)","s":"relative only","c":2,"r":1,"k":"io"},
+  {"id":"c1","t":"Viewer + candidate list","s":"all posts together","c":0,"r":2,"k":"data"},
+  {"id":"c2","t":"Model","s":"list-level loss (nDCG-like)","c":1,"r":2,"k":"svc"},
+  {"id":"c3","t":"Ordering of the list","s":"no per-post probability","c":2,"r":2,"k":"io"}],
+ "edges":[["a1","a2",{"hl":1}],["a2","a3",{"hl":1}],["b1","b2"],["b2","b3"],["c1","c2"],["c2","c3"]]}
+</script>
+
+<h2>Data Preparation</h2>
+<h3>Data engineering</h3>
+<p>Four data sources feed the system. Posts and the social graph are mostly static or slowly changing; the interaction log is the high-volume stream that becomes both features and labels.</p>
+<table>
+<caption>Posts (about 250 million new posts per day, assumed; text and media stored in object storage, metadata in a row store)</caption>
+<tr><th>post_id</th><th>author_id</th><th>text</th><th>media</th><th>language</th><th>created_at</th></tr>
+<tr><td>p1</td><td>u7</td><td>"Sunrise run along the bay"</td><td>video</td><td>en</td><td>2026-11-05 06:10</td></tr>
+<tr><td>p2</td><td>pg3</td><td>"10 tips to photograph the Milky Way"</td><td>link</td><td>en</td><td>2026-11-05 07:45</td></tr>
+</table>
+<table>
+<caption>Users and the social graph (friendships are symmetric; follows of pages and groups are directed)</caption>
+<tr><th>user_id</th><th>other_id</th><th>edge_type</th><th>since</th><th>flags</th></tr>
+<tr><td>u1</td><td>u7</td><td>friend</td><td>2020-02</td><td>close_friend, family</td></tr>
+<tr><td>u1</td><td>pg3</td><td>follows page</td><td>2023-05</td><td>notifications_off</td></tr>
+<tr><td>u1</td><td>g9</td><td>group member</td><td>2024-01</td><td>muted=false</td></tr>
+</table>
+<table>
+<caption>Impressions and reactions log (about 5e10 impressions per day, assumed: 500M users x 100 viewed posts; roughly 200 bytes each is 10 TB per day)</caption>
+<tr><th>user_id</th><th>post_id</th><th>event</th><th>position</th><th>dwell_ms</th><th>ts</th></tr>
+<tr><td>u1</td><td>p1</td><td>impression</td><td>2</td><td>14,200</td><td>07:02:11</td></tr>
+<tr><td>u1</td><td>p1</td><td>like</td><td>2</td><td></td><td>07:02:19</td></tr>
+<tr><td>u1</td><td>p2</td><td>impression</td><td>3</td><td>900</td><td>07:02:26</td></tr>
+<tr><td>u1</td><td>p2</td><td>hide</td><td>3</td><td></td><td>07:02:27</td></tr>
+</table>
+<p>Three logging details matter. First, log an <b>impression only when the post was actually on screen</b> (for example, at least 500 ms in the viewport); posts that were ranked but never scrolled into view are not negatives. Second, log <b>position and the full feature vector used at serving time</b>, so training sees what the ranker saw, not a later recomputation. Third, log reactions with the same <code>request_id</code> as the impression so labels can be joined within a window.</p>
+<script type="application/json" class="dg" data-cap="Data model: authors reach the viewer through friend edges (strong), follows (weaker), and memberships; each post inherits the relationship between viewer and author">
+{"type":"net","h":300,"nodes":[
+ {"id":"me","t":"You","x":10,"y":50,"k":"me"},
+ {"id":"bob","t":"Bob","x":38,"y":14,"k":"fr","s":"friend"},
+ {"id":"dana","t":"Dana","x":38,"y":50,"k":"fr","s":"close friend"},
+ {"id":"pg","t":"Page","x":38,"y":86,"k":"other","s":"followed"},
+ {"id":"p1","t":"P1","x":78,"y":14,"k":"cand","s":"photo"},
+ {"id":"p2","t":"P2","x":78,"y":50,"k":"hit","s":"video"},
+ {"id":"p3","t":"P3","x":78,"y":86,"k":"cand","s":"article"}],
+ "edges":[["me","bob",{"l":"friend"}],["me","dana",{"hl":1,"l":"close friend"}],["me","pg",{"d":1,"l":"follows"}],["bob","p1",{"l":"posted"}],["dana","p2",{"hl":1,"l":"posted"}],["pg","p3",{"d":1,"l":"posted"}]]}
+</script>
+
+<h3>Feature engineering</h3>
+<p>Features are organized by the entity they describe. The ranker scores (viewer, post) pairs, so it needs the viewer, the post, and, most importantly, the relationship between the two.</p>
+<table>
+<caption>Features by entity, with encoding choices</caption>
+<tr><th>Group</th><th>Features</th><th>Encoding</th></tr>
+<tr><td>Post content</td><td>Text embedding, image or video embedding, content type, language, hashtags, link domain, integrity classifier scores (clickbait, misinformation likelihood)</td><td>Pretrained encoders produce dense vectors; type and language as embeddings; classifier scores as floats</td></tr>
+<tr><td>Post statistics</td><td>Likes, comments, shares, hides per impression so far; reaction velocity (last 10 minutes); post age</td><td>Rates, not raw counts; log or percentile buckets; age bucketized plus raw hours</td></tr>
+<tr><td>Viewer</td><td>Activity level (sessions per day), recent reaction history, topic and format preferences, device and locale</td><td>Bucketized levels; mean of embeddings of recently liked posts; categorical embeddings</td></tr>
+<tr><td>Viewer-author affinity</td><td>Past like, comment, share and profile-visit rates toward this author; friendship length; close-friend or family flag; reciprocal interactions; tagged-in-post flag</td><td>Smoothed rates over several windows (7, 30, 90 days); binary flags; recency of last interaction</td></tr>
+<tr><td>Context</td><td>Hour of day, day of week, connection type, position-independent session depth</td><td>Cyclic encoding for hour; one-hot for connection</td></tr>
+</table>
+<script type="application/json" class="dg" data-cap="Feature groups are concatenated into one vector that feeds the shared network; context features are added at request time">
+{"type":"graph","cols":3,
+ "nodes":[
+  {"id":"f1","t":"Post content","s":"text/image/video embeddings","c":0,"r":0,"k":"data"},
+  {"id":"f2","t":"Post statistics","s":"reaction rates, age","c":0,"r":1,"k":"data"},
+  {"id":"f3","t":"Viewer","s":"history, activity, topics","c":0,"r":2,"k":"data"},
+  {"id":"f4","t":"Viewer-author affinity","s":"interaction rates, closeness","c":0,"r":3,"k":"data"},
+  {"id":"f5","t":"Context","s":"hour, device, connection","c":0,"r":4,"k":"data"},
+  {"id":"v","t":"Feature vector","s":"concatenated","c":1,"r":2,"k":"vec"},
+  {"id":"n","t":"Shared network","s":"learns interactions","c":2,"r":2,"k":"model"}],
+ "gapY":18,
+ "edges":[["f1","v"],["f2","v"],["f3","v"],["f4","v",{"hl":1}],["f5","v"],["v","n"]]}
+</script>
+<p>Affinity features are usually the strongest signal in a social feed: people react most to people they know well. They are computed as smoothed rates (reactions divided by impressions of that author, with a prior so one lucky like does not look like a 100% rate) over several windows. Because the table is viewer x author, it is sparse: most pairs have no history, which is where content features and the viewer's overall behavior must carry the prediction.</p>
+<script type="application/json" class="dg" data-cap="Viewer-author affinity matrix (illustrative, scaled like rate; ? means no history, so the model falls back on content and viewer features)">
+{"type":"matrix","rl":"Viewers","cl":"Authors","rows":["u1","u2","u3","u4"],"cols":["close friend","family","coworker","page","celebrity"],
+ "v":[[0.9,0.7,null,0.2,null],[0.3,null,0.6,0.5,0.1],[null,0.8,0.1,null,0.4],[0.2,0.1,null,0.9,0.7]],"unk":"?"}
+</script>
+<p>Post age needs care. Fresh posts get more reactions because they are at the top of friends' feeds and because stale news matters less, so age is a strong feature, but its effect differs by relationship: a close friend's engagement-announcement is still welcome a day later, while a news page's headline is not. Feeding age as a feature (rather than hard-coding a decay) lets the model learn these curves. A hand-written decay is still useful as a prior in the pass-0 retrieval scorer.</p>
+<script type="application/json" class="dg" data-cap="Post-age effect (illustrative): the probability of a reaction decays with age, but more slowly for close friends than for generic pages">
+{"type":"curve","xmax":48,"xl":"Post age (hours)","yl":"Relative reaction probability","series":[
+ {"n":"Close friend","c":0,"lp":3,"pts":[[0,1],[6,0.8],[12,0.65],[24,0.45],[36,0.33],[48,0.25]]},
+ {"n":"Generic page","c":1,"lp":2,"pts":[[0,1],[2,0.85],[6,0.6],[12,0.4],[24,0.2],[36,0.12],[48,0.08]]}]}
+</script>
+<div class="callout tip"><p>In an interview, state that every feature must be available at serving time with the same definition used in training. For fast-changing features such as post counters, log the value the ranker saw rather than recomputing it later; otherwise the model trains on information from the future and looks great offline but disappoints online.</p></div>
+
+<h3>Labels</h3>
+<p>Each reaction head needs its own label. Three sources are plausible.</p>
+<table>
+<caption>Label sources</caption>
+<tr><th>Source</th><th>Definition</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Explicit reactions</td><td>Positive if the user liked, commented, or shared within a window (say 24 hours) of the impression</td><td>Clean intent; direct input to the blend</td><td>Sparse; passive users contribute almost no positives</td></tr>
+<tr><td>Implicit behavior</td><td>Positive if dwell exceeds a threshold, the user expanded the text, or watched at least half a video</td><td>Dense for every user, including passive ones</td><td>Threshold choices are arbitrary; long or attention-grabbing posts look good</td></tr>
+<tr><td>Negative feedback</td><td>Positive for the "hide" head if the user hid the post, unfollowed the author, or reported it</td><td>Captures harm and annoyance that engagement hides</td><td>Very rare; reporting is not uniform across user groups</td></tr>
+</table>
+<p><b>Decision.</b> Build all three: explicit heads for like, comment, and share; implicit heads for click and dwell; and a negative head for hide. A shown post is positive for a head if that reaction occurred within the window and negative otherwise. Dwell is binarized with a threshold (for example 10 seconds, chosen so that it separates real reads from quick scrolls, and ideally normalized by content type because a text post and a video have different natural dwell times).</p>
+<script type="application/json" class="dg" data-cap="Label construction: each impression is joined with reactions inside a window to give one binary label per head; negatives are down-sampled before training">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"log","t":"Impression log","s":"viewed posts with features","c":0,"r":1,"k":"data"},
+  {"id":"join","t":"Join within window","s":"reaction in 24 h of impression","c":1,"r":1},
+  {"id":"l1","t":"Click, dwell labels","s":"dwell > 10 s is positive","c":2,"r":0,"k":"data"},
+  {"id":"l2","t":"Like, comment, share","s":"positive if reaction occurred","c":2,"r":1,"k":"data"},
+  {"id":"l3","t":"Hide, unfollow, report","s":"negative-feedback head","c":2,"r":2,"k":"data"},
+  {"id":"set","t":"Training set","s":"negatives kept at 10-25%","c":3,"r":1,"k":"store"}],
+ "edges":[["log","join"],["join","l1"],["join","l2"],["join","l3"],["l1","set"],["l2","set"],["l3","set"]]}
+</script>
+<p>Class imbalance is severe and differs by head. Commenting and sharing happen on a fraction of a percent of impressions, while dwell is common. The standard remedies are to <b>down-sample negatives</b> (and recalibrate afterward, see below), to weight rare positives, and to share representations across heads so a rare head borrows strength from a common one.</p>
+<script type="application/json" class="dg" data-cap="Illustrative base rates per impression: rare heads such as comment, share, and hide have orders of magnitude fewer positives than click or dwell">
+{"type":"bars","horiz":true,"labels":["Dwell >= 10 s","Click","Like","Comment","Share","Hide"],"series":[{"n":"% of impressions","v":[18,9,3.5,0.6,0.25,0.15]}],"fmt":null}
+</script>
+<p>Several biases contaminate these labels, and a good answer names them.</p>
+<ul>
+<li><b>Selection bias.</b> We only observe reactions to posts we chose to show. A post the old ranker never surfaced has no label, so the new model can never learn it is good. Reserve a small exploration slice (randomized or boosted exposure) and use it for unbiased training and evaluation.</li>
+<li><b>Position bias.</b> Slot 1 gets more reactions than slot 8 for the same post. Training on raw labels teaches the model that "posts that were ranked high are good". Add position as a training-only input (or a separate shallow tower, as in the multitask ranker of Zhao et al.) and set it to a constant at serving, or use inverse-propensity weights.</li>
+<li><b>Delayed feedback.</b> Comments and shares can arrive hours after the impression. Training on yesterday's log undercounts them. Wait for the label window to close, or use a model that corrects for incomplete labels.</li>
+<li><b>Noisy implicit labels.</b> A long dwell can mean fascination or distraction. Pair dwell with explicit and survey signals when tuning thresholds.</li>
+<li><b>Time-based splits.</b> Train on days D-30 through D-2, validate on D-1, test on D. A random split leaks future counters and trending posts into training.</li>
+</ul>
+
+<h2>Model Development</h2>
+<h3>Model options</h3>
+<table>
+<caption>Model families for the ranker</caption>
+<tr><th>Option</th><th>Strengths</th><th>Weaknesses</th></tr>
+<tr><td>Logistic regression with crosses (one per head)</td><td>Fast, interpretable, easy to calibrate; strong baseline</td><td>Manual feature crosses; cannot use raw embeddings well; one model per reaction to maintain</td></tr>
+<tr><td>Gradient-boosted trees (per head)</td><td>Strong on tabular features; little feature scaling</td><td>Poor with high-dimensional embeddings; hard to share across tasks; slow retraining on huge logs</td></tr>
+<tr><td>Deep network with shared bottom and per-reaction heads</td><td>Learns feature interactions; ingests embeddings; one model serves all heads; rare heads borrow strength</td><td>Heads can interfere when tasks conflict; more serving cost</td></tr>
+<tr><td><b>Multi-gate mixture-of-experts (MMoE) network</b></td><td>Experts specialize; per-task gates reduce interference between conflicting tasks</td><td>More parameters and tuning; gates can collapse onto one expert</td></tr>
+<tr><td>Sequential transformer over the user's interaction history</td><td>Captures taste trajectory; helps sparse users</td><td>Costly to train and serve; needs GPU serving and shared-context batching</td></tr>
+</table>
+<p><b>Decision.</b> Start with a shared-bottom multi-task deep network, move to MMoE if offline results show task conflict, and mention a sequential model as the next step. Meta describes multitask neural networks as the core of News Feed ranking, and LinkedIn describes MMoE heads (with DCNv2 experts) on top of a sequential encoder in its recent feed system.</p>
+<script type="application/json" class="dg" data-cap="Shared-bottom multi-task network: one trunk learns a common representation, six small heads each output one reaction probability, and the blend combines them">
+{"type":"graph","cols":4,"gapY":18,
+ "nodes":[
+  {"id":"x","t":"Feature vector","s":"post, viewer, affinity, context","c":0,"r":2,"k":"vec"},
+  {"id":"sb","t":"Shared bottom","s":"3 dense layers, 512-d output","c":1,"r":2,"k":"model"},
+  {"id":"h1","t":"Click head","s":"sigmoid","c":2,"r":0},
+  {"id":"h2","t":"Dwell head","s":"sigmoid, dwell > 10 s","c":2,"r":1},
+  {"id":"h3","t":"Like head","s":"sigmoid","c":2,"r":2},
+  {"id":"h4","t":"Comment head","s":"sigmoid","c":2,"r":3},
+  {"id":"h5","t":"Share head","s":"sigmoid","c":2,"r":4},
+  {"id":"h6","t":"Hide head","s":"sigmoid","c":2,"r":5},
+  {"id":"b","t":"Weighted blend","s":"sum of w_k x P_k","c":3,"r":2,"k":"io"}],
+ "edges":[["x","sb"],["sb","h1"],["sb","h2"],["sb","h3",{"hl":1}],["sb","h4"],["sb","h5"],["sb","h6"],["h1","b"],["h2","b"],["h3","b"],["h4","b"],["h5","b"],["h6","b"]]}
+</script>
+<p>Sharing the trunk is both a cost and a modeling choice. It is cheaper to serve than six separate models, and it lets sparse heads (share, hide) use representations learned mostly from click and dwell. The risk is <b>negative transfer</b>: a hide head and a click head may pull the trunk in opposite directions for sensational posts. MMoE addresses this by replacing the single trunk with several experts and giving each task its own gate, a softmax over experts that decides how much each expert contributes to that task's tower (Ma et al. 2018). Related tasks can share experts; conflicting tasks can route to different ones.</p>
+<script type="application/json" class="dg" data-cap="MMoE: parallel experts see the same features; each task has its own gate and tower, so related tasks share experts and conflicting tasks can diverge">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"x","t":"Feature vector","s":"input to experts and gates","c":0,"r":1,"k":"vec"},
+  {"id":"e","t":"Shared experts","s":"N parallel MLPs","c":1,"r":1,"k":"model"},
+  {"id":"g1","t":"Click gate + tower","s":"softmax over experts","c":2,"r":0},
+  {"id":"g2","t":"Like gate + tower","s":"softmax over experts","c":2,"r":1},
+  {"id":"g3","t":"Hide gate + tower","s":"softmax over experts","c":2,"r":2},
+  {"id":"o1","t":"P(click)","c":3,"r":0,"k":"io"},
+  {"id":"o2","t":"P(like)","c":3,"r":1,"k":"io"},
+  {"id":"o3","t":"P(hide)","c":3,"r":2,"k":"io"}],
+ "edges":[["x","e"],["e","g1"],["e","g2",{"hl":1}],["e","g3"],["g1","o1"],["g2","o2"],["g3","o3"]]}
+</script>
+<h3>Passive users</h3>
+<p>A passive user may scroll for twenty minutes and never tap like. Explicit heads see almost no positives for that user, so predictions are uninformative and the blend collapses to ordering by popularity. Three techniques address this, and a candidate should offer them together.</p>
+<ul>
+<li><b>Implicit-signal heads.</b> Dwell, expand-text, video watch fraction, and profile visits fire for everyone. Include them in the blend so a passive user's ordering is driven by what they pause on.</li>
+<li><b>Shared representations.</b> The trunk learns patterns from active users (for example, close-friend photos are engaging) and applies them to passive users with similar features.</li>
+<li><b>Viewer-conditioned weights.</b> For users with little explicit history, shift blend weight toward implicit heads; for active users, explicit heads carry more of the weight. This can be a rule or a small learned function of the viewer's activity level.</li>
+</ul>
+<script type="application/json" class="dg" data-cap="Two parallel signal paths: implicit heads (highlighted) give passive users a training signal and a ranking signal when explicit reactions are rare">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"pu","t":"Passive user","s":"scrolls, rarely reacts","c":0,"r":0,"k":"user"},
+  {"id":"pb","t":"Implicit behavior","s":"dwell, expand, video watch","c":1,"r":0,"k":"data"},
+  {"id":"ph","t":"Implicit heads","s":"P(dwell), P(expand), P(watch)","c":2,"r":0,"k":"model"},
+  {"id":"bl","t":"Blended score","s":"weights depend on activity","c":3,"r":0},
+  {"id":"au","t":"Active user","s":"likes and comments often","c":0,"r":1,"k":"user"},
+  {"id":"ab","t":"Explicit reactions","s":"like, comment, share","c":1,"r":1,"k":"data"},
+  {"id":"ah","t":"Explicit heads","s":"P(like), P(comment), P(share)","c":2,"r":1,"k":"model"}],
+ "edges":[["pu","pb"],["pb","ph",{"hl":1}],["ph","bl",{"hl":1}],["au","ab"],["ab","ah"],["ah","bl"]]}
+</script>
+<h3>Training</h3>
+<p><b>Loss.</b> The total loss is the sum of binary cross-entropy over heads, optionally weighted per task:</p>
+<p><code>L = &sum;<sub>k</sub> &lambda;<sub>k</sub> &middot; BCE(y<sub>k</sub>, p<sub>k</sub>)</code>, where <code>BCE = &minus;[ y log p + (1&minus;y) log(1&minus;p) ]</code> averaged over examples.</p>
+<p>In plain words: each head is graded on its own binary question and the grades are added, so the shared layers receive gradients from every task. The weights <code>&lambda;<sub>k</sub></code> control how loudly each task speaks to the trunk; they are <i>not</i> the blend weights. Rare heads often get larger <code>&lambda;</code> so they are not drowned out.</p>
+<div class="callout math"><p>One example, three heads, all &lambda; = 1. Labels (click, like, hide) = (1, 0, 0) with predictions (0.8, 0.1, 0.02). Click: &minus;ln 0.8 = 0.223. Like: &minus;ln(1&minus;0.1) = 0.105. Hide: &minus;ln(1&minus;0.02) = 0.020. Total loss = 0.223 + 0.105 + 0.020 = <b>0.348</b>.</p></div>
+<p><b>Calibration after down-sampling.</b> Keeping only a fraction <code>w</code> of negatives speeds up training but inflates predicted probabilities. If the model outputs <code>p</code> under negative keep-rate <code>w</code>, the corrected probability is <code>q = p / (p + (1 &minus; p) / w)</code>.</p>
+<div class="callout math"><p>Suppose a head has a true rate of 4%: of 100 impressions, 4 are positive and 96 negative. Keeping 10% of negatives leaves 4 positives and 9.6 negatives, so the trained model learns an average output of 4 / 13.6 = 0.294. Correcting with <code>w</code> = 0.1 gives q = 0.294 / (0.294 + 0.706 / 0.1) = 0.294 / 7.353 = <b>0.040</b>, which restores the true 4%.</p></div>
+<p>Even after this correction, networks tend to be miscalibrated, particularly in the tails, so a per-head calibrator (isotonic regression or Platt scaling fit on a recent held-out day) is applied on top. Guo et al. showed that modern deep networks are often overconfident; for a blend that sums probabilities, this matters directly.</p>
+<script type="application/json" class="dg" data-cap="Reliability curve (illustrative, negatives kept at 25%): raw predictions overshoot the observed rate, a per-head calibrator pulls them back to the diagonal">
+{"type":"curve","xmax":0.5,"ymax":0.5,"ticks":6,"xl":"Predicted probability","yl":"Observed rate","series":[
+ {"n":"Perfect","c":2,"d":1,"lp":3,"pts":[[0,0],[0.5,0.5]]},
+ {"n":"Raw after down-sampling","c":1,"lp":4,"pts":[[0,0],[0.1,0.027],[0.2,0.059],[0.3,0.097],[0.4,0.143],[0.5,0.2]]},
+ {"n":"After isotonic calibrator","c":0,"lp":5,"pts":[[0,0],[0.1,0.1],[0.2,0.19],[0.3,0.31],[0.4,0.39],[0.5,0.49]]}]}
+</script>
+<p><b>Refresh.</b> Train daily on a rolling window with warm starts, and run an incremental job more often for fast-moving signals; trending topics and news shift within hours, and a stale ranker degrades noticeably. Hold out the most recent day for validation.</p>
+
+<h2>Evaluation</h2>
+<h3>Offline metrics</h3>
+<p>Because the ranker predicts probabilities that are summed, evaluate the heads two ways: do they <i>order</i> posts correctly, and are the numbers <i>correct</i>? Report each head separately.</p>
+<table>
+<caption>Offline metrics for the multi-task ranker</caption>
+<tr><th>Metric</th><th>Definition (in words)</th><th>Mini example</th><th>Flaw</th><th>Decision</th></tr>
+<tr><td>ROC-AUC per head</td><td>Probability that a random positive scores above a random negative</td><td>Positives {0.9, 0.6}, negatives {0.7, 0.3, 0.2}: 0.9 beats 3 of 3, 0.6 beats 2 of 3, so AUC = 5/6 = 0.833</td><td>Ignores calibration and top-of-list quality; dominated by easy negatives for rare heads</td><td>Use per head as the main ordering check; also report grouped AUC per viewer</td></tr>
+<tr><td>Log loss per head</td><td>Average negative log-probability of the true label</td><td>Label 1 predicted 0.8 and label 0 predicted 0.1: (0.223 + 0.105) / 2 = 0.164</td><td>Depends on base rate; hard to compare across heads or datasets</td><td>Use as the training and tuning metric</td></tr>
+<tr><td>Normalized entropy (NE)</td><td>Log loss divided by the entropy of always predicting the background rate</td><td>Base rate 0.1: entropy = 0.325; model log loss 0.26 gives NE = 0.26 / 0.325 = 0.80</td><td>Still reflects calibration only on average; below 1.0 is better than the constant baseline</td><td>Use to compare models and datasets with different base rates</td></tr>
+<tr><td>Calibration error (ECE) and reliability curves</td><td>Gap between predicted and observed rate, averaged over probability bins</td><td>Two equal bins: predicted 0.1 observed 0.12 and predicted 0.5 observed 0.40 gives ECE = 0.5(0.02) + 0.5(0.10) = 0.06</td><td>Bin choices change the number; hides tail errors</td><td>Required per head, because the blend consumes probabilities</td></tr>
+<tr><td>nDCG on blended value</td><td>Discounted gain of the produced order divided by the best possible order</td><td>Model order has gains [2, 3, 0]; ideal [3, 2, 0]. DCG = 2 + 3/1.585 = 3.893; IDCG = 3 + 2/1.585 = 4.262; nDCG = 0.913</td><td>Needs graded relevance built from position-biased logs</td><td>Use on the exploration slice or with propensity weights</td></tr>
+</table>
+<div class="callout math"><p>Normalized entropy by hand: background entropy at rate 0.1 is &minus;(0.1 ln 0.1 + 0.9 ln 0.9) = 0.1(2.303) + 0.9(0.105) = 0.230 + 0.095 = 0.325. A model whose log loss is 0.26 has NE = 0.26 / 0.325 = <b>0.80</b>, a 20% reduction in loss versus predicting the base rate for everyone.</p></div>
+<script type="application/json" class="dg" data-cap="AUC gain over a per-head tree baseline, in AUC points (illustrative): multi-task sharing helps rare heads most, and MMoE adds a further gain">
+{"type":"bars","labels":["Click","Dwell","Like","Comment","Share","Hide"],"series":[{"n":"Shared bottom","v":[0.040,0.035,0.050,0.050,0.060,0.030]},{"n":"MMoE","v":[0.050,0.045,0.060,0.055,0.070,0.040]}]}
+</script>
+<div class="callout warn"><p>Offline wins do not guarantee online wins. The logs only contain posts the old ranker chose to show, and AUC improvements on easy negatives can be meaningless. Treat offline metrics as a filter for what deserves an A/B test, not as proof.</p></div>
+<h3>Online metrics</h3>
+<table>
+<caption>Online metrics and guardrails</caption>
+<tr><th>Type</th><th>Metric</th><th>Why it matters</th></tr>
+<tr><td>Engagement</td><td>Reactions per user per day (like, comment, share); click-through rate; time spent on feed; sessions per day</td><td>Direct effect of better ranking; the first thing the experiment should move</td></tr>
+<tr><td>Quality</td><td>Meaningful-interaction rate (for example comments and shares between people who know each other); survey scores such as "was this worth your time?"</td><td>Counters engagement-bait; aligns with what users say they value</td></tr>
+<tr><td>Guardrails</td><td>Hides and "see less" per user; reports; integrity-violating impressions; creator and publisher exposure diversity; app load time</td><td>Detects ranking improvements that harm users or the ecosystem</td></tr>
+<tr><td>Long-term</td><td>Day-28 retention, daily active users in a long-running holdout</td><td>Short-term engagement can rise while satisfaction falls</td></tr>
+</table>
+<script type="application/json" class="dg" data-cap="Per-session funnel (illustrative): each stage is a subset of the one above; the passive 40% of sessions with no reaction are why implicit signals matter">
+{"type":"funnel","stages":[
+ {"t":"Feed sessions opened","s":"all users","n":"100%"},
+ {"t":"Scrolled past 3 posts","s":"real browsing, not bounces","n":"85%"},
+ {"t":"At least one reaction","s":"click, like, comment, share","n":"60%"},
+ {"t":"Meaningful interaction","s":"comment or share","n":"18%"}]}
+</script>
+<div class="callout tip"><p>Interviewers like a pitfall you have experienced. Mention A/B tests on social products suffer from <b>network effects</b>: if I am in treatment and my friend is in control, my better-ranked posts reach my friend, and my friend's reactions reach me. A plain user-level split then underestimates (or mixes up) the effect. Use graph-cluster randomization (Ugander et al.; Saveski et al.), measure on both viewers and creators, and run a long-term holdout.</p></div>
+<p>Other A/B pitfalls to name: novelty effects (a new ordering raises engagement for a week), metric dilution from users who never saw the change, multiple-comparison inflation when many weight vectors are tested, and ramp-up bias when the early traffic is not representative.</p>
+
+<h2>Serving</h2>
+<h3>Request path and scale math</h3>
+<p>At a high level the request flows through three stages: retrieve a few thousand eligible posts, score them with the heavy model, then apply list-level rules. The same funnel is used by Meta, which describes a lightweight pass to keep roughly 500 candidates, a main scoring pass, and a contextual pass for diversity.</p>
+<script type="application/json" class="dg" data-cap="Serving funnel (counts are assumptions): cheap rules and a light model prune early so the expensive multi-task model scores only about 500 posts">
+{"type":"funnel","stages":[
+ {"t":"Eligible candidates","s":"friends, pages, groups, bumps","n":"~1,500","m":"millions of posts in the graph"},
+ {"t":"Pass 0: light scorer","s":"small model, few features","n":"500"},
+ {"t":"Pass 1: multi-task model","s":"full features, blended score","n":"top 100"},
+ {"t":"Pass 2: re-ranking","s":"integrity, diversity, slots","n":"~30 shown first"}]}
+</script>
+<div class="callout math"><p>Assumptions: 500 million daily users, 8 feed sessions each, so 4 billion requests per day, or 4e9 / 86,400 = about 46,000 requests per second on average. With a peak of 3x, that is about 140,000 QPS. Scoring 500 posts per request means 70 million post scores per second at peak. If one score costs about 10 MFLOPs, that is 7e14 FLOP/s, which is tens of accelerators or thousands of CPU cores before caching and prefetching reduce the load. At a 10 TB per day impression log, 30 days of history is 300 TB, which is why training reads a sampled stream.</p></div>
+<h3>Candidate retrieval</h3>
+<p>Retrieval collects every eligible post and caps each source so a prolific friend cannot flood the list. Two bumping rules matter: <b>unread bumping</b> re-admits posts that were ranked in an earlier session but never seen, and <b>comment bumping</b> re-admits already-seen posts that triggered a lively conversation among the viewer's connections.</p>
+<script type="application/json" class="dg" data-cap="Candidate retrieval (caps are assumptions): four sources are capped, merged and deduplicated, then filtered for eligibility">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"s1","t":"New posts from friends","s":"since last visit, cap 600","c":0,"r":0,"k":"data"},
+  {"id":"s2","t":"Followed pages and groups","s":"cap 500","c":0,"r":1,"k":"data"},
+  {"id":"s3","t":"Unread bumped posts","s":"ranked before, unseen, cap 250","c":0,"r":2,"k":"data"},
+  {"id":"s4","t":"Comment-bumped posts","s":"seen, with new comments, cap 150","c":0,"r":3,"k":"data"},
+  {"id":"mg","t":"Merge and dedupe","s":"by post_id, keep best source","c":1,"r":1},
+  {"id":"el","t":"Eligibility filters","s":"deleted, blocked, privacy, mute","c":2,"r":1},
+  {"id":"cd","t":"Candidate set","s":"about 1,500 posts","c":3,"r":1,"k":"io"}],
+ "gapY":18,
+ "edges":[["s1","mg"],["s2","mg"],["s3","mg"],["s4","mg"],["mg","el"],["el","cd"]]}
+</script>
+<p>For cold-start users with no friends yet, the candidate set shifts toward popular and trending posts in their region and topics from onboarding; modern systems may add an embedding-based retriever (LinkedIn describes replacing several separate retrieval sources with one LLM-embedding retriever) to surface posts from authors the viewer does not follow.</p>
+<h3>Architecture</h3>
+<script type="application/json" class="dg" data-cap="Serving architecture: online request path (top) with caches and stores, and offline/streaming systems (bottom) that produce features and models">
+{"type":"graph","cols":5,
+ "groups":[{"t":"Online request path","c0":0,"c1":4,"r0":0,"r1":1},{"t":"Offline and streaming","c0":0,"c1":4,"r0":2,"r1":2}],
+ "nodes":[
+  {"id":"cl","t":"Client app","s":"requests and renders","c":0,"r":0,"k":"io"},
+  {"id":"gw","t":"Feed API gateway","s":"auth, paging","c":1,"r":0},
+  {"id":"ag","t":"Feed aggregator","s":"retrieve and orchestrate","c":2,"r":0},
+  {"id":"rk","t":"Ranking service","s":"multi-task model + blend","c":3,"r":0,"k":"model"},
+  {"id":"rr","t":"Re-ranking service","s":"integrity, diversity, slots","c":4,"r":0},
+  {"id":"ca","t":"Feed cache","s":"per-user ranked pages","c":1,"r":1,"k":"store"},
+  {"id":"ps","t":"Post and graph stores","s":"content, friends, follows","c":2,"r":1,"k":"store"},
+  {"id":"fs","t":"Feature store","s":"online key-value","c":3,"r":1,"k":"store"},
+  {"id":"tr","t":"Training pipeline","s":"daily; publishes the model","c":1,"r":2,"k":"model"},
+  {"id":"lg","t":"Event log","s":"impressions, reactions","c":2,"r":2,"k":"data"},
+  {"id":"st","t":"Streaming counters","s":"post stats, affinity rates","c":3,"r":2}],
+ "edges":[["cl","gw"],["gw","ag"],["ag","rk"],["rk","rr"],["gw","ca","hit",{"d":1}],["ag","ps"],["rk","fs",{"hl":1}],["lg","tr"],["lg","st"],["st","fs","writes"]]}
+</script>
+<p>The aggregator is the orchestrator: it calls retrieval, fans scoring requests out to many predictor machines in parallel, and passes the scored list to re-ranking. The feature store has two parts. A slow-changing part (viewer embeddings, long-term affinity) is refreshed in batch; a fast part (post counters, recent reaction velocity, last-hour affinity) is updated by streaming jobs within seconds to minutes. Freshness matters because a post that has just gone viral should be scored with its current like rate, and a user who just liked three cooking posts should see more cooking.</p>
+<script type="application/json" class="dg" data-cap="Ranking service latency budget (illustrative, ms; 270 total against a 300 ms p95 target): inference and hydration dominate, so batching and caching of features are the main levers">
+{"type":"bars","horiz":true,"labels":["Gateway and network","Candidate retrieval","Feature fetch","Pass 0 and pass 1 inference","Re-ranking","Post hydration"],"series":[{"n":"ms","v":[40,35,40,70,25,60]}],"fmt":null}
+</script>
+<h3>Re-ranking</h3>
+<p>The model does not know about list-level policy, so a final pass applies it. Keeping these rules outside the model keeps them auditable and quick to change.</p>
+<script type="application/json" class="dg" data-cap="Re-ranking pipeline: integrity first (it can remove posts), then dedupe and diversity, then slots and floors, then page assembly">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"in","t":"Scored posts","s":"top ~100 by blended value","c":0,"r":0,"k":"data"},
+  {"id":"ig","t":"Integrity rules","s":"remove, demote, add labels","c":1,"r":0,"k":"model"},
+  {"id":"dd","t":"Dedupe and seen-state","s":"same link, same story, seen","c":2,"r":0},
+  {"id":"dv","t":"Diversity spacing","s":"author, format, topic","c":3,"r":0},
+  {"id":"ad","t":"Ad and promo slots","s":"reserved positions","c":3,"r":1},
+  {"id":"fl","t":"Freshness and floors","s":"unread and close-friend minimums","c":2,"r":1},
+  {"id":"as","t":"Page assembly","s":"order, prefetch next page","c":1,"r":1},
+  {"id":"out","t":"Final feed page","c":0,"r":1,"k":"io"}],
+ "edges":[["in","ig"],["ig","dd"],["dd","dv"],["dv","ad"],["ad","fl"],["fl","as"],["as","out",{"hl":1}]]}
+</script>
+<p><b>Integrity and misinformation.</b> Classifier scores (from the harmful-content system) enter in two places. Clearly violating posts are removed before ranking. Borderline content (misinformation likelihood, clickbait, engagement bait) is demoted by a multiplier on the blended value or by a feature the model sees, and labeled where appropriate, for example with a fact-check notice. The hide and report heads act as a second line: if users keep hiding a type of post, its blended value drops without a rule change.</p>
+<h3>Caching, prefetch, and degradation</h3>
+<ul>
+<li><b>Cache and prefetch.</b> Cache the next page or two of the ranked list for a short time (minutes). Prefetch the first page for heavy users when they are likely to open the app, and refresh the cache when a close friend posts.</li>
+<li><b>Fallbacks.</b> If the ranking service times out, serve the cached list; if there is no cache, serve a reverse-chronological feed from retrieval with light affinity ordering. If the feature store is slow, score with defaults for missing features and mark the request so monitoring can see the impact.</li>
+<li><b>Model rollout.</b> Shadow-score new models on live traffic, compare score distributions and calibration to the incumbent, then ramp through A/B arms.</li>
+<li><b>Refresh cadence.</b> Full retraining daily; calibration layer refit more often; streaming features continuously.</li>
+</ul>
+<h3>Monitoring</h3>
+<ul>
+<li><b>Calibration drift:</b> predicted versus observed rate per head per day; alert if the ratio leaves a band (for example 0.9 to 1.1).</li>
+<li><b>Score distributions:</b> mean and quantiles of each head, and of the blended value, per model version.</li>
+<li><b>Feature freshness and coverage:</b> age of streaming counters, share of requests with missing affinity features.</li>
+<li><b>Ecosystem health:</b> hides, reports, exposure by creator size, and share of impressions from non-friends.</li>
+</ul>
+<h3>Challenges</h3>
+<table>
+<caption>Challenges and mitigations</caption>
+<tr><th>Challenge</th><th>Why it is hard</th><th>Mitigation</th></tr>
+<tr><td>Cold start: new users</td><td>No history; no affinities</td><td>Onboarding interests and imported contacts; regional and popularity priors; content features; explore with more diverse posts, then adapt quickly as reactions arrive</td></tr>
+<tr><td>Cold start: new posts and authors</td><td>Counters are zero; the model has no engagement to rely on</td><td>Smooth rates with a prior from the author or content type; give new posts a bounded exploration allocation; use content embeddings</td></tr>
+<tr><td>Speed</td><td>Hundreds of posts scored in a few hundred milliseconds</td><td>Two-pass scoring; batched inference; feature caching; cached pages</td></tr>
+<tr><td>Diversity and echo chambers</td><td>Ranking by predicted engagement concentrates on a few authors and formats</td><td>Re-ranking spacing rules; exploration slots; caps per source</td></tr>
+<tr><td>Creator fairness</td><td>Rich-get-richer: popular authors earn more exposure and more data</td><td>Exposure audits by creator size; exploration quota for small creators; monitor distribution of impressions</td></tr>
+<tr><td>Privacy</td><td>Posts have audience settings; behavior data is sensitive</td><td>Enforce visibility in retrieval, not just in ranking; minimize retention of raw logs; aggregate features</td></tr>
+</table>
+
+<h2>Other Talking Points</h2>
+<ul>
+<li><b>Selection and position bias in training data:</b> logged reactions only exist for posts that were shown, and top slots get more; use position as a training-only input, an exploration slice, or inverse-propensity weights (Joachims et al.), because otherwise the model learns the old ranker's mistakes.</li>
+<li><b>Sequential models over interaction history:</b> a transformer reading hundreds of past interactions captures taste trajectory and helps sparse users, but it needs GPU serving and shared-context batching (as LinkedIn describes), so propose it as an upgrade with a cost analysis.</li>
+<li><b>Exploration:</b> reserve a small share of slots for uncertain posts or authors (for example Thompson sampling over reaction rates) so new content can earn data; without it, the ranker only ever confirms what it already knows.</li>
+<li><b>Long-term value versus short-term engagement:</b> time spent can rise while satisfaction falls, so run long-running holdouts, survey-based quality metrics, and retention as the final judge of weight vectors.</li>
+<li><b>Choosing blend weights:</b> start from survey-informed priors, test candidate vectors as parallel arms, and keep guardrails fixed; the weights are a product decision as much as a modeling one, and they can drift as user behavior changes.</li>
+<li><b>Integrity and misinformation demotion:</b> keep classifier scores as both features and re-ranking inputs; demotion strength should be tunable without retraining, and appeals and audits should be possible.</li>
+<li><b>Creator ecosystem health:</b> track exposure by creator size and let small authors earn data; LinkedIn states it audits that creators compete on equal footing, which is a good guardrail to mention.</li>
+<li><b>Explainability:</b> "why am I seeing this?" is a product feature and a debugging tool; surface the top affinity and reaction drivers (for example "you often react to posts by this friend").</li>
+<li><b>Training-serving skew:</b> log the exact features used at request time and compute training features point-in-time, since counters and affinities change quickly.</li>
+<li><b>Experimentation with interference:</b> use graph-cluster randomization, creator-side metrics, and holdouts, because a user-level split leaks across friends.</li>
+</ul>
+
+<h2 class="nonum">Check yourself</h2>
+<p class="qa-intro">Questions are tagged by the level they target. The first set checks Senior-level fundamentals and arithmetic; Staff and Principal questions probe trade-offs, operations, experimentation and organization. Try to answer aloud for two minutes before opening one.</p>
+<div class="qa-bar" data-qa></div>
+<details class="ans" data-lvl="sr"><summary>Why predict several reactions and blend them rather than train one engagement score?</summary>Reactions differ in meaning and base rate, so a single pooled label is dominated by the common ones (click, dwell) and cannot express negative feedback. Separate heads let product teams change weights without retraining, give calibrated probabilities that can be audited, and share a trunk so rare heads (share, hide) borrow strength from common ones. The linear blend also lets a reaction a user almost never performs have near-zero influence automatically.</details>
+<details class="ans" data-lvl="sr"><summary>A viewer gets these predictions for one post: click 0.20, like 0.10, comment 0.02, hide 0.01, with weights 1, 2, 5, and &minus;20. What is its blended value, and what happens if the hide head is over-predicted by 3x?</summary>Value = 0.20&middot;1 + 0.10&middot;2 + 0.02&middot;5 &minus; 0.01&middot;20 = 0.20 + 0.20 + 0.10 &minus; 0.20 = <b>0.30</b>. If hide is over-predicted to 0.03, the penalty becomes 0.60 and the value falls to &minus;0.10, flipping a good post to a bad one. This is why every head must be calibrated before blending.</details>
+<details class="ans" data-lvl="sr"><summary>You down-sampled negatives to 25% for training. A head outputs 0.2 on an example. What is the corrected probability, and why does it matter?</summary>q = p / (p + (1 &minus; p) / w) = 0.2 / (0.2 + 0.8 / 0.25) = 0.2 / (0.2 + 3.2) = 0.2 / 3.4 = <b>0.059</b>. Without the correction the blend would treat this as a 20% chance, inflating that reaction's contribution roughly 3.4 times. A per-head calibrator fitted on recent, unsampled traffic then removes remaining error.</details>
+<details class="ans" data-lvl="st"><summary>How do you serve a user who almost never reacts, and how do you evaluate it?</summary>Add implicit heads (dwell, expand, video watch fraction) that fire for everyone, include them in the blend, and let the shared trunk transfer patterns from active users. Shift weights toward implicit heads for low-activity users. Evaluate by cohort: report AUC and calibration for passive and active segments separately, and track session time and return rate for passive users in the A/B test, since like counts will not move.</details>
+<details class="ans" data-lvl="st"><summary>Your A/B test shows a 3% lift in likes in treatment, but you suspect interference. What do you do?</summary>Treatment users produce better-ranked posts that control friends see, and control users' reactions affect what treatment users see, so a user-level split mixes the arms. Use graph-cluster randomization or ego-cluster designs, compare viewer-side and creator-side metrics, and confirm with a larger or longer holdout. Also check guardrails (hides, reports) and long-term retention, not only likes.</details>
+<details class="ans" data-lvl="sr"><summary>Estimate the ranking compute for 500 million daily users and how you would reduce it.</summary>With 8 sessions per user, there are 4e9 requests per day, about 46k QPS average and 140k at 3x peak. Scoring 500 posts per request is 70M post scores per second; at an assumed 10 MFLOPs each that is 7e14 FLOP/s. Reduce it with the light pass 0 (score 1,500 cheaply, keep 500), batching, feature caching, a cached next page, prefetch for heavy users, and smaller models for low-engagement segments.</details>
+<details class="ans" data-lvl="st"><summary>The weights in the blend encode product values. Who sets them, and how do you tune them without gaming the metric?</summary><p>Keep roles separate. The model answers what the user will do (calibrated heads); the weights state what the company values. Set them through a process: start from a policy (what long-term outcomes matter: meaningful interactions, time well spent, integrity), then tune with online experiments using Bayesian optimization over the weights, with guardrails (hides, reports, retention) as constraints and the long-term metric as the objective.</p><p>To avoid Goodhart effects: version the weights, review them on a schedule with stakeholders (product, policy, integrity), keep a long-term holdout, and check for gaming by creators (engagement bait). Record each change with its experiment results so that value judgments are auditable, not hidden in code.</p><p class="probe"><b>Likely follow-ups:</b> How do you detect that creators are gaming a high-weight reaction? &middot; What if two stakeholders want opposite changes?</p><p class="signal"><b>What makes this Staff-level:</b> You treat weights as governed product decisions with evidence, not a hand-tuned magic number.</p></details>
+<details class="ans" data-lvl="st"><summary>Misinformation and borderline content get high predicted engagement. Where in the stack do you intervene?</summary><p>At several layers, each for a reason. As a feature and label source: integrity classifier scores feed the ranker so it can learn the long-term cost. As a score modifier at re-rank time: a demotion multiplier for content flagged by classifiers or fact-checkers, which is cheaper to adjust than retraining. As a candidate filter: remove clearly violating items. As a product intervention: labels and friction for sharing.</p><p>Measure with integrity-specific metrics: prevalence of violating content views (sampled and human-labeled), distribution of exposure to flagged content, and the engagement cost of the demotions. Make the trade-off explicit: demotion strength is chosen from the experiment frontier of integrity gain against engagement loss and signed off by the owners.</p><p class="probe"><b>Likely follow-ups:</b> Why not just remove all borderline content? &middot; How do you keep the demotion from becoming a hidden censorship system?</p><p class="signal"><b>What makes this Staff-level:</b> You apply different mechanisms at different layers and measure prevalence, not just removals.</p></details>
+<details class="ans" data-lvl="pr"><summary>You must cut serving cost by 30 percent without losing engagement. What is your plan?</summary><p>Profile first: which stage, which model, which features cost the most per request, and how engagement relates to compute (diminishing returns). Candidate levers: a cascade with a light first-pass ranker (score 1,500 cheaply, keep 500 for the heavy model), caching user and item features and the next page, quantization (bf16 or int8) and distillation of the heavy ranker, early-exit or truncated models, and adaptive compute that spends more on high-value requests and less on low-value ones.</p><p>Evaluate each lever as a point on a cost-per-engagement curve with an A/B test, ship the ones that give the most savings per unit of lost engagement, and stop at the 30 percent target. Track a standing efficiency metric (cost per thousand sessions) so savings persist, and keep headroom for new features.</p><p class="probe"><b>Likely follow-ups:</b> Which lever has the highest risk of silent quality loss? &middot; How do you decide which requests get more compute?</p><p class="signal"><b>What makes this Principal-level:</b> You treat cost as a first-class objective with a frontier and a sequence of measured steps.</p></details>
+<details class="ans" data-lvl="st"><summary>How fresh must reaction features be, and how do you build near-real-time features correctly?</summary><p>Decide by value: measure how much model quality decays as feature age grows (for example, retrain with features lagged by 1 minute, 10 minutes, 1 hour) and set a freshness SLO where the curve flattens. Build streaming counters (a windowed aggregation over an event stream) for the fast features and batch jobs for the slow ones; serve both from a feature store with the same definitions.</p><p>Correctness matters more than speed: log the features exactly as served and train on those logs (point-in-time correct), so training sees what serving saw. Monitor freshness (lag) and null rates per feature, and define a fallback (a default or a last-known value) with an alarm when a stream stalls.</p><p class="probe"><b>Likely follow-ups:</b> How do you backfill a new streaming feature for training? &middot; What breaks if the stream lags by ten minutes during a viral event?</p><p class="signal"><b>What makes this Staff-level:</b> You justify the freshness tier with data and protect train-serve consistency.</p></details>
+
+<h2 class="nonum">References</h2>
+<ol class="refs">
+<li>Lada, Wang, Yan. How machine learning powers Facebook's News Feed ranking algorithm. Meta Engineering, 2021. <a href="https://engineering.fb.com/2021/01/26/core-infra/news-feed-ranking/">engineering.fb.com</a></li>
+<li>Agarwal et al. Personalizing LinkedIn Feed. KDD 2015. <a href="https://dl.acm.org/doi/10.1145/2783258.2788614">dl.acm.org</a></li>
+<li>LinkedIn Engineering. Engineering the next generation of LinkedIn's Feed. <a href="https://www.linkedin.com/blog/engineering/feed/engineering-the-next-generation-of-linkedins-feed">linkedin.com</a></li>
+<li>Hertel et al. An Industrial-Scale Sequential Recommender for LinkedIn Feed Ranking. CIKM 2026. <a href="https://arxiv.org/abs/2602.12354">arxiv.org/abs/2602.12354</a></li>
+<li>Borisyuk et al. LiRank: Industrial Large Scale Ranking Models at LinkedIn. KDD 2024. <a href="https://arxiv.org/abs/2402.06859">arxiv.org/abs/2402.06859</a></li>
+<li>Ma et al. Modeling Task Relationships in Multi-task Learning with Multi-gate Mixture-of-Experts. KDD 2018. <a href="https://dl.acm.org/doi/10.1145/3219819.3220007">dl.acm.org</a></li>
+<li>Zhao et al. Recommending What Video to Watch Next: A Multitask Ranking System. RecSys 2019. <a href="https://dl.acm.org/doi/10.1145/3298689.3346997">dl.acm.org</a></li>
+<li>Guo et al. On Calibration of Modern Neural Networks. ICML 2017. <a href="https://arxiv.org/abs/1706.04599">arxiv.org/abs/1706.04599</a></li>
+<li>He et al. Practical Lessons from Predicting Clicks on Ads at Facebook. ADKDD 2014. <a href="https://dl.acm.org/doi/10.1145/2648584.2648589">dl.acm.org</a></li>
+<li>Joachims, Swaminathan, Schnabel. Unbiased Learning-to-Rank with Biased Feedback. WSDM 2017. <a href="https://arxiv.org/abs/1608.04468">arxiv.org/abs/1608.04468</a></li>
+<li>Ugander, Karrer, Backstrom, Kleinberg. Graph Cluster Randomization: Network Exposure to Multiple Universes. KDD 2013. <a href="https://arxiv.org/abs/1305.6979">arxiv.org/abs/1305.6979</a></li>
+<li>Saveski et al. Detecting Network Effects: Randomizing Over Randomized Experiments. KDD 2017. <a href="https://dl.acm.org/doi/10.1145/3097983.3098192">dl.acm.org</a></li>
+<li>Covington, Adams, Sargin. Deep Neural Networks for YouTube Recommendations. RecSys 2016. <a href="https://dl.acm.org/doi/10.1145/2959100.2959190">dl.acm.org</a></li>
+<li>Wang et al. DCN V2: Improved Deep and Cross Network and Practical Lessons for Web-scale Learning to Rank Systems. WWW 2021. <a href="https://arxiv.org/abs/2008.13535">arxiv.org/abs/2008.13535</a></li>
+</ol>
+</main></div>
+<script src="assets/dg.js"></script>
+<script src="assets/nav.js"></script>
+<script src="assets/qa.js"></script>
+</body>
+</html>

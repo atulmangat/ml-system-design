@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ML System Design Study Guide</title>
+<link rel="stylesheet" href="assets/style.css">
+<style>
+.wrap{max-width:1040px;margin:0 auto;padding:0 24px 90px}
+.hero{padding:48px 0 16px;max-width:860px}
+.hero h1{font-size:clamp(2.1rem,4.5vw,3rem);line-height:1.15;margin:0 0 16px;letter-spacing:-.02em}
+.hero .lead{font-size:1.18rem;line-height:1.65;color:var(--muted);margin:0 0 10px}
+.stats{display:flex;flex-wrap:wrap;gap:12px;margin:28px 0 10px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px 20px;flex:1;min-width:130px}
+.stat b{display:block;font-size:1.65rem;letter-spacing:-.02em;color:var(--fg)}
+.stat span{font-size:13px;color:var(--muted);font-weight:500}
+
+/* framework pill pipeline */
+.pipeline-box{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:22px 24px;margin:32px 0 40px}
+.pipeline-box h3{margin:0 0 6px;font-size:1.05rem;display:flex;align-items:center;gap:8px}
+.pipeline-box p{margin:0 0 16px;font-size:14px;color:var(--muted)}
+.pipeline{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px}
+.pipe-step{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:10px 12px;font-size:13px;line-height:1.35}
+.pipe-step .num{font-size:11px;font-weight:700;color:var(--accent);letter-spacing:.06em;text-transform:uppercase;margin-bottom:3px}
+.pipe-step .title{font-weight:600;color:var(--fg)}
+
+/* featured chapter 1 */
+.featured-card{background:var(--accent-soft);border:1.5px solid var(--accent);border-radius:16px;padding:24px 28px;margin:32px 0;display:flex;flex-wrap:wrap;gap:20px;align-items:center;justify-content:space-between;text-decoration:none;color:var(--fg);transition:transform .12s,box-shadow .12s}
+.featured-card:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(47,91,234,0.12)}
+.featured-content{max-width:700px}
+.featured-content .n{color:var(--accent);font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:4px}
+.featured-content .t{font-size:1.45rem;font-weight:700;margin:0 0 6px;letter-spacing:-.01em}
+.featured-content .d{font-size:14.5px;color:var(--muted);line-height:1.55;margin:0}
+.featured-btn{background:var(--accent);color:#fff;font-weight:600;font-size:14px;padding:10px 20px;border-radius:10px;white-space:nowrap;display:inline-flex;align-items:center;gap:6px}
+:root[data-theme="dark"] .featured-btn{color:#0f1319}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]) .featured-btn{color:#0f1319}}
+
+/* grid cards */
+.section-hdr{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin:44px 0 16px;padding-top:24px;border-top:1px solid var(--line)}
+.section-hdr h2{margin:0;padding:0;border:0;font-size:1.55rem}
+.section-hdr span{font-size:13.5px;color:var(--muted)}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px;margin:16px 0 40px}
+.card{display:flex;flex-direction:column;justify-content:space-between;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;text-decoration:none;color:var(--fg);transition:transform .12s,border-color .12s,box-shadow .12s}
+.card:hover{border-color:var(--accent);transform:translateY(-2px);box-shadow:0 6px 18px rgba(0,0,0,0.04)}
+.card-top .n{display:flex;justify-content:space-between;align-items:center;color:var(--accent);font-size:11.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px}
+.card-top .badge{font-size:11px;font-weight:600;color:var(--muted);background:var(--bg);border:1px solid var(--line);padding:2px 7px;border-radius:6px;letter-spacing:0;text-transform:none}
+.card-top .t{font-size:1.18rem;font-weight:700;line-height:1.3;margin:0 0 8px}
+.card-top .d{font-size:13.5px;color:var(--muted);line-height:1.5;margin:0 0 14px}
+.card-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:auto;padding-top:10px;border-top:1px solid var(--line)}
+.card-tags span{font-size:11.5px;color:var(--muted);background:var(--bg);padding:2px 8px;border-radius:5px;border:1px solid var(--line)}
+
+/* study steps */
+.steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;margin:20px 0;padding:0;list-style:none}
+.steps li{display:flex;gap:16px;align-items:flex-start;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;transition:transform .12s,border-color .12s}
+.steps li:hover{border-color:var(--accent);transform:translateY(-2px)}
+.step-num{flex:none;display:flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:9px;background:var(--accent);color:#fff;font-weight:700;font-size:14px;margin-top:1px}
+:root[data-theme="dark"] .step-num{color:#0f1319}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]) .step-num{color:#0f1319}}
+.step-body{flex:1;min-width:0}
+.step-title{font-weight:700;font-size:15px;color:var(--fg);margin-bottom:5px;line-height:1.35}
+.step-desc{font-size:14px;color:var(--muted);line-height:1.55;margin:0}
+@media (min-width:720px){.steps li:last-child{grid-column:1 / -1}}
+
+.footer{margin-top:60px;padding-top:24px;border-top:1px solid var(--line);font-size:13.5px;color:var(--muted);display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:16px}
+.footer a{color:var(--muted);text-decoration:none}
+.footer a:hover{color:var(--accent)}
+</style>
+</head>
+<body data-slug="index">
+<div class="topbar">
+  <strong>ML System Design Study Guide</strong>
+  <div style="display:flex;gap:18px;align-items:center">
+    <a href="intro.html" style="font-weight:600;color:var(--accent);text-decoration:none">Start Chapter 1 &rarr;</a>
+    <span style="color:var(--muted)">11 chapters · 227 diagrams</span>
+  </div>
+</div>
+
+<div class="wrap">
+<section class="hero">
+  <div class="kicker">Original Study Guide &amp; Technical Reference</div>
+  <h1>Machine Learning System Design, one problem per page</h1>
+  <p class="lead">Ten classic machine learning system design problems, each worked end to end: clarify requirements, frame the ML objective, engineer features and labels, construct models, calibrate metrics, and design scale-ready serving architectures. Built with 227 original SVG diagrams and 100% self-contained for offline study.</p>
+  <div class="stats">
+    <div class="stat"><b>10</b><span>problems</span></div>
+    <div class="stat"><b>227</b><span>diagrams</span></div>
+    <div class="stat"><b>7</b><span>step framework</span></div>
+    <div class="stat"><b>100%</b><span>offline &amp; free</span></div>
+  </div>
+</section>
+
+<!-- 7-Step Framework Blueprint -->
+<div class="pipeline-box">
+  <h3>The 7-Step Blueprint Followed in Every Chapter</h3>
+  <p>Standardized structure designed for 45-minute technical interviews and production system architecture.</p>
+  <div class="pipeline">
+    <div class="pipe-step"><div class="num">Step 1</div><div class="title">Clarify Requirements</div></div>
+    <div class="pipe-step"><div class="num">Step 2</div><div class="title">Frame as ML Task</div></div>
+    <div class="pipe-step"><div class="num">Step 3</div><div class="title">Data Preparation</div></div>
+    <div class="pipe-step"><div class="num">Step 4</div><div class="title">Model Development</div></div>
+    <div class="pipe-step"><div class="num">Step 5</div><div class="title">Evaluation &amp; Slices</div></div>
+    <div class="pipe-step"><div class="num">Step 6</div><div class="title">Serving &amp; Scale</div></div>
+    <div class="pipe-step"><div class="num">Step 7</div><div class="title">Talking Points</div></div>
+  </div>
+</div>
+
+<!-- Featured Chapter 1 -->
+<a class="featured-card" href="intro.html">
+  <div class="featured-content">
+    <div class="n">Foundational Blueprint · Read First</div>
+    <div class="t">Chapter 1: Introduction and Framework</div>
+    <p class="d">How every ML design answer is structured: time allocation for 45-minute interviews, the canonical funnel, multi-stage pipelines, and offline vs. online trade-offs.</p>
+  </div>
+  <div class="featured-btn">Read Chapter 1 &rarr;</div>
+</a>
+
+<!-- 10 Problems Grid -->
+<div class="section-hdr">
+  <h2 class="nonum">System Design Problems</h2>
+  <span>10 detailed problem chapters · 22 diagrams each</span>
+</div>
+
+<div class="cards" id="cards">
+  <!-- Chapter 2 -->
+  <a class="card" href="visual-search.html">
+    <div class="card-top">
+      <div class="n"><span>Chapter 2 · Computer Vision</span><span class="badge">22 diagrams</span></div>
+      <div class="t">Visual Search System</div>
+      <p class="d">Retrieve visually similar images from a multi-billion image catalog with sub-100 ms p99 latency.</p>
+    </div>
+    <div class="card-tags">
+      <span>Two-Tower Encoder</span>
+      <span>IVF-PQ ANN</span>
+      <span>Contrastive Loss</span>
+      <span>Rescoring</span>
+    </div>
+  </a>
+
+  <!-- Chapter 3 -->
+  <a class="card" href="street-view-blurring.html">
+    <div class="card-top">
+      <div class="n"><span>Chapter 3 · Vision &amp; Privacy</span><span class="badge">22 diagrams</span></div>
+      <div class="t">Street View Blurring</div>
+      <p class="d">Detect and irreversibly blur faces and license plates at 99%+ recall across billions of multi-megapixel panoramas.</p>
+    </div>
+    <div class="card-tags">
+      <span>Object Detection</span>
+      <span>Focal Loss</span>
+      <span>Tiling &amp; Overlap</span>
+      <span>Reprocessing Tiers</span>
+    </div>
+  </a>
+
+  <!-- Chapter 4 -->
+  <a class="card" href="youtube-video-search.html">
+    <div class="card-top">
+      <div class="n"><span>Chapter 4 · Search &amp; NLP</span><span class="badge">22 diagrams</span></div>
+      <div class="t">YouTube Video Search</div>
+      <p class="d">Multi-modal video search: text query in, ranked videos out, combining BM25 lexical match and dual encoders.</p>
+    </div>
+    <div class="card-tags">
+      <span>Hybrid Retrieval</span>
+      <span>Reciprocal Rank Fusion</span>
+      <span>LambdaMART</span>
+      <span>nDCG</span>
+    </div>
+  </a>
+
+  <!-- Chapter 5 -->
+  <a class="card" href="harmful-content-detection.html">
+    <div class="card-top">
+      <div class="n"><span>Chapter 5 · Moderation &amp; Safety</span><span class="badge">22 diagrams</span></div>
+      <div class="t">Harmful Content Detection</div>
+      <p class="d">Detect policy-violating text and media under 0.1% base rate prevalence with proactive human-in-the-loop triage.</p>
+    </div>
+    <div class="card-tags">
+      <span>Extreme Imbalance</span>
+      <span>Active Learning</span>
+      <span>Queue Sizing</span>
+      <span>PR Operating Point</span>
+    </div>
+  </a>
+
+  <!-- Chapter 6 -->
+  <a class="card" href="video-recommendation.html">
+    <div class="card-top">
+      <div class="n"><span>Chapter 6 · Recommendations</span><span class="badge">22 diagrams</span></div>
+      <div class="t">Video Recommendation System</div>
+      <p class="d">Two-stage recommendation funnel serving personalized video feeds to hundreds of millions of daily active users.</p>
+    </div>
+    <div class="card-tags">
+      <span>Candidate Generation</span>
+      <span>Two-Tower DNN</span>
+      <span>Multi-Task Ranking</span>
+      <span>Exploration</span>
+    </div>
+  </a>
+
+  <!-- Chapter 7 -->
+  <a class="card" href="event-recommendation.html">
+    <div class="card-top">
+      <div class="n"><span>Chapter 7 · Recommendations</span><span class="badge">22 diagrams</span></div>
+      <div class="t">Event Recommendation System</div>
+      <p class="d">Recommend localized, short-lived events under extreme cold-start, spatial decay, and capacity thresholds.</p>
+    </div>
+    <div class="card-tags">
+      <span>Severe Cold-Start</span>
+      <span>H3 Spatial Cells</span>
+      <span>Distance Decay</span>
+      <span>Pointwise GBDT</span>
+    </div>
+  </a>
+
+  <!-- Chapter 8 -->
+  <a class="card" href="ad-click-prediction.html">
+    <div class="card-top">
+      <div class="n"><span>Chapter 8 · Ads &amp; Monitization</span><span class="badge">22 diagrams</span></div>
+      <div class="t">Ad Click Prediction</div>
+      <p class="d">Predict real-time click-through rate for auction bidding with calibrated probabilities and delayed-feedback labels.</p>
+    </div>
+    <div class="card-tags">
+      <span>Normalized Entropy</span>
+      <span>Negative Downsampling</span>
+      <span>Isotonic Regression</span>
+      <span>FTRL</span>
+    </div>
+  </a>
+
+  <!-- Chapter 9 -->
+  <a class="card" href="similar-listings.html">
+    <div class="card-top">
+      <div class="n"><span>Chapter 9 · Vacation Rentals</span><span class="badge">22 diagrams</span></div>
+      <div class="t">Similar Listings</div>
+      <p class="d">Real-time 'more-like-this' carousel recommendations using session co-click graph embeddings and booking signals.</p>
+    </div>
+    <div class="card-tags">
+      <span>Listing2Vec</span>
+      <span>Skip-Gram with Negatives</span>
+      <span>Global Context</span>
+      <span>Two-Pass Serving</span>
+    </div>
+  </a>
+
+  <!-- Chapter 10 -->
+  <a class="card" href="news-feed.html">
+    <div class="card-top">
+      <div class="n"><span>Chapter 10 · Social Platforms</span><span class="badge">22 diagrams</span></div>
+      <div class="t">Personalized News Feed</div>
+      <p class="d">Score and blend multiple reaction probabilities (like, comment, share, hide) with post-ranking diversity and safety controls.</p>
+    </div>
+    <div class="card-tags">
+      <span>Multi-Task Shared Bottom</span>
+      <span>Probability Blending</span>
+      <span>Calibration Drift</span>
+      <span>Re-Ranking</span>
+    </div>
+  </a>
+
+  <!-- Chapter 11 -->
+  <a class="card" href="people-you-may-know.html">
+    <div class="card-top">
+      <div class="n"><span>Chapter 11 · Social Graphs</span><span class="badge">22 diagrams</span></div>
+      <div class="t">People You May Know</div>
+      <p class="d">Predict reciprocal friendships across a billion-member social graph combining 2-hop graph expansion and GNNs.</p>
+    </div>
+    <div class="card-tags">
+      <span>Link Prediction</span>
+      <span>Adamic-Adar</span>
+      <span>GraphSAGE</span>
+      <span>Reciprocal Objective</span>
+    </div>
+  </a>
+</div>
+
+<!-- Study Strategy -->
+<div class="section-hdr">
+  <h2 class="nonum">How to Practice With This Guide</h2>
+  <span>Strategies for self-study and mock interviews</span>
+</div>
+
+<ol class="steps">
+  <li>
+    <div class="step-num">1</div>
+    <div class="step-body">
+      <div class="step-title">Master Chapter 1 first</div>
+      <p class="step-desc">It defines the 7-step blueprint, the latency budgeting method, and the funnel rubric every answer follows.</p>
+    </div>
+  </li>
+  <li>
+    <div class="step-num">2</div>
+    <div class="step-body">
+      <div class="step-title">Read only the requirements</div>
+      <p class="step-desc">For each problem, read &ldquo;Clarifying Requirements&rdquo; and close the page.</p>
+    </div>
+  </li>
+  <li>
+    <div class="step-num">3</div>
+    <div class="step-body">
+      <div class="step-title">Sketch your own design</div>
+      <p class="step-desc">Take 10 minutes on paper to outline the ML objective, features, baseline model, and metrics.</p>
+    </div>
+  </li>
+  <li>
+    <div class="step-num">4</div>
+    <div class="step-body">
+      <div class="step-title">Compare with the chapter</div>
+      <p class="step-desc">Review the worked diagrams and notice where your design had gaps or missed operational trade-offs.</p>
+    </div>
+  </li>
+  <li>
+    <div class="step-num">5</div>
+    <div class="step-body">
+      <div class="step-title">Test yourself out loud</div>
+      <p class="step-desc">Each chapter ends with Senior, Staff and Principal level questions. Filter by level, hit &ldquo;Drill me&rdquo; for a timed two-minute question, answer aloud, then reveal. Rate yourself on the scorecard in the Introduction to see which axis to study next.</p>
+    </div>
+  </li>
+</ol>
+
+<!-- Attribution & Credit -->
+<div class="note" style="margin-top:48px">
+  <b>Credit &amp; Attribution.</b> The problem syllabus and general chapter structure follow <i>Machine Learning System Design Interview</i> by <b>Ali Aminian and Alex Xu</b> (ByteByteGo). The prose, worked arithmetic, tables, and SVG diagrams here are original, developed independently for self-study and cross-referenced against public research papers (NeurIPS, ICML, KDD, ICCV) and engineering publications (Meta, Google, LinkedIn, Airbnb, Pinterest).
+  For the authors' comprehensive published work, visit the
+  <a href="https://bytebytego.com/courses/machine-learning-system-design-interview" target="_blank" rel="noopener">official ByteByteGo course</a>.
+</div>
+
+<footer class="footer">
+  <div>ML System Design Study Guide · Built for offline study</div>
+  <div style="display:flex;gap:18px">
+    <a href="intro.html">Chapter 1</a>
+    <a href="street-view-blurring.html">Street View Blurring</a>
+    <a href="gallery.html">Diagram Gallery</a>
+  </div>
+</footer>
+</div>
+
+<script src="assets/dg.js"></script>
+<script src="assets/nav.js"></script>
+</body>
+</html>

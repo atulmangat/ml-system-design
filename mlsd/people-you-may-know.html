@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>People You May Know</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-slug="people-you-may-know">
+<div class="topbar"><a href="index.html">&larr; ML System Design Study Guide</a><span style="color:var(--muted)">Chapter 11 of 11</span></div>
+<div class="layout"><aside class="toc" id="toc"></aside>
+<main>
+<div class="kicker">Chapter 11</div>
+<h1>People You May Know</h1>
+<p class="lead">People You May Know (PYMK) suggests other members a user might want to connect with, on a symmetric social graph of about a billion users. It is hard for four reasons: the candidate pool is the whole network, true new friends are a tiny fraction of it, every suggestion involves two people who both have to say yes, and the data is deeply personal. The core idea is a funnel: cheap graph-based retrieval, a pair-level ranker trained on accepted requests, and a layer of privacy, spam and exposure rules on top.</p>
+
+<h2>Clarifying Requirements</h2>
+<div class="dlg">
+<div class="turn c"><span>Candidate</span><p>What is the business goal of the feature?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Help members build a network they value. More real connections lead to more engagement and better retention, but only if the connections are wanted.</p></div>
+<div class="turn c"><span>Candidate</span><p>Is the graph symmetric, like friends, or directed, like follow?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Symmetric. A connection exists only after the other person accepts a request, so we can treat the final graph as undirected.</p></div>
+<div class="turn c"><span>Candidate</span><p>What does the user see and what can they do?</p></div>
+<div class="turn i"><span>Interviewer</span><p>A carousel of about 20 cards. Each card has a name, photo, mutual-friend count, a Connect button and a dismiss button.</p></div>
+<div class="turn c"><span>Candidate</span><p>How big is the network?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Around one billion users, with hundreds of connections each on average. Assume 300 million members open the feature on a given day.</p></div>
+<div class="turn c"><span>Candidate</span><p>Which signals can I use besides the graph?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Profile data such as school, employer and location, interactions such as profile views and messages, and contacts that members chose to import.</p></div>
+<div class="turn c"><span>Candidate</span><p>Do suggestions have to be computed in real time?</p></div>
+<div class="turn i"><span>Interviewer</span><p>No. The graph changes slowly, so precomputation is fine. But a person who became your friend this morning must not be suggested again this afternoon, and the page should load in about 200 ms at p99.</p></div>
+<div class="turn c"><span>Candidate</span><p>What feedback do we get?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Impressions, profile clicks, requests sent, requests accepted, ignored or declined, dismissals, and "I don't know this person" reports.</p></div>
+<div class="turn c"><span>Candidate</span><p>How important are new members with almost no connections?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Very. A new member with few connections is the biggest retention opportunity, and also the hardest case for any graph method.</p></div>
+<div class="turn c"><span>Candidate</span><p>Any constraints on privacy and abuse, and anything out of scope?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Never reveal hidden relationships or blocked users, and be careful with contact uploads. Spammers will try to use the feature to find targets. Out of scope: follow recommendations, people search, group suggestions.</p></div>
+</div>
+<div class="summary"><p>Build a system that recommends other members to connect with on a symmetric social graph of about 1B users. Use graph structure, profile data, interactions and imported contacts. Precompute candidates in batch, rank online with fresh signals, optimize for accepted requests, and respect privacy, spam and fairness constraints.</p></div>
+
+<script type="application/json" class="dg" data-cap="The product flow: a suggestion only becomes an edge if the other person accepts, so the second row is where the label is created">
+{"type":"graph","cols":5,"gapX":40,
+ "groups":[{"t":"You","c0":0,"c1":3,"r0":0,"r1":0},{"t":"The other person","c0":2,"c1":4,"r0":1,"r1":1}],
+ "nodes":[
+  {"id":"open","t":"Open My Network","s":"tab or home carousel","c":0,"r":0,"k":"io"},
+  {"id":"cards","t":"See cards","s":"name, photo, mutual friends","c":1,"r":0},
+  {"id":"tap","t":"Tap Connect","s":"or dismiss with X","c":2,"r":0},
+  {"id":"req","t":"Request pending","s":"sent, not yet accepted","c":3,"r":0,"k":"data"},
+  {"id":"fresh","t":"Fresh graph and labels","s":"for filters and training","c":4,"r":0,"k":"data"},
+  {"id":"note","t":"Gets notification","s":"sees name, mutual friends","c":2,"r":1},
+  {"id":"dec","t":"Accept, ignore or decline","s":"the outcome we learn from","c":3,"r":1},
+  {"id":"edge","t":"New friendship edge","s":"both graphs change","c":4,"r":1,"k":"store"}],
+ "edges":[["open","cards"],["cards","tap"],["tap","req"],["tap","note","request"],["note","dec"],["dec","edge","accept"],["edge","fresh","updates",{"d":1}]]}
+</script>
+
+<h2>Frame the Problem as an ML Task</h2>
+<h3>ML objective</h3>
+<p>The product wants more connections that people value. "Connection that people value" has to be turned into something we can log and optimize. A candidate may consider four objectives.</p>
+<table>
+<caption>Candidate objectives</caption>
+<tr><th>Objective</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Maximize requests sent</td><td>Dense, immediate signal</td><td>Rewards persuasive cards, ignores the recipient, drives spam and declines</td></tr>
+<tr><td>Maximize accepted requests</td><td>Needs consent from both people; still logged within days</td><td>Delayed, sparser, depends on the recipient's inbox state</td></tr>
+<tr><td>Maximize long-term value (connection still active after 30 days)</td><td>Closest to the real goal</td><td>Slow, noisy, hard to attribute to one suggestion</td></tr>
+<tr><td>Predict any future edge (pure link prediction)</td><td>Needs only graph history</td><td>Most such edges would have formed anyway, so incremental value is low</td></tr>
+</table>
+<div class="callout key"><p><b>Decision.</b> Maximize the expected number of accepted connections: score a pair by P(send) times P(accept given send), trained with acceptance labels. Use "connection still active after 30 days" as a measurement metric and a guardrail, not as the training label.</p></div>
+<h3>Input and output</h3>
+<p>The input is a viewer, the graph as of now, profile data, interaction logs and consented contact uploads. The output is an ordered list of about 20 members, each with a score and a privacy-safe reason.</p>
+<script type="application/json" class="dg" data-cap="The system as a black box: four kinds of input, one ranked list with reasons">
+{"type":"graph","cols":3,
+ "nodes":[
+  {"id":"g","t":"Social graph","s":"1B nodes, about 150B edges","c":0,"r":0,"k":"store"},
+  {"id":"p","t":"Profiles","s":"school, employer, city","c":0,"r":1,"k":"data"},
+  {"id":"i","t":"Interactions","s":"views, messages, photo tags","c":0,"r":2,"k":"data"},
+  {"id":"c","t":"Imported contacts","s":"opt-in, hashed phone or email","c":0,"r":3,"k":"data"},
+  {"id":"sys","t":"PYMK system","s":"candidates, ranking, filters","c":1,"r":1,"k":"model","dy":48},
+  {"id":"out","t":"Ranked suggestions","s":"about 20 people, each with a reason","c":2,"r":1,"k":"io","dy":48}],
+ "edges":[["g","sys"],["p","sys"],["i","sys"],["c","sys"],["sys","out"]]}
+</script>
+<h3>ML category</h3>
+<p>Brute force is impossible: scoring every pair is 1B x 1B = 10<sup>18</sup> pairs, and each viewer only has a few real future friends among a billion strangers. The task is link prediction, but it must be solved as retrieval plus ranking. A candidate may compare these model families.</p>
+<table>
+<caption>Model families for link prediction</caption>
+<tr><th>Family</th><th>Idea</th><th>Trade-offs</th></tr>
+<tr><td>Graph heuristics</td><td>Mutual friends, Jaccard, Adamic-Adar, shortest path</td><td>Simple, explainable, strong baseline; no learning, no profile signals</td></tr>
+<tr><td>Random walks (personalized PageRank, supervised random walks)</td><td>Score nodes by how often a walk from the viewer reaches them</td><td>Reaches 3 to 6 hops, helps sparse users; expensive and hard to tune</td></tr>
+<tr><td>Pointwise classifier on pairs</td><td>Predict P(accept) from pair features</td><td>Uses every signal, easy to calibrate; needs a candidate set first</td></tr>
+<tr><td>Two-tower embeddings</td><td>Encode viewer and candidate separately, retrieve by dot product</td><td>Fast ANN retrieval over profile similarity; no pair features</td></tr>
+<tr><td>GNN embeddings (GraphSAGE, PinSage)</td><td>Encode each member from the features of sampled neighbors</td><td>Captures multi-hop structure plus attributes, inductive; heavy to train, weak at exact 2-hop recall</td></tr>
+<tr><td>Pair-subgraph GNN (SEAL)</td><td>Classify the small subgraph around a candidate pair</td><td>Very accurate; too slow to run for every candidate</td></tr>
+</table>
+<div class="callout key"><p><b>Decision.</b> Use a funnel. Candidate generation merges several cheap sources (graph walks, shared school or employer, contacts, interactions, GNN-embedding ANN). A light ranker trims the pool, a rich pair-level ranker scores the survivors, and a re-ranker applies privacy, diversity and exposure rules.</p></div>
+<script type="application/json" class="dg" data-cap="The chosen formulation: from a billion members to about 20 cards, each stage cheaper per item than the next">
+{"type":"funnel","stages":[
+ {"t":"Candidate generation","s":"graph walks, rules, ANN","n":"~3,000","m":"1B members"},
+ {"t":"Light ranker","s":"small GBDT, few features","n":"~500"},
+ {"t":"Rich ranker","s":"all pair features, fresh signals","n":"~200 scored"},
+ {"t":"Filters and re-rank","s":"privacy, diversity, caps","n":"~20 shown"}]}
+</script>
+
+<h2>Data Preparation</h2>
+<h3>Data engineering</h3>
+<p>Four datasets matter. The graph is stored as adjacency lists keyed by member. Assuming a mean degree of 300 and 8-byte member IDs, 1B x 300 = 3 x 10<sup>11</sup> directed entries (150B undirected edges) take about 2.4 TB, which fits comfortably in a sharded graph store. Impression logs are the biggest stream: 300M viewers x 3 loads x 20 cards is about 18B impressions per day, roughly 1 TB per day at 60 bytes each (assumptions).</p>
+<table>
+<caption>Members (profile snapshot)</caption>
+<tr><th>member_id</th><th>age_bucket</th><th>city</th><th>school</th><th>employer</th><th>created_at</th></tr>
+<tr><td>u17</td><td>25-34</td><td>Toronto</td><td>UofT</td><td>Acme</td><td>2019-03</td></tr>
+<tr><td>u92</td><td>25-34</td><td>Toronto</td><td>UofT</td><td>Globex</td><td>2023-11</td></tr>
+</table>
+<table>
+<caption>Connections (stored in both directions)</caption>
+<tr><th>member_a</th><th>member_b</th><th>connected_at</th><th>origin</th></tr>
+<tr><td>u17</td><td>u41</td><td>2024-03-02</td><td>pymk</td></tr>
+<tr><td>u17</td><td>u55</td><td>2024-05-19</td><td>search</td></tr>
+</table>
+<table>
+<caption>Suggestion events (one row per impression)</caption>
+<tr><th>viewer</th><th>candidate</th><th>shown_at</th><th>position</th><th>source</th><th>sent</th><th>outcome</th></tr>
+<tr><td>u17</td><td>u92</td><td>11-02 09:14</td><td>3</td><td>2hop</td><td>1</td><td>accepted (11-03)</td></tr>
+<tr><td>u17</td><td>u80</td><td>11-02 09:14</td><td>7</td><td>contacts</td><td>0</td><td>dismissed</td></tr>
+<tr><td>u17</td><td>u63</td><td>11-02 09:14</td><td>9</td><td>ann</td><td>1</td><td>ignored</td></tr>
+</table>
+<table>
+<caption>Imported contacts (hashed; only for members who opted in)</caption>
+<tr><th>uploader</th><th>contact_hash</th><th>matched_member</th><th>uploaded_at</th></tr>
+<tr><td>u17</td><td>9f3a...c1</td><td>u80</td><td>2024-01-10</td></tr>
+</table>
+<p>Two logging details decide whether the data is usable. First, log the <b>candidate source and position</b> with each impression, because source is a feature and position bias must be corrected. Second, keep dated snapshots of the graph (daily is enough). Without snapshots you cannot rebuild what a feature looked like at impression time, and every offline number becomes optimistic.</p>
+
+<h3>Feature engineering</h3>
+<p>Features describe the viewer, the candidate and, most importantly, the pair.</p>
+<table>
+<caption>Features by entity</caption>
+<tr><th>Entity</th><th>Features</th><th>Encoding</th></tr>
+<tr><td>Viewer</td><td>Account age, degree, sessions in last 7 days, past accept rate of own requests, pending outgoing requests, recent connection velocity</td><td>Log-scaled counts; rates with Bayesian smoothing so small samples do not look extreme</td></tr>
+<tr><td>Candidate</td><td>Degree, pending incoming requests, accept rate and decline count of requests received, days since active, report rate, profile completeness</td><td>Log-scaled counts, smoothed rates, recency buckets</td></tr>
+<tr><td>Pair: graph</td><td>Common neighbors, Jaccard, Adamic-Adar, resource allocation, hop distance (2 or 3), personalized PageRank score, share of the viewer's friends who know the candidate</td><td>Numeric, log for counts; hop distance categorical; missing PPR as null</td></tr>
+<tr><td>Pair: profile</td><td>Same school with overlapping years, same employer with overlapping tenure, same city, shared groups, age gap</td><td>Match flags plus overlap length; hashed IDs for school and employer</td></tr>
+<tr><td>Pair: interaction</td><td>Profile views each way, co-tagged photos, shared events, messages exchanged with mutual friends</td><td>Time-decayed counts over 7, 30 and 90 days; reciprocity flags</td></tr>
+<tr><td>Pair: contacts</td><td>Candidate is in the viewer's contacts; viewer is in the candidate's contacts</td><td>Binary flags; usually the strongest single features</td></tr>
+<tr><td>Embeddings</td><td>GNN vectors of both members, cosine similarity, a few elementwise products</td><td>128-d half precision, looked up from the feature store</td></tr>
+<tr><td>Context</td><td>Candidate source and its score, device, time of day, display position</td><td>One-hot source; position used in training only</td></tr>
+</table>
+<p>Start with the graph heuristics, because they are both features and the baseline you must beat. Take a viewer with four friends and three candidates. Friend degrees are A=4, D=3, B=8 and C=400 (a recruiter who knows everyone). Candidate X knows A and D and has 6 connections; Y knows B and C and has 40; Z knows only C and has 2.</p>
+<script type="application/json" class="dg" data-cap="A small network: highlighted edges connect each candidate to the viewer's friends (mutual friends); degrees shown under the nodes">
+{"type":"net","h":330,"nodes":[
+ {"id":"u","t":"You","x":8,"y":50,"k":"me","s":"deg 4"},
+ {"id":"a","t":"A","x":40,"y":12,"k":"fr","s":"deg 4"},
+ {"id":"d","t":"D","x":40,"y":36,"k":"fr","s":"deg 3"},
+ {"id":"b","t":"B","x":40,"y":62,"k":"fr","s":"deg 8"},
+ {"id":"c","t":"C","x":40,"y":88,"k":"fr","s":"deg 400"},
+ {"id":"x","t":"X","x":80,"y":24,"k":"cand","s":"deg 6"},
+ {"id":"y","t":"Y","x":80,"y":64,"k":"cand","s":"deg 40"},
+ {"id":"z","t":"Z","x":80,"y":92,"k":"cand","s":"deg 2"}],
+ "edges":[["u","a"],["u","d"],["u","b"],["u","c"],["a","x",{"hl":1}],["d","x",{"hl":1}],["b","y",{"hl":1}],["c","y",{"hl":1}],["c","z",{"hl":1}]]}
+</script>
+<p>The three classic scores, with N(u) the set of u's neighbors:</p>
+<ul>
+<li><b>Common neighbors:</b> |N(u) &cap; N(v)|. Raw count of mutual friends.</li>
+<li><b>Jaccard:</b> |N(u) &cap; N(v)| divided by |N(u) &cup; N(v)|. Mutual friends relative to the combined circle, so large networks do not win by size alone.</li>
+<li><b>Adamic-Adar:</b> the sum over mutual friends w of 1 / ln(degree of w). A mutual friend who knows few people is strong evidence; one who knows everyone is weak.</li>
+</ul>
+<table>
+<caption>Scores for the example network (computed by hand)</caption>
+<tr><th>Candidate</th><th>Mutual friends</th><th>Degree</th><th>Common nbrs</th><th>Jaccard</th><th>Adamic-Adar</th></tr>
+<tr><td>X</td><td>A, D</td><td>6</td><td>2</td><td>2/8 = 0.250</td><td>1/ln4 + 1/ln3 = 0.721 + 0.910 = 1.63</td></tr>
+<tr><td>Y</td><td>B, C</td><td>40</td><td>2</td><td>2/42 = 0.048</td><td>1/ln8 + 1/ln400 = 0.481 + 0.167 = 0.65</td></tr>
+<tr><td>Z</td><td>C</td><td>2</td><td>1</td><td>1/5 = 0.200</td><td>1/ln400 = 0.17</td></tr>
+</table>
+<div class="callout math"><p>Union sizes: for Y, |N(u)| = 4 and |N(Y)| = 40 share 2 members, so the union is 4 + 40 - 2 = 42 and Jaccard = 2/42 = 0.048. Common neighbors ties X and Y at 2, Jaccard ranks X, Z, Y, and Adamic-Adar ranks X, Y, Z. Three heuristics, three different orders.</p></div>
+<script type="application/json" class="dg" data-cap="The same scores as a matrix, each column divided by its maximum; outlined cells mark the winner of each heuristic (common neighbors ties X and Y)">
+{"type":"matrix","rl":"Candidate","cl":"Heuristic","rows":["X","Y","Z"],"cols":["Mutual","Jaccard","Adamic"],
+ "v":[[1,1,1],[1,0.19,0.4],[0.5,0.8,0.1]],"hl":[[0,0],[1,0],[0,1],[0,2]]}
+</script>
+<div class="callout warn"><p>Common neighbors is biased toward popular candidates: a member with 40 friends has more chances to overlap with you than one with 2. Adamic-Adar and Jaccard correct different parts of this bias. A learned ranker should receive all three plus the degrees, and let the data decide.</p></div>
+<p>Graph features alone cannot see that two people studied together. Add profile overlap features, interaction counts, and the contact flags. Then add the GNN embeddings (see Model Development) as dense features. The pipeline has an offline half that builds heavy features once a day and an online half that keeps fast-moving counters fresh.</p>
+<script type="application/json" class="dg" data-cap="Feature pipeline: heavy graph and embedding features are built daily, fast-moving counters are streamed and merged at ranking time">
+{"type":"graph","cols":5,"gapX":40,
+ "groups":[{"t":"Offline: daily batch","c0":0,"c1":4,"r0":0,"r1":0},{"t":"Online: streaming and per request","c0":0,"c1":4,"r0":1,"r1":1}],
+ "nodes":[
+  {"id":"snap","t":"Graph snapshot","s":"adjacency lists at time T","c":0,"r":0,"k":"store"},
+  {"id":"gnn","t":"GNN embeddings","s":"one vector per member","c":1,"r":0,"k":"model"},
+  {"id":"pf","t":"Pair feature jobs","s":"counts, scores, cosines","c":2,"r":0},
+  {"id":"off","t":"Offline feature store","s":"daily snapshot","c":3,"r":0,"k":"store"},
+  {"id":"tt","t":"Training table","s":"pair, features, label","c":4,"r":0,"k":"data"},
+  {"id":"ev","t":"Event stream","s":"views, accepts, blocks","c":0,"r":1,"k":"data"},
+  {"id":"sp","t":"Stream processor","s":"windowed counters","c":1,"r":1},
+  {"id":"on","t":"Online feature store","s":"fresh in under a minute","c":2,"r":1,"k":"store"},
+  {"id":"rk","t":"Ranker","s":"reads both stores","c":3,"r":1,"k":"model"},
+  {"id":"rs","t":"Scored candidates","c":4,"r":1,"k":"io"}],
+ "edges":[["snap","gnn","graph"],["gnn","pf","vectors"],["pf","off","features"],["off","tt","join labels"],["ev","sp"],["sp","on","counters"],["off","on","daily sync",{"sa":"b","sb":"t","d":1}],["on","rk"],["rk","rs"]]}
+</script>
+<div class="callout warn"><p><b>Point-in-time leakage.</b> Training features must be computed from the graph as it was when the suggestion was shown. If you compute mutual-friend counts on today's graph, the new edge and the friendships it triggered are already in the counts, and the offline metric looks great while the online result disappoints.</p></div>
+
+<h3>Labels</h3>
+<table>
+<caption>Candidate label sources</caption>
+<tr><th>Label</th><th>Definition</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Request sent</td><td>Viewer taps Connect on a shown card</td><td>Dense, available within seconds</td><td>Measures persuasion, not mutual interest; spam-prone; ignores the recipient</td></tr>
+<tr><td>Request accepted</td><td>Recipient accepts within a window (7 days)</td><td>Both sides consented; robust to spam</td><td>Delayed, roughly 40% of sends never convert, depends on recipient inbox</td></tr>
+<tr><td>Edge formed in window</td><td>Pair connects within 30 days by any route</td><td>Large volume; needs no impression log; good for graph-only training</td><td>Includes connections that would happen anyway; not tied to the suggestion</td></tr>
+</table>
+<div class="callout key"><p><b>Decision.</b> Train the ranker with two heads: P(send | shown) and P(accept | sent), both from impression logs. Use "edge formed in window" to train the GNN, where the log of impressions is not needed. Using acceptance rather than send keeps spammy senders and aggressive card designs from looking good.</p></div>
+<script type="application/json" class="dg" data-cap="Label funnel per 1,000 impressions (illustrative): each stage is a different label with a different meaning and delay">
+{"type":"funnel","stages":[
+ {"t":"Suggestions shown","s":"impressions","n":"1,000","m":"negative if nothing follows"},
+ {"t":"Requests sent","s":"P(send) = 6%","n":"60"},
+ {"t":"Requests accepted","s":"P(accept | send) = 60%","n":"36"},
+ {"t":"Still active after 30 days","s":"value label, used for evaluation","n":"~29"}]}
+</script>
+<p>Practical handling of the labels:</p>
+<ul>
+<li><b>Imbalance.</b> Only about 3.6% of impressions end in an accepted request (36 of 1,000). Downsample negatives to keep training fast, then correct the output. If negatives are kept with probability w = 0.1 and the model outputs p' = 0.4, the calibrated probability is p'/(p' + (1 - p')/w) = 0.4/(0.4 + 6) = 0.0625.</li>
+<li><b>Delay.</b> Accepts arrive over days. Train on impressions that are at least 7 days old, or use a delayed-feedback correction for fresh ones.</li>
+<li><b>Negatives.</b> Dismissals and "I don't know this person" reports are strong negatives and worth a separate head. Candidates never shown are <i>not</i> negatives; they were simply unobserved.</li>
+<li><b>Position and selection bias.</b> Top cards get more clicks regardless of quality, and only shown candidates have labels. Include position as a training feature and fix it to a default at serving. Reserve about 1% of traffic for exploration, where candidates are shown from a wider pool, so the ranker sees outcomes it would not otherwise choose.</li>
+</ul>
+
+<h2>Model Development</h2>
+<h3>Candidate generation</h3>
+<p>The first problem is expansion. A viewer with 500 friends, each with 500 friends, has 500 x 500 = 250,000 friends-of-friends before deduplication. Three hops is 125 million. Capping the number of expanded neighbors per friend (for example the 50 strongest or most recent) cuts hop 2 to 25,000 and hop 3 to 1.25 million.</p>
+<script type="application/json" class="dg" data-cap="Candidate slots before deduplication, in thousands (illustrative arithmetic): a cap of 50 per expansion keeps the numbers tractable">
+{"type":"bars","horiz":true,"labels":["1 hop: your friends","2 hops, cap 50 each","2 hops, uncapped","3 hops, cap 50 each"],"series":[{"n":"Candidate slots (thousands)","v":[0.5,25,250,1250]}]}
+</script>
+<p>Hubs make the work skewed. A job that emits every pair of neighbors of each member costs about the square of the degree. At the mean degree of 300 that is 90,000 pairs; a recruiter with a 5,000 connection cap generates 25 million, which is 278 times more. Heavy-tailed networks are dominated by such nodes, so a single reducer can hold up the whole batch. Standard fixes: skip expansion through members above a degree threshold, or sample their strongest 200 neighbors (200 x 200 = 40,000 pairs), and let Adamic-Adar weighting discount them.</p>
+<table>
+<caption>Candidate sources</caption>
+<tr><th>Source</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>2 to 3 hop neighbors, ranked by mutual friends</td><td>Exact, explainable, high precision</td><td>Fan-out, hub skew, misses people with no path</td></tr>
+<tr><td>Personalized PageRank</td><td>Reaches 5 to 6 hops, gives under-connected members candidates</td><td>Heavy compute, teleport parameters to tune</td></tr>
+<tr><td>Shared school, employer, location</td><td>Works with zero edges, so helps cold start</td><td>Cohorts are huge; needs overlap-year rules to be precise</td></tr>
+<tr><td>Imported contacts</td><td>Highest precision source</td><td>Only for uploaders; privacy sensitive</td></tr>
+<tr><td>Recent interactions (profile viewers, search hits)</td><td>Direct sign of intent</td><td>Sparse; explaining it can reveal who looked at whom</td></tr>
+<tr><td>Embedding ANN (GNN or two-tower)</td><td>One lookup, blends structure and attributes</td><td>Weak at exact 2-hop recall; popularity bias in training</td></tr>
+</table>
+<div class="callout key"><p><b>Decision.</b> Run all sources and union them. Each source has different blind spots, and the union covers more than any one. LinkedIn reports exactly this three-way mix of graph, similarity and heuristic sources, and says that GNN embeddings alone did not reproduce 2-hop and 3-hop neighbors for them, so they keep explicit graph walks. Tag every candidate with its source and source score; the ranker uses both.</p></div>
+<script type="application/json" class="dg" data-cap="Candidate sources are merged, tagged with their origin and score, trimmed by a light ranker, and stored per viewer">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"s1","t":"Graph walks (2-3 hop, PPR)","s":"score: mutual friends or PPR","c":0,"r":0},
+  {"id":"s2","t":"Shared school or employer","s":"same cohort, overlapping years","c":0,"r":1},
+  {"id":"s3","t":"Imported contacts","s":"reverse match on phone or email","c":0,"r":2},
+  {"id":"s4","t":"Recent interactions","s":"profile viewers, search hits","c":0,"r":3},
+  {"id":"s5","t":"GNN embedding ANN","s":"nearest members by cosine","c":0,"r":4,"k":"model"},
+  {"id":"m","t":"Merge and dedupe","s":"tag source and score","c":1,"r":2},
+  {"id":"lr","t":"Light ranker","s":"calibrates across sources","c":2,"r":2,"k":"model"},
+  {"id":"cs","t":"Top 500 per viewer","s":"stored daily","c":3,"r":2,"k":"store"}],
+ "edges":[["s1","m"],["s2","m"],["s3","m"],["s4","m"],["s5","m"],["m","lr","about 3,000"],["lr","cs","top 500"]]}
+</script>
+
+<h3>Graph neural network embeddings</h3>
+<p>A graph neural network gives each member a vector that mixes their own features with their neighborhood. In GraphSAGE, one layer averages the previous-layer vectors of a sample of neighbors, concatenates the result with the member's own vector, applies a dense layer and a nonlinearity. Two layers mean a member's vector reflects friends and friends-of-friends. Because the model learns a function of features and neighbors, not a table of per-member vectors, it is <i>inductive</i>: a brand-new member gets an embedding from their profile and first connections without retraining.</p>
+<script type="application/json" class="dg" data-cap="Two layers of message passing: friends-of-friends feed their friend (layer 1), friends feed you (layer 2); the dashed edge was not sampled">
+{"type":"net","h":350,"nodes":[
+ {"id":"u","t":"You","x":90,"y":50,"k":"me"},
+ {"id":"f1","t":"F1","x":58,"y":16,"k":"fr"},
+ {"id":"f2","t":"F2","x":58,"y":50,"k":"fr"},
+ {"id":"f3","t":"F3","x":58,"y":84,"k":"fr"},
+ {"id":"g1","t":"G1","x":22,"y":6,"k":"other"},
+ {"id":"g2","t":"G2","x":22,"y":26,"k":"other"},
+ {"id":"g3","t":"G3","x":22,"y":44,"k":"other"},
+ {"id":"g6","t":"G6","x":22,"y":60,"k":"other","s":"skipped"},
+ {"id":"g4","t":"G4","x":22,"y":78,"k":"other"},
+ {"id":"g5","t":"G5","x":22,"y":94,"k":"other"}],
+ "edges":[["g1","f1"],["g2","f1",{"hl":1,"l":"layer 1"}],["g3","f2",{"hl":1}],["g6","f2",{"d":1}],["g4","f3",{"hl":1}],["g5","f3",{"hl":1}],["f1","u",{"hl":1,"l":"layer 2"}],["f2","u",{"hl":1}],["f3","u",{"hl":1}]]}
+</script>
+<p>Scalability is the whole difficulty. Without sampling, one embedding touches 250,000 nodes. With neighbor sampling (GraphSAGE used 25 neighbors at the first hop and 10 at the second), it touches 25 x 10 = 250. PinSage, which Pinterest ran on a graph with 3 billion nodes and 18 billion edges, replaced uniform sampling with random-walk importance (keep the neighbors a short walk visits most often) and generated embeddings in bulk with a MapReduce-style job so that shared intermediate vectors are computed once, not once per member.</p>
+<script type="application/json" class="dg" data-cap="Why neighbor sampling is what makes a GNN usable at this scale: the same embedding shape for 1,000 times fewer lookups">
+{"type":"stack","cols":[
+ {"t":"Without sampling","layers":[{"t":"All 500 friends","s":"hop 1"},{"t":"All friends-of-friends","s":"500 x 500 = 250,000 nodes"},{"t":"Aggregate 250,000 vectors","s":"memory and latency blow up"}]},
+ {"t":"With sampling (S1=25, S2=10)","layers":[{"t":"Sample 25 friends","s":"hop 1"},{"t":"Sample 10 per friend","s":"25 x 10 = 250 nodes"},{"t":"Aggregate 250 vectors","s":"fixed cost per member","k":"model"}]}],
+ "join":{"t":"1,000 times fewer lookups","s":"250,000 / 250 = 1,000"}}
+</script>
+<p>Training needs positives and negatives. For an anchor member u with the graph frozen at time T, a positive is someone who became u's connection in the next 30 days. A random member is an easy negative. A <b>hard negative</b> is a 2-hop non-friend who did not connect: structurally close, so the model must use finer evidence to separate them. PinSage showed that adding harder negatives gradually improves convergence, and LinkedIn mines negatives from the neighbors of in-batch negatives for the same reason.</p>
+<script type="application/json" class="dg" data-cap="Training data for the GNN: one anchor, one positive, and a mix of easy and hard negatives share one encoder">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"a","t":"Anchor member u","s":"graph as of time T","c":0,"r":0,"k":"user"},
+  {"id":"p","t":"Positive v+","s":"new friend within 30 days","c":0,"r":1,"k":"user"},
+  {"id":"n","t":"Negatives","s":"random plus 2-hop non-friends","c":0,"r":2,"k":"user"},
+  {"id":"enc","t":"Shared GNN encoder","s":"2-layer GraphSAGE","c":1,"r":1,"k":"model"},
+  {"id":"v","t":"Embeddings","s":"unit length, 128-d","c":2,"r":1,"k":"vec"},
+  {"id":"l","t":"Margin ranking loss","s":"positive must beat negative","c":3,"r":1}],
+ "edges":[["a","enc"],["p","enc"],["n","enc"],["enc","v"],["v","l","cosines"]]}
+</script>
+<div class="callout math"><p>Margin loss for one anchor is max(0, s(u,v-) - s(u,v+) + margin) with cosine similarity s. Let s(u,v+) = 0.8, margin = 0.3. An easy negative with s = 0.5 gives max(0, 0.5 - 0.8 + 0.3) = 0, so it teaches nothing. A hard negative with s = 0.7 gives 0.7 - 0.8 + 0.3 = 0.2, so it still produces a gradient. Easy negatives keep recall broad; hard negatives sharpen the ordering.</p></div>
+<p>Hard negatives carry a risk: some 2-hop non-friends are people the viewer will befriend later, so they are false negatives. Mix them with easy negatives (for example one hard for every four easy) and watch recall. Also remember that in-batch negatives are other viewers' positives, which are disproportionately popular members; using them alone pushes embeddings away from popular members, so LinkedIn applies sampling-bias corrections.</p>
+<script type="application/json" class="dg" data-cap="Embedding space (illustrative): members cluster by shared school, employer and interests; the nearest neighbors of the viewer mix two clusters">
+{"type":"embed","h":320,"seed":9,"nn":4,
+ "clusters":[{"n":"UofT, Toronto","x":165,"y":160,"r":34,"k":9},{"n":"Acme engineers","x":355,"y":210,"r":28,"k":8},{"n":"Hiking club, Denver","x":600,"y":110,"r":30,"k":8},{"n":"Law school, London","x":590,"y":235,"r":28,"k":7}],
+ "query":{"x":262,"y":172,"t":"You"}}
+</script>
+<p>Embeddings are retrieved with approximate nearest neighbor search. At 128 dimensions in half precision, 1B members need 256 GB; product quantization at 32 bytes per vector shrinks the index to 32 GB, which fits on a handful of machines. A GNN embedding is not a drop-in replacement for graph walks; use it as one source and as a ranker feature, and keep the exact graph sources. One more caveat: two members in different parts of the graph with identical local structure get similar vectors (the graph isomorphism problem), so always pair structural embeddings with profile features.</p>
+
+<h3>Ranker</h3>
+<table>
+<caption>Ranker options</caption>
+<tr><th>Option</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Logistic regression</td><td>Fast, interpretable, easy to calibrate</td><td>No interactions without manual crosses</td></tr>
+<tr><td>Gradient-boosted trees</td><td>Best on mixed tabular pair features; handles missing values; fast to serve</td><td>Cannot learn raw embeddings end to end</td></tr>
+<tr><td>Deep multi-task network</td><td>Learns from embeddings and many heads at once</td><td>More infrastructure; needs more data to beat trees</td></tr>
+<tr><td>Pair-subgraph GNN (SEAL)</td><td>Learns its own heuristics from the local subgraph</td><td>Subgraph extraction per pair is too slow for online use</td></tr>
+</table>
+<div class="callout key"><p><b>Decision.</b> Gradient-boosted trees, one model per head (P(send) and P(accept | send)), trained on the pair features plus GNN embedding features. They are strong on this feature mix and cheap to serve, and the architecture can move to a deep multi-task net once feature volume justifies it. Public descriptions agree on the shape: LinkedIn uses an XGBoost light ranker before neural rankers that predict sends and accepts, and Meta describes separate models for send and accept, split by user segment such as friend count and country.</p></div>
+<script type="application/json" class="dg" data-cap="Ranker architecture: pair features and embeddings feed two heads; the product of the heads is the expected number of accepted connections">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"f1","t":"Pair features","s":"mutual friends, AA, profile match","c":0,"r":0,"k":"data"},
+  {"id":"f2","t":"Embedding features","s":"z_u, z_v, cosine","c":0,"r":1,"k":"vec"},
+  {"id":"f3","t":"Viewer, candidate, context","s":"activity, inbox load, source","c":0,"r":2,"k":"data"},
+  {"id":"rk","t":"GBDT rankers","s":"one model per head","c":1,"r":1,"k":"model"},
+  {"id":"ps","t":"P(send | shown)","c":2,"r":0,"k":"io"},
+  {"id":"pa","t":"P(accept | sent)","c":2,"r":2,"k":"io"},
+  {"id":"sc","t":"Expected accepts","s":"P(send) x P(accept), plus guardrails","c":3,"r":1}],
+ "edges":[["f1","rk"],["f2","rk"],["f3","rk"],["rk","ps"],["rk","pa"],["ps","sc"],["pa","sc"]]}
+</script>
+<div class="callout math"><p>Training uses log loss. A true accept predicted at 0.2 costs -ln 0.2 = 1.609; a true negative predicted at 0.2 costs -ln 0.8 = 0.223. Reciprocity shows up in the product: candidate A has P(send) = 0.30 but P(accept) = 0.20, a score of 0.06; candidate B has P(send) = 0.15 and P(accept) = 0.60, a score of 0.09. B ranks higher even though the viewer is less drawn to B, because B is likely to say yes.</p></div>
+<p>The accept head needs features about the recipient: how many requests are already pending, how many they declined, how long since they were active. Without them the system learns to suggest popular, inactive members to everyone, and recipients drown in unanswered requests.</p>
+
+<h2>Evaluation</h2>
+<h3>Offline metrics</h3>
+<p>The evaluation split must be by time. In a random split of edges, the training graph contains friendships that formed after the test edge, and triadic closure makes those a giveaway: if u-w and w-v both exist, u-v is likely, and the model may have learned the future. The correct protocol freezes a snapshot at time T, builds features from it, and labels pairs by what happens in the following window, then rolls the window forward for validation and test.</p>
+<script type="application/json" class="dg" data-cap="Time-based link-prediction evaluation: features come only from the past, labels only from the window after it, and test data is always later than training data">
+{"type":"graph","cols":5,"gapX":40,
+ "groups":[{"t":"One training example","c0":0,"c1":4,"r0":0,"r1":0},{"t":"Rolling splits, never random","c0":0,"c1":4,"r0":1,"r1":1}],
+ "nodes":[
+  {"id":"g0","t":"Graph at T","s":"snapshot","c":0,"r":0,"k":"store"},
+  {"id":"ft","t":"Pair features","s":"frozen at T, no peeking","c":1,"r":0,"k":"data"},
+  {"id":"w","t":"30-day window","s":"T to T+30d","c":2,"r":0},
+  {"id":"g1","t":"Graph at T+30d","s":"snapshot","c":3,"r":0,"k":"store"},
+  {"id":"lb","t":"Labels","s":"pairs newly connected","c":4,"r":0,"k":"data"},
+  {"id":"tr","t":"Train","s":"features T0, labels T0 to T1","c":0,"r":1,"k":"io"},
+  {"id":"va","t":"Validate","s":"features T1, labels T1 to T2","c":1,"r":1,"k":"io"},
+  {"id":"te","t":"Test","s":"features T2, labels T2 to T3","c":2,"r":1,"k":"io"}],
+ "edges":[["g0","ft"],["ft","w"],["w","g1"],["g1","lb","new edges"],["tr","va","later"],["va","te","later"]]}
+</script>
+<p>Evaluate each stage with the metric that matches its job. Candidate generation needs recall, because it is the only chance a good candidate gets. Rankers need ordering and calibration metrics.</p>
+<table>
+<caption>Offline metrics</caption>
+<tr><th>Metric</th><th>Definition</th><th>Mini example</th><th>Flaw</th><th>Decision</th></tr>
+<tr><td>Recall@k (generation)</td><td>Share of a viewer's future accepted connections that appear in the top k candidates</td><td>4 future friends, 3 inside the 3,000 candidates: 0.75</td><td>Ignores order and cost; more candidates always looks better</td><td>Use for candidate generation, with k fixed to the budget</td></tr>
+<tr><td>Precision@k</td><td>Fraction of the first k suggestions that were accepted</td><td>Hits at ranks 1 and 3 of 5: P@1 = 1, P@3 = 0.67, P@5 = 0.40</td><td>Order inside the top k is ignored; few positives make it noisy</td><td>Use at k = 10 or 20, the size of the carousel</td></tr>
+<tr><td>Average precision</td><td>Mean of precision at each hit rank, divided by the number of relevant items</td><td>(1.00 + 0.67) / 4 = 0.42 for the list above, if the viewer has 4 future friends</td><td>Hard to read in isolation; sensitive to how positives are defined</td><td>Use as the headline ranking metric next to P@k</td></tr>
+<tr><td>ROC-AUC</td><td>Chance that a random positive scores above a random negative</td><td>3 positives, 3 negatives: 7 of 9 pairs ordered correctly, AUC = 0.78</td><td>Dominated by the huge negative pool, looks excellent when the top is weak</td><td>Report for monitoring; do not choose models with it</td></tr>
+<tr><td>PR-AUC</td><td>Area under the precision-recall curve</td><td>See the worked example below</td><td>Depends on the base rate, so compare only on the same data</td><td>Use for model selection with rare positives</td></tr>
+<tr><td>Calibration (ECE)</td><td>Gap between predicted probability and observed rate, averaged over bins</td><td>Bin predicted 0.30, observed 0.18: gap 0.12</td><td>Says nothing about ordering</td><td>Required, because the score is multiplied across heads</td></tr>
+<tr><td>Entropy and source mix</td><td>Spread of candidates over countries, schools or sources</td><td>90% of cards from one source gives low entropy</td><td>Diversity is not quality</td><td>Use as a sign-post for generation and re-ranking</td></tr>
+</table>
+<div class="callout math"><p><b>Why ROC-AUC misleads here.</b> Take 500 candidates with 2 true future friends, which the model ranks 5th and 12th. The first positive has 4 negatives above it and the second has 10 (the other positive is also above it). AUC = 1 - (4 + 10)/(2 x 498) = 1 - 14/996 = 0.986. Yet precision@20 is 2/20 = 0.10 and average precision is (1/5 + 2/12)/2 = 0.183. A near-perfect AUC hid a list that is wrong 9 times out of 10.</p></div>
+<script type="application/json" class="dg" data-cap="Precision-recall curves for three rankers (illustrative): pair features beat the heuristic, and embeddings add a further lift at every recall level">
+{"type":"curve","xl":"Recall","yl":"Precision","series":[
+ {"n":"Adamic-Adar only","c":1,"d":1,"lp":3,"pts":[[0,0.55],[0.2,0.45],[0.4,0.32],[0.6,0.2],[0.8,0.1],[1,0.04]]},
+ {"n":"GBDT, pair features","c":2,"lp":3,"pts":[[0,0.8],[0.2,0.68],[0.4,0.52],[0.6,0.36],[0.8,0.2],[1,0.05]]},
+ {"n":"GBDT + GNN embeddings","c":0,"lp":1,"pts":[[0,0.86],[0.2,0.75],[0.4,0.6],[0.6,0.43],[0.8,0.26],[1,0.06]]}]}
+</script>
+<script type="application/json" class="dg" data-cap="Recall of new connections inside the candidate pool by source (illustrative): no source covers most future friends alone, the union covers the most">
+{"type":"bars","labels":["Graph walks","School or employer","Contacts","Embedding ANN","Union of all"],"series":[{"n":"Recall@3000","v":[0.52,0.18,0.12,0.34,0.78]}],"max":1}
+</script>
+<h3>Online metrics</h3>
+<table>
+<caption>Online and guardrail metrics</caption>
+<tr><th>Metric</th><th>Why it matters</th><th>Watch for</th></tr>
+<tr><td>Accepted requests per viewer per day (primary)</td><td>Direct measure of the objective</td><td>Gains concentrated in already active users</td></tr>
+<tr><td>Acceptance rate (accepts / sends)</td><td>Separates real demand from request spam</td><td>Can rise while volume falls</td></tr>
+<tr><td>New connections who stay engaged (messages, reactions in 30 days)</td><td>Checks that edges are valuable</td><td>Slow signal, needs long tests</td></tr>
+<tr><td>D7 and D28 retention, especially for new members</td><td>The business reason for the feature</td><td>Novelty effects in the first days</td></tr>
+<tr><td>Guardrail: decline and ignore rate, "I don't know this person" reports, blocks</td><td>Each is a harm to the recipient</td><td>Must not rise even if accepts rise</td></tr>
+<tr><td>Guardrail: pending requests per recipient, exposure concentration (Gini)</td><td>Detects inbox overload and hub over-suggestion</td><td>Shows up weeks later</td></tr>
+<tr><td>Guardrail: PYMK hide rate, privacy complaints</td><td>Users telling us it feels intrusive</td><td>Rare but high severity</td></tr>
+</table>
+<script type="application/json" class="dg" data-cap="A hypothetical A/B result per 1,000 impressions: more sends, many more accepts, fewer declines or ignores (acceptance ratio 60% to 70%)">
+{"type":"bars","labels":["Requests sent","Requests accepted","Declined or ignored"],"series":[{"n":"Control","v":[60,36,24]},{"n":"Treatment","v":[63,44,19]}]}
+</script>
+<div class="callout warn"><p><b>A/B pitfalls on a graph.</b> Users interact: a treated viewer sends requests to control users, who then see accepts they would not have had. This interference biases a naive comparison, so randomize by graph community or measure on both the sender and recipient side. Network effects also build slowly, so keep a long-term holdout, and segment results by new versus established members. Offline gains rarely match online gains because of presentation effects and training-serving differences; trust the experiment.</p></div>
+
+<h2>Serving</h2>
+<p>The design follows the funnel. A daily batch trains the embeddings, generates candidates, applies the light ranker and writes the top 500 per active viewer. At request time the system reads that list, patches it with fresh events, scores the top 200 with the rich ranker and applies filters.</p>
+<script type="application/json" class="dg" data-cap="Serving architecture: heavy graph work happens offline once a day; the request path only fetches, ranks 200 candidates and filters">
+{"type":"graph","cols":5,"gapX":40,
+ "groups":[{"t":"Offline: daily batch","c0":0,"c1":4,"r0":0,"r1":0},{"t":"Online: per request","c0":0,"c1":4,"r0":1,"r1":1}],
+ "nodes":[
+  {"id":"snap","t":"Graph and profile snapshot","c":0,"r":0,"k":"store"},
+  {"id":"gnn","t":"GNN training and inference","s":"embeddings for everyone","c":1,"r":0,"k":"model"},
+  {"id":"idx","t":"Embedding index and features","s":"ANN index, offline store","c":2,"r":0,"k":"store"},
+  {"id":"cg","t":"Candidate generation","s":"walks, rules, ANN, light ranker","c":3,"r":0},
+  {"id":"cs","t":"Candidate store","s":"500 per active viewer","c":4,"r":0,"k":"store"},
+  {"id":"req","t":"PYMK request","c":0,"r":1,"k":"io"},
+  {"id":"fe","t":"Candidate fetch and patch","s":"adds fresh, drops stale","c":1,"r":1},
+  {"id":"rk","t":"Rich ranker","s":"fresh features, 200 scored","c":2,"r":1,"k":"model"},
+  {"id":"fl","t":"Filters and re-rank","s":"privacy, caps, diversity","c":3,"r":1},
+  {"id":"out","t":"Suggestions","s":"20 cards with reasons","c":4,"r":1,"k":"io"}],
+ "edges":[["snap","gnn","graph"],["gnn","idx","vectors"],["idx","cg","ANN"],["cg","cs","top 500"],["cs","fe","lookup",{"sa":"b","sb":"t"}],["req","fe"],["fe","rk","top 200"],["idx","rk","features"],["rk","fl","scores"],["fl","out"]]}
+</script>
+<h3>Scale and latency math</h3>
+<table>
+<caption>Back-of-envelope sizing (assumptions in the left column)</caption>
+<tr><th>Item</th><th>Assumption</th><th>Result</th></tr>
+<tr><td>Request rate</td><td>300M viewers x 3 loads per day, peak 3 times average</td><td>900M per day, about 10,400 QPS average, about 31,000 QPS peak</td></tr>
+<tr><td>Candidate store</td><td>300M active viewers x 500 candidates x 16 bytes (ID, score, source)</td><td>About 2.4 TB, sharded by viewer</td></tr>
+<tr><td>Embeddings</td><td>1B members x 128 dimensions x 2 bytes</td><td>256 GB raw; about 32 GB with 32-byte PQ codes</td></tr>
+<tr><td>Daily light ranking</td><td>300M viewers x 3,000 candidates at 100k scores per second per core</td><td>9 x 10<sup>11</sup> scores, about 100 cores running for a day</td></tr>
+<tr><td>Online rich ranking</td><td>200 candidates per request at the peak rate, 100k scores per second per core</td><td>About 6.2M scores per second, about 60 cores</td></tr>
+<tr><td>Latency budget (p99 about 200 ms)</td><td>Fetch 10, feature multiget 40, ranking 50, filters 30, network and render 70</td><td>200 ms total</td></tr>
+</table>
+<h3>Freshness</h3>
+<p>Batch candidates age. The cheap part of freshness is filtering: when a connection event arrives, add the pair to an exclusion set immediately and verify against the live friend set before display. The more valuable part is near-real-time candidate generation. When you accept a request, the new friend's friends become fresh 2-hop candidates, and LinkedIn reports large gains from making N-hop generation near-real-time. The trade-off is cost and complexity: a streaming expansion job must respect the same caps as the batch one.</p>
+<script type="application/json" class="dg" data-cap="Staleness cost (illustrative): without online patching, relevance drops as the batch ages; patching holds it near the fresh level">
+{"type":"curve","xl":"Hours since last batch run","yl":"Relative acceptance rate (fresh = 1.0)","xmax":48,"ymin":0.8,"ymax":1,"series":[
+ {"n":"Daily batch only","c":1,"lp":2,"pts":[[0,1],[12,0.97],[24,0.93],[36,0.89],[48,0.85]]},
+ {"n":"Batch + online patches","c":2,"lp":3,"pts":[[0,1],[12,0.995],[24,0.985],[36,0.975],[48,0.965]]}]}
+</script>
+<h3>Filters, privacy and explanations</h3>
+<p>The filter layer is where safety lives, and it runs after ranking so no model can bypass it.</p>
+<ul>
+<li><b>Hard exclusions:</b> existing and pending connections, dismissed suggestions, blocked and blocking members, deactivated or restricted accounts, and spam-flagged accounts.</li>
+<li><b>Privacy settings:</b> respect who may send requests and who may see a profile. Meta documents that limiting requests to friends of friends also limits the member's visibility in PYMK to friends of friends.</li>
+<li><b>Hidden information:</b> do not count or show mutual friends the viewer is not allowed to see, and do not infer hidden relationships. Suppress low counts if they would identify a person.</li>
+<li><b>Sensitive contexts:</b> avoid linking people only through sensitive groups or private contexts.</li>
+<li><b>Contacts:</b> use uploads only with explicit consent, store hashes, honor deletion, and never reveal that someone has your number.</li>
+</ul>
+<script type="application/json" class="dg" data-cap="Privacy-safe explanations (illustrative): each reason uses only information the viewer may see; reasons from private signals such as profile views or another member's contact upload are never shown">
+{"type":"ranklist","ql":"Viewer","q":"You","qs":"signed up last week","items":[
+ {"t":"Maya Chen","s":"6 mutual friends, same university","v":0.31,"hl":1},
+ {"t":"Dev Patel","s":"In your contacts, works at Acme","v":0.28},
+ {"t":"Lena Fischer","s":"3 mutual friends, same city","v":0.22},
+ {"t":"Sam Okafor","s":"Shares 2 groups with you","v":0.17}]}
+</script>
+<h3>Exposure caps and diversity</h3>
+<p>Mutual-friend counts favor well-connected members, so without a control a few members are suggested to everyone. Their inboxes fill, accept rates drop, and the product becomes a popularity contest. Apply a per-candidate weekly exposure cap, or a penalty that grows with recent exposures. In the same re-ranking step, limit any one source or cohort to a share of the 20 cards.</p>
+<script type="application/json" class="dg" data-cap="Suggestions received per week by popularity group (illustrative, cap of 60 per week): the cap flattens the top and returns exposure to the long tail">
+{"type":"bars","labels":["Bottom 50%","50-90%","90-99%","Top 1%","Top 0.1%"],"series":[{"n":"No cap","v":[2,6,30,150,700]},{"n":"Cap 60","v":[3,7,28,60,60]}]}
+</script>
+<h3>Failure modes and monitoring</h3>
+<table>
+<caption>Failure modes and degradation</caption>
+<tr><th>Failure</th><th>Effect</th><th>Degradation</th></tr>
+<tr><td>Batch late or failed</td><td>Candidates stale</td><td>Serve yesterday's list with extra live filters; page on age beyond 36 hours</td></tr>
+<tr><td>Viewer missing from candidate store (new or inactive)</td><td>Empty list</td><td>Fallback path: contacts, school, employer and city sources computed online</td></tr>
+<tr><td>Feature store timeout</td><td>Ranker missing inputs</td><td>Use defaults for fresh counters; fall back to the stored light-ranker order</td></tr>
+<tr><td>Ranker down</td><td>No scores</td><td>Serve the offline order after filters</td></tr>
+<tr><td>ANN shard down</td><td>One source missing</td><td>Drop the source; other sources cover most candidates</td></tr>
+</table>
+<p>Refresh cadence: embeddings and candidates daily, rankers weekly or on drift, feature counters in under a minute. Monitor the input and output distributions of each feature, calibration by segment (new versus established members, region), batch freshness, the source mix, exposure concentration, and the ratio of accepts to declines and reports, since a model can improve AUC and hurt recipients.</p>
+<table>
+<caption>Challenges and approaches</caption>
+<tr><th>Challenge</th><th>Approach</th></tr>
+<tr><td>Cold start: new member</td><td>Contacts (if consented), profile sources, an inductive GNN from profile features, a separate ranker for members with few friends, and onboarding prompts</td></tr>
+<tr><td>Cold start: new candidate</td><td>Exploration slice, cohort sources such as school and city, a mild exposure boost</td></tr>
+<tr><td>Speed and scale</td><td>Daily batch, neighbor sampling, degree caps, ANN with quantization, precomputed lists</td></tr>
+<tr><td>Diversity and popularity bias</td><td>Exposure caps, source quotas, penalty on over-suggested members</td></tr>
+<tr><td>Fairness</td><td>No protected attributes as features; audit exposure and acceptance by group; fairness re-rankers as LinkedIn describes</td></tr>
+<tr><td>Privacy</td><td>Consent for contacts, safe explanations, visibility rules, small-count suppression</td></tr>
+<tr><td>Spam and abuse</td><td>Per-sender request limits, accept-rate based demotion, acceptance labels, rate limits on contact imports and scraping</td></tr>
+</table>
+<div class="callout tip"><p>In an interview, draw the funnel first and put numbers on it (a billion members, 3,000, 500, 200, 20). Then spend your time on the two interesting parts: capping the expansion, and the label (accepted, not sent). Those show you understand the problem rather than the buzzwords.</p></div>
+<div class="callout tip"><p>If asked "why not just use a GNN for everything", answer with evidence: GNN embeddings are useful for similarity and cold start, but a public engineering report says they did not reproduce 2-hop and 3-hop neighbors, so exact graph sources stay in the mix and the GNN is a complementary source and feature.</p></div>
+
+<h2>Other Talking Points</h2>
+<ul>
+<li>Reciprocal recommendation: both people must say yes, so model P(send) and P(accept) separately and multiply; this prevents a system that flatters viewers while burying recipients in requests.</li>
+<li>Heterogeneous graphs: add schools, employers and groups as node types so cohorts get embeddings and cold-start members connect through them.</li>
+<li>Temporal GNNs: models such as TGN keep a memory per member updated by timed events, which can improve freshness, but a daily batch plus streaming patches is usually enough and far cheaper.</li>
+<li>Personalized PageRank: restricting teleportation to the viewer's neighborhood keeps long walks relevant and gives sparse members useful candidates.</li>
+<li>Feedback loops: suggestions create edges, edges become the next training labels and candidates; keep an exploration slice and a PYMK-free holdout so the model does not just learn its own past behavior.</li>
+<li>Homophily and fairness: friend suggestions can deepen segregation by recommending people just like you, so measure exposure and acceptance across groups and consider diversity re-ranking.</li>
+<li>Negative feedback as labels: dismissals, declines and "I don't know this person" are strong, cheap signals; train a separate negative head and use it as a guardrail.</li>
+<li>Spam economics: acceptance-based labels make spammy sending unprofitable, and sender rate limits protect recipients regardless of model quality.</li>
+<li>Batch versus real time: batch is cheap and robust but stale; near-real-time expansion buys fresh candidates at the price of streaming complexity, so move only the highest-value parts (new connections) online.</li>
+<li>Privacy-safe explanations: showing a reason builds trust, but every reason must be derivable from data the viewer may see; leaking who viewed whom or whose address book you are in can hurt people.</li>
+</ul>
+
+<h2 class="nonum">Check yourself</h2>
+<p class="qa-intro">Questions are tagged by the level they target. The first set checks Senior-level fundamentals and arithmetic; Staff and Principal questions probe trade-offs, operations, experimentation and organization. Try to answer aloud for two minutes before opening one.</p>
+<div class="qa-bar" data-qa></div>
+<details class="ans" data-lvl="sr"><summary>A viewer has 500 friends, each with 500 friends. How many candidate slots does 2-hop expansion create, and what does a cap of 50 per friend do? What about 3 hops?</summary>The 2-hop expansion creates 500 x 500 = 250,000 slots before deduplication. A cap of 50 per friend gives 500 x 50 = 25,000, a tenfold reduction, and you keep the 50 strongest or most recent neighbors of each friend. Three hops uncapped is 125 million; with a cap of 50 at each expansion it is 500 x 50 x 50 = 1.25 million. After counting mutual friends, keep the top few hundred by score.</details>
+<details class="ans" data-lvl="sr"><summary>Why is acceptance a better label than request sent, and what are its costs?</summary>A send measures only the viewer's wish and is easily inflated by pushy cards or spam; an accept requires both people to agree, which matches the product goal. Costs: labels arrive days later, are sparser, and depend on the recipient's inbox and activity. Handle them with a 7-day label window, a separate P(send) head for density, and recipient features in the accept head.</details>
+<details class="ans" data-lvl="sr"><summary>A viewer shares two mutual friends with candidate P, of degrees 10 and 1,000, and one mutual friend with candidate Q, of degree 3. Compute Adamic-Adar for each. Which wins?</summary>For P: 1/ln10 + 1/ln1000 = 0.434 + 0.145 = 0.579. For Q: 1/ln3 = 0.910. Q wins even with fewer mutual friends, because its single shared friend is a tight-knit person, while P's mutual friends include a hub, so less evidence per mutual friend.</details>
+<details class="ans" data-lvl="sr"><summary>Why must the evaluation be split by time, and how do you choose the window?</summary>A random edge split lets the training graph contain edges that formed after the test edge, and triadic closure makes those a leak. Freeze features at T and label by new connections in (T, T+window]. Pick the window to match label maturity: about 7 days for accepts, 30 days for new edges, and roll forward for validation and test.</details>
+<details class="ans" data-lvl="sr"><summary>A recruiter has 5,000 connections and the common-neighbor job emits all neighbor pairs. What is the cost relative to an average member, and what do you do?</summary>The recruiter emits about 5,000<sup>2</sup> = 25M pairs, versus 300<sup>2</sup> = 90,000 for the average member, which is 278 times more and will straggle the job. Cap the neighbors emitted per hub to the strongest 200 (200<sup>2</sup> = 40,000 pairs), skip expansion above a degree threshold, and let Adamic-Adar discount hubs. Reach the hub's real neighbors through other sources such as embeddings and profile cohorts.</details>
+<details class="ans" data-lvl="st"><summary>A test shows requests sent +5%, accepts +1%, declines and "don't know" reports +20%. Do you ship?</summary>No. Sends grew far faster than accepts, so acceptance rate fell, and recipients are being harmed. Likely cause: the ranker or the objective drifted toward sends, or exposure concentrated on a few members. Investigate by segment and by source, check exposure caps and the accept head's calibration, and rerun after fixing. Treat the guardrails as launch criteria, not as secondary metrics.</details>
+<details class="ans" data-lvl="st"><summary>Some members are suggested to many others, others to almost no one. How do you handle exposure fairness and inbound request overload?</summary><p>Measure exposure per candidate (impressions per day, Gini across members) and inbound requests per candidate. Without limits, hubs attract disproportionate suggestions, which creates request fatigue and spam for them and starves everyone else. Add caps per candidate per day with decay, and a diversity term so a viewer does not see only popular members.</p><p>Make the objective two-sided: include the candidate's probability of accepting and their tolerance (a recent history of ignoring or reporting requests lowers the score). Track guardrails: decline and report rates, requests per hub, and the share of members who received no suggestions. Set caps by experiment and keep them configurable.</p><p class="probe"><b>Likely follow-ups:</b> What is a sensible cap and how would you derive it? &middot; How do you avoid penalizing a member who is genuinely popular?</p><p class="signal"><b>What makes this Staff-level:</b> You treat the candidate as a stakeholder, not only the viewer.</p></details>
+<details class="ans" data-lvl="st"><summary>A suggestion can reveal a sensitive relationship, such as a patient and a therapist or someone you blocked. How do you design for harm?</summary><p>Treat inference as a privacy risk, not only data access. Exclude sensitive or protected signals and honor blocks and mutual hides as hard filters at candidate generation, not only at display. Use contact-upload signals carefully: do not reveal who has your number, do not suggest based on one-sided data in ways the user would not expect, and provide opt-outs and controls.</p><p>Explanations must not leak: a line such as "you both appear in someone's contacts" can expose information, so use only explanations that both sides could see. Review with a privacy and threat-model exercise (inference attacks), run red-team scenarios (a stalker, an ex), and set launch gates with privacy counsel. Measure with abuse reports and a periodic audit of suggestion pairs flagged as sensitive.</p><p class="probe"><b>Likely follow-ups:</b> How do you audit suggestions you are not supposed to look at? &middot; What if the most predictive feature is the sensitive one?</p><p class="signal"><b>What makes this Staff-level:</b> You reason about what the output reveals, and you accept a quality loss for safety by design.</p></details>
+<details class="ans" data-lvl="pr"><summary>Justify, or kill, the investment in graph neural network embeddings. How do you decide?</summary><p>Define the question as incremental value: how much does the GNN feature add to the accepted-connection rate over the best non-GNN graph features (common neighbors, Adamic-Adar, random-walk scores)? Run an ablation offline on time-split data, then an online test. Compare with the cost: training on a billion-node graph (neighbor sampling, accelerator hours), serving an ANN index, freshness (embeddings go stale as the graph changes), and the engineering and on-call burden.</p><p>Set kill criteria in advance, for example: if the lift is under a stated threshold after two quarters, or the cost per accepted connection exceeds a ceiling, stop and reuse the effort for cheaper features. Stage the work (a simple random-walk embedding first, a GNN only if the data shows headroom) and be honest that GNNs may help most for sparse members and cold start.</p><p class="probe"><b>Likely follow-ups:</b> What offline metric would convince you and what would not? &middot; How do you handle embedding staleness for new members?</p><p class="signal"><b>What makes this Principal-level:</b> You frame an ML investment as an ROI question with kill criteria and a cheaper alternative.</p></details>
+<details class="ans" data-lvl="st"><summary>A brand-new member has no contacts and no connections. What does day-one PYMK show?</summary><p>Use onboarding signals the member gives or the platform can legitimately infer: employer, school, location, email domain, and imported contacts with consent. Candidates come from cohort-based retrieval (people at the same company or school with high acceptance rates), popular-in-cohort members who accept reliably, and people who have already viewed their profile. Ask a few onboarding questions to bootstrap.</p><p>Rank with a model that has no dependence on the viewer's graph (it uses candidate quality, cohort affinity and context), use exploration to learn fast, and measure activation: the share of new members with at least N connections within 7 days. Keep suggestions conservative to avoid sending low-quality requests that damage the member's first impressions.</p><p class="probe"><b>Likely follow-ups:</b> How do you avoid every new member receiving the same ten suggestions? &middot; What is your metric for the first-session experience?</p><p class="signal"><b>What makes this Staff-level:</b> You design a separate cold-start path with its own metric instead of hoping the main model degrades gracefully.</p></details>
+
+<h2 class="nonum">References</h2>
+<ol class="refs">
+<li>LinkedIn Engineering. Candidate Generation in a Large Scale Graph Recommendation System: People You May Know, 2024. <a href="https://www.linkedin.com/blog/engineering/recommendations/candidate-generation-in-a-large-scale-graph-recommendation-system-people-you-may-know">linkedin.com</a></li>
+<li>LinkedIn Engineering. Building a Large-Scale Recommendation System: People You May Know, 2024. <a href="https://www.linkedin.com/blog/engineering/recommendations/building-a-large-scale-recommendation-system-people-you-may-know">linkedin.com</a></li>
+<li>Meta Transparency Center. Facebook People You May Know AI system. <a href="https://transparency.meta.com/features/explaining-ranking/fb-people-you-may-know/">transparency.meta.com</a></li>
+<li>Hamilton, Ying, Leskovec. Inductive Representation Learning on Large Graphs (GraphSAGE). NeurIPS 2017. <a href="https://arxiv.org/abs/1706.02216">arXiv:1706.02216</a></li>
+<li>Ying et al. Graph Convolutional Neural Networks for Web-Scale Recommender Systems (PinSage). KDD 2018. <a href="https://arxiv.org/abs/1806.01973">arXiv:1806.01973</a></li>
+<li>Liben-Nowell, Kleinberg. The Link Prediction Problem for Social Networks. JASIST 2007. <a href="https://www.cs.cornell.edu/home/kleinber/link-pred.pdf">pdf</a></li>
+<li>Adamic, Adar. Friends and Neighbors on the Web. Social Networks, 2003. <a href="https://www.sciencedirect.com/science/article/abs/pii/S0378873303000091">sciencedirect.com</a></li>
+<li>Grover, Leskovec. node2vec: Scalable Feature Learning for Networks. KDD 2016. <a href="https://arxiv.org/abs/1607.00653">arXiv:1607.00653</a></li>
+<li>Backstrom, Leskovec. Supervised Random Walks: Predicting and Recommending Links in Social Networks. WSDM 2011. <a href="https://arxiv.org/abs/1011.4071">arXiv:1011.4071</a></li>
+<li>Zhang, Chen. Link Prediction Based on Graph Neural Networks (SEAL). NeurIPS 2018. <a href="https://arxiv.org/abs/1802.09691">arXiv:1802.09691</a></li>
+<li>Rossi et al. Temporal Graph Networks for Deep Learning on Dynamic Graphs. 2020. <a href="https://arxiv.org/abs/2006.10637">arXiv:2006.10637</a></li>
+<li>Huang et al. Embedding-based Retrieval in Facebook Search. KDD 2020. <a href="https://arxiv.org/abs/2006.11632">arXiv:2006.11632</a></li>
+</ol>
+</main></div>
+<script src="assets/dg.js"></script>
+<script src="assets/nav.js"></script>
+<script src="assets/qa.js"></script>
+</body>
+</html>

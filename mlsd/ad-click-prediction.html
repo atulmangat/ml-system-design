@@ -1,0 +1,516 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ad Click Prediction on Social Platforms</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-slug="ad-click-prediction">
+<div class="topbar"><a href="index.html">&larr; ML System Design Study Guide</a><span style="color:var(--muted)">Chapter 8 of 11</span></div>
+<div class="layout"><aside class="toc" id="toc"></aside>
+<main>
+<div class="kicker">Chapter 8</div>
+<h1>Ad Click Prediction on Social Platforms</h1>
+<p class="lead">Ads in a social feed are sold in an auction where the advertiser pays only if the user clicks, so the platform needs a probability of click for every (user, ad, context) that it can multiply by a bid. That makes this an unusual ML problem: the <i>value</i> of the score, not just its order, moves money. The model must be calibrated, fast enough to score hundreds of ads in tens of milliseconds, and fresh enough to learn about ads that were created an hour ago. The core idea is a pointwise click model trained with log loss, wrapped in an explicit story for calibration, label delay, and sampling, and placed inside an auction.</p>
+
+<h2>Clarifying Requirements</h2>
+<p>Ad prediction questions hide a lot of business logic. Use the first minutes to pin down the pricing model, because it decides what the model must output.</p>
+<div class="dlg">
+<div class="turn c"><span>Candidate</span><p>Which surface are we designing for, and how many ads per request?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Ads inserted into the main feed. Assume one ad slot is filled per ad opportunity, roughly one opportunity every few posts. Image, video, and carousel creatives all count as one ad format.</p></div>
+<div class="turn c"><span>Candidate</span><p>How do advertisers pay, and how is the winner chosen?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Cost per click, in an auction. Each advertiser sets a maximum bid per click. The platform ranks eligible ads by expected value and charges the winner only when a click happens.</p></div>
+<div class="turn c"><span>Candidate</span><p>So the model's output feeds the auction directly. Do we need calibrated probabilities, or is a good ordering enough?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Calibrated. Ordering alone is not enough, because the auction multiplies the score by a bid. Explain why in your design.</p></div>
+<div class="turn c"><span>Candidate</span><p>What do we know at request time?</p></div>
+<div class="turn i"><span>Interviewer</span><p>The user profile and engagement history, the ad creative and targeting metadata, and context such as device, placement, and time. There is no search query.</p></div>
+<div class="turn c"><span>Candidate</span><p>What is the scale?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Assume 300 million daily active users, about ten ad opportunities per user per day, and around ten million live ads. Targeting leaves a few thousand eligible ads per request.</p></div>
+<div class="turn c"><span>Candidate</span><p>What is the latency budget?</p></div>
+<div class="turn i"><span>Interviewer</span><p>The whole ad stage gets about 50 ms at p99, inside the feed's own budget. A slow ad call delays the feed.</p></div>
+<div class="turn c"><span>Candidate</span><p>Which feedback signals do we log, and how soon do they arrive?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Impressions and clicks with the features used at serving time. Clicks usually arrive within seconds to minutes. Conversions and hides exist but conversions are out of scope for the first version.</p></div>
+<div class="turn c"><span>Candidate</span><p>How often do new ads and advertisers appear, and how fresh must the model be?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Thousands of new ads per hour. Campaigns change budgets and creatives all day, so the model should learn continuously, not weekly.</p></div>
+<div class="turn c"><span>Candidate</span><p>Any constraints on data, safety, or fairness?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Respect user opt-outs and limited identifiers on some platforms. Invalid clicks must not be billed or learned from. Special ad categories such as housing and employment have restricted targeting.</p></div>
+<div class="turn c"><span>Candidate</span><p>What is out of scope?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Auto-bidding for advertisers, creative generation, and multi-slot auction design. Mention them if time allows.</p></div>
+</div>
+<div class="summary"><p>Build a click model for feed ads on a platform with 300 million daily users. For each (user, ad, context) it outputs a calibrated probability of click, which a cost-per-click auction multiplies by the bid to rank ads. Scoring must fit inside tens of milliseconds, handle thousands of new ads per hour, and keep learning continuously from impression and click logs.</p></div>
+<script type="application/json" class="dg" data-cap="The product from the user's side (top) and the logging that feeds training (bottom): an ad slot opens, the ad system picks one ad, and the impression and any later click are logged by request ID">
+{"type":"graph","cols":5,"gapX":44,
+ "nodes":[
+  {"id":"u","t":"User scrolls feed","c":0,"r":0,"k":"user"},
+  {"id":"slot","t":"Feed reserves ad slot","s":"every few posts","c":1,"r":0},
+  {"id":"ads","t":"Ad system","s":"select, score, auction","c":2,"r":0,"k":"model"},
+  {"id":"shown","t":"Sponsored post","s":"an impression","c":3,"r":0,"k":"io"},
+  {"id":"click","t":"User clicks","s":"opens landing page","c":4,"r":0,"k":"io"},
+  {"id":"tp","t":"Training pipeline","s":"features + labels","c":2,"r":1},
+  {"id":"il","t":"Impression log","s":"request_id, features","c":3,"r":1,"k":"data"},
+  {"id":"cl","t":"Click log","s":"request_id, click ts","c":4,"r":1,"k":"data"}],
+ "edges":[["u","slot"],["slot","ads"],["ads","shown"],["shown","click",{"d":1}],["shown","il"],["click","cl"],["cl","il",{"d":1}],["il","tp"]]}
+</script>
+
+<h2>Frame the Problem as an ML Task</h2>
+<h3>ML objective</h3>
+<p>Several objectives sound plausible. The way to choose is to ask what the downstream consumer, the auction, needs from the model.</p>
+<table>
+<caption>Candidate objectives</caption>
+<tr><th>Objective</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Rank ads by P(click) only</td><td>Simple; maximizes engagement</td><td>Ignores bids, so advertisers cannot compete and revenue is left on the table; no price can be derived</td></tr>
+<tr><td>Regress expected revenue per impression (bid &times; click) directly</td><td>One number to sort by</td><td>Bids change by the minute, so the target distribution shifts and the model must be retrained whenever bids move; heavy-tailed target; hides the click behavior you want to monitor</td></tr>
+<tr><td>Predict a calibrated P(click) and let the auction combine it with bid and pacing</td><td>Separates stable user behavior (the model) from fast-moving prices (the auction); supports per-click pricing; debuggable</td><td>Accuracy of the probability value, not only its order, now matters; needs a calibration story</td></tr>
+</table>
+<div class="callout key"><p>Predict a calibrated probability of click and keep the bid out of the model. The model owns user behavior, the auction owns money. Everything else in this chapter (downsampling corrections, calibration layers, online learning, delay handling) exists to keep that probability honest.</p></div>
+<p>Why does the value matter when only the ordering seems to drive the winner? Because the auction ranks by <code>bid &times; pCTR</code>, and a model that preserves the order of pCTR can still flip the order of the product. Take three ads competing for one slot. The true click probabilities are 1.0%, 3.0%, and 1.8%; suppose the model over-predicts only ad B, by 2x.</p>
+<table>
+<caption>Worked auction example (eCPM = bid &times; pCTR &times; 1000, in dollars per thousand impressions)</caption>
+<tr><th>Ad</th><th>Bid per click</th><th>True pCTR</th><th>True eCPM</th><th>Model pCTR</th><th>Model eCPM</th></tr>
+<tr><td>A</td><td>$2.00</td><td>1.0%</td><td>$20</td><td>1.0%</td><td>$20</td></tr>
+<tr><td>B</td><td>$0.50</td><td>3.0%</td><td>$15</td><td>6.0%</td><td>$30</td></tr>
+<tr><td>C</td><td>$1.00</td><td>1.8%</td><td>$18</td><td>1.8%</td><td>$18</td></tr>
+</table>
+<script type="application/json" class="dg" data-cap="Expected value per thousand impressions (dollars, illustrative). Over-predicting ad B by 2x keeps the pCTR order (B > C > A) but flips the auction winner from A to B">
+{"type":"bars","labels":["Ad A (bid $2.00)","Ad B (bid $0.50)","Ad C (bid $1.00)"],"series":[{"n":"True pCTR","v":[20,15,18]},{"n":"Miscalibrated","v":[20,30,18]}]}
+</script>
+<div class="callout math"><p>With correct scores, A wins (20 vs 18 vs 15). Under a second-price rule the winner pays just enough to beat the runner-up, so A pays 18/0.01 = $1.80 per click and revenue is 0.01 &times; 1.80 = $0.018 per impression. With the miscalibrated model, B wins (30 vs 20 vs 18) and pays the runner-up's score divided by its own predicted pCTR: 0.020 / 0.06 = $0.333 per click. B really clicks at 3%, so revenue is 0.03 &times; 0.333 = $0.010 per impression, a 44% drop (0.018 &rarr; 0.010), and the ad shown also has the lower true value to the market. The pCTR ranking never changed; the calibration error did the damage.</p></div>
+
+<h3>Input and output</h3>
+<p>The model's input is the feature vector for one (user, ad, context) triple; its output is a probability in (0, 1). Around it sits the auction, which turns probabilities into a winner and a price. Keep this boundary clear in an interview: the ML system produces <code>pCTR</code>, and the auction adds the bid, a pacing multiplier, and a quality or reserve rule.</p>
+<script type="application/json" class="dg" data-cap="Where pCTR sits in the auction: the model scores eligible ads, the auction multiplies by bid and pacing, ranks, and prices the winner per click">
+{"type":"graph","cols":4,"gapX":60,
+ "nodes":[
+  {"id":"bids","t":"Eligible ads + bids","s":"after targeting","c":0,"r":0,"k":"data"},
+  {"id":"model","t":"pCTR model","s":"calibrated P(click)","c":1,"r":0,"k":"model"},
+  {"id":"score","t":"Score","s":"bid x pCTR x pacing","c":2,"r":0},
+  {"id":"rank","t":"Rank and price","s":"pay to beat runner-up","c":3,"r":0},
+  {"id":"uc","t":"User + context","s":"features at request time","c":0,"r":1,"k":"user"},
+  {"id":"pace","t":"Budget pacing","s":"per-campaign multiplier","c":2,"r":1},
+  {"id":"win","t":"Winning ad","s":"billed only if clicked","c":3,"r":1,"k":"io"}],
+ "edges":[["bids","model"],["uc","model"],["model","score","pCTR",{"hl":1}],["pace","score",{"d":1}],["score","rank"],["rank","win"]]}
+</script>
+<p>Pricing matters for the design. In a generalized second-price (GSP) rule, the winner at rank <i>i</i> pays, per click, the score of the next ad divided by its own pCTR: <code>price_i = score_(i+1) / pCTR_i</code>. A one-slot feed ad behaves like a second-price auction in the quality-adjusted score, and VCG variants charge each winner the harm it causes others. In every variant the price depends on <i>other ads' pCTRs</i>, so errors propagate into revenue and into what advertisers feel they are paying for.</p>
+
+<h3>ML category</h3>
+<p>The formulation is pointwise binary classification with a probabilistic output, trained with log loss. Ranking-oriented losses are tempting but wrong here, because they only care about order.</p>
+<table>
+<caption>Formulations considered</caption>
+<tr><th>Formulation</th><th>Fit</th><th>Why or why not</th></tr>
+<tr><td>Pointwise binary classification (log loss)</td><td>Chosen</td><td>Log loss is a proper scoring rule: its minimizer is the true probability, which is exactly what the auction needs</td></tr>
+<tr><td>Pairwise or listwise learning to rank</td><td>Rejected for the final scorer</td><td>Optimizes order within a list and gives scores with no probability meaning; calibration would need a second model</td></tr>
+<tr><td>Per-ad aggregate CTR regression</td><td>Baseline only</td><td>Ignores the user, so it cannot personalize; useful as a smoothed prior for new ads</td></tr>
+<tr><td>Contextual bandit on top</td><td>Add later</td><td>Handles exploration for new ads, but needs a calibrated base model with uncertainty first</td></tr>
+</table>
+<p>The serving system is a cascade, as in the public Facebook description: cheap stages cut millions of ads to a manageable set, and only the last stage uses the expensive model. The counts below are assumptions for the scenario above.</p>
+<script type="application/json" class="dg" data-cap="Ad funnel with assumed counts: only about 300 ads per request ever see the expensive model, and one to three are shown">
+{"type":"funnel","stages":[
+ {"t":"Active ad corpus","s":"all live ads","n":"~10M","m":"assumed"},
+ {"t":"Eligibility filter","s":"targeting, budget, policy","n":"~3,000"},
+ {"t":"Light pre-ranker","s":"small model, cheap features","n":"~300"},
+ {"t":"Final pCTR + auction","s":"deep model, calibrated","n":"1-3 shown"}]}
+</script>
+<div class="callout tip"><p>In an interview, say that two-tower models belong in the pre-ranking and retrieval stages. The final scorer needs rich user-by-ad interactions (user history with this advertiser, creative type by device) and calibrated output, which a dot product of two independent embeddings cannot give.</p></div>
+
+<h2>Data Preparation</h2>
+<h3>Data engineering</h3>
+<p>Three sources matter: the ad catalog, the impression log, and the click log. The impression log is the most important table in the system, because it records the exact features and the score served for each decision.</p>
+<table>
+<caption>Ad catalog (one row per ad, updated continuously)</caption>
+<tr><th>ad_id</th><th>advertiser</th><th>campaign</th><th>category</th><th>creative</th><th>cpc_bid</th><th>daily_budget</th><th>created</th></tr>
+<tr><td>a_81</td><td>adv_9</td><td>c_204</td><td>footwear</td><td>video</td><td>$0.80</td><td>$500</td><td>11-04 18:20</td></tr>
+<tr><td>a_82</td><td>adv_44</td><td>c_377</td><td>games</td><td>image</td><td>$0.35</td><td>$2,000</td><td>09-12 08:05</td></tr>
+</table>
+<table>
+<caption>Impression log (one row per ad shown; the serving-time feature vector is stored alongside)</caption>
+<tr><th>request_id</th><th>user_id</th><th>ad_id</th><th>slot</th><th>device</th><th>ts</th><th>served_pctr</th><th>model_ver</th></tr>
+<tr><td>r_7f1</td><td>u_19</td><td>a_81</td><td>3</td><td>ios</td><td>11-05 09:00:12</td><td>0.021</td><td>m_42</td></tr>
+<tr><td>r_7f2</td><td>u_88</td><td>a_82</td><td>1</td><td>android</td><td>11-05 09:00:13</td><td>0.006</td><td>m_42</td></tr>
+</table>
+<table>
+<caption>Click log (one row per click, joined to impressions by request_id)</caption>
+<tr><th>request_id</th><th>ad_id</th><th>click_ts</th><th>source</th><th>valid</th></tr>
+<tr><td>r_7f1</td><td>a_81</td><td>11-05 09:00:19</td><td>cta_button</td><td>1</td></tr>
+</table>
+<p><b>Sizes (assumptions).</b> 300 million users &times; 10 opportunities is about 3 billion impressions per day, or 34,700 impressions per second on average. With roughly 1 KB of logged features per impression, that is about 3 TB per day. At a 1% CTR there are about 30 million clicks per day. Logging <code>served_pctr</code> and <code>model_ver</code> costs almost nothing and enables calibration monitoring and counterfactual analysis later.</p>
+<p>Labels come from joining two streams that arrive at different times. The join is a stateful stream job: impressions wait in a buffer keyed by request ID, clicks look them up, and an impression is emitted as a negative only after a waiting window has passed.</p>
+<script type="application/json" class="dg" data-cap="Streaming label join: impressions wait in a buffer for the window W; clicks are matched by request_id; clicks that arrive after the window are patched in later">
+{"type":"graph","cols":4,"gapX":56,
+ "nodes":[
+  {"id":"imp","t":"Impression stream","s":"request_id, features, ts","c":0,"r":0,"k":"data"},
+  {"id":"join","t":"Stream joiner","s":"HashQueue by request_id","c":1,"r":0},
+  {"id":"fraud","t":"Validity filter","s":"bots, duplicates, accidents","c":2,"r":0},
+  {"id":"ex","t":"Labeled examples","s":"click=1, else 0 after W","c":3,"r":0,"k":"data"},
+  {"id":"clk","t":"Click stream","s":"request_id, click ts","c":0,"r":1,"k":"data"},
+  {"id":"late","t":"Late-click patch","s":"clicks that miss W","c":2,"r":1}],
+ "edges":[["imp","join","wait W"],["clk","join"],["join","fraud"],["fraud","ex"],["clk","late","after window",{"d":1}],["late","ex",{"d":1}]]}
+</script>
+<p>How long should the window W be? Clicks on feed ads arrive quickly, but not instantly, and the tail is long. The curve below is illustrative; measure your own surface, because the shape depends on the creative type and the landing flow.</p>
+<script type="application/json" class="dg" data-cap="Illustrative delay curve: most clicks arrive within a couple of minutes, but a tail continues. The window trades label freshness against click coverage">
+{"type":"curve","xl":"Minutes after impression","yl":"Cumulative share of clicks","xmax":20,"ymax":1,
+ "series":[{"n":"Click arrivals","c":0,"lp":7,"pts":[[0,0],[0.25,0.45],[0.5,0.65],[1,0.8],[2,0.9],[5,0.96],[10,0.985],[20,0.995]]}],
+ "marks":[{"x":2,"y":0.9,"t":"2 min: 90%"},{"x":10,"y":0.985,"t":"10 min: 98.5%"}]}
+</script>
+<table>
+<caption>Window choice (coverage from the illustrative curve; joiner state assumes 34,700 impressions/s and 1 KB each)</caption>
+<tr><th>Window</th><th>Click coverage</th><th>Labeled CTR if true CTR is 1%</th><th>Joiner buffer</th></tr>
+<tr><td>2 minutes</td><td>90%</td><td>0.900% (10% too low)</td><td>about 4.2 GB</td></tr>
+<tr><td>10 minutes</td><td>98.5%</td><td>0.985% (1.5% too low)</td><td>about 21 GB</td></tr>
+<tr><td>20 minutes</td><td>99.5%</td><td>0.995% (0.5% too low)</td><td>about 42 GB</td></tr>
+</table>
+<p>The buffer sizes follow from 34,700 &times; window seconds &times; 1 KB: 120 s gives 4.2 million records, 600 s gives 20.8 million, and 1,200 s gives 41.7 million. A short window biases labels toward negatives and makes the model under-predict, which is correctable if the coverage is stable. A long window delays learning and costs memory. The public Facebook write-up describes exactly this recency versus coverage balance and reports that practical windows reduce the bias to a small fraction of a percent. Two further tools exist for slow signals such as conversions: model the delay explicitly (Chapelle), or emit every impression immediately as a negative and re-emit a positive when a late click arrives, correcting the loss with importance weights (Ktena et al.).</p>
+<div class="callout warn"><p>A broken click stream looks like a model problem. If the click feed stalls, the joiner emits only negatives, the labeled CTR collapses toward zero, and an online learner happily learns to predict zero for everything. Alert on joiner input rates and on the labeled CTR, and have the trainer disconnect automatically when the label distribution moves abruptly.</p></div>
+
+<h3>Feature engineering</h3>
+<table>
+<caption>Features by entity</caption>
+<tr><th>Entity</th><th>Features</th><th>Encoding</th></tr>
+<tr><td>Ad</td><td>ad_id, creative_id, advertiser_id, campaign, category, creative type, image/video and text embeddings from a pretrained encoder, ad age, impressions and smoothed CTR over 1 hour, 1 day, 7 days</td><td>IDs hashed into embedding rows; content embeddings passed as dense vectors; counts log-bucketized; CTRs smoothed with a prior</td></tr>
+<tr><td>User</td><td>Age bucket, country, language, declared and inferred interests, categories and advertisers clicked recently, user's own smoothed CTR, ads seen in the last day (fatigue), last N clicked ad IDs</td><td>Categorical IDs embedded; multi-valued fields pooled (sum or attention); recent-click sequence pooled</td></tr>
+<tr><td>Context</td><td>Device, OS, app version, connection type, placement and slot position, hour, day of week</td><td>Small vocabularies one-hot or embedded; hour as bucket or sine/cosine</td></tr>
+<tr><td>Cross</td><td>User&ndash;category affinity, user&ndash;advertiser history, category &times; hour, country &times; creative type</td><td>Explicit crosses hashed, or learned by interaction layers</td></tr>
+</table>
+<p>Two findings from the Facebook paper are worth knowing. First, features describing history (the ad's recent CTR, the user's average CTR) dominated feature importance: the top ten features were all historical. A model with only contextual features was about 4.5% worse in normalized entropy than the full model, while one with only historical features was less than 1% worse. Second, contextual features still matter for cold start, because a new ad or user has no history to look up.</p>
+<script type="application/json" class="dg" data-cap="Feature pipeline: IDs are hashed and embedded, numeric and time fields are bucketized, crosses are hashed, and everything is concatenated into one input vector">
+{"type":"graph","cols":4,"gapX":60,
+ "nodes":[
+  {"id":"u","t":"User features","s":"history, interests, geo","c":0,"r":0,"k":"data"},
+  {"id":"a","t":"Ad features","s":"IDs, creative, smoothed CTR","c":0,"r":1,"k":"data"},
+  {"id":"cr","t":"Cross features","s":"user x category, ...","c":0,"r":2,"k":"data"},
+  {"id":"x","t":"Context features","s":"device, hour, slot","c":0,"r":3,"k":"data"},
+  {"id":"h","t":"Hash IDs","s":"id to bucket to row","c":1,"r":0},
+  {"id":"ch","t":"Hash the cross","s":"hash(a, b) mod 2^22","c":1,"r":2},
+  {"id":"b","t":"Bucketize","s":"numeric and time fields","c":1,"r":3},
+  {"id":"emb","t":"Embedding tables","s":"16-32 dims per field","c":2,"r":1,"k":"vec"},
+  {"id":"dense","t":"Dense block","s":"normalized scalars","c":2,"r":3},
+  {"id":"model","t":"Model input","s":"concatenated vector","c":3,"r":2,"k":"model"}],
+ "edges":[["u","h"],["a","h"],["cr","ch"],["x","b"],["h","emb"],["ch","emb"],["b","dense"],["emb","model"],["dense","model"]]}
+</script>
+<p><b>Encoding trade-offs.</b> High-cardinality IDs (user, ad, advertiser) cannot be one-hot encoded. Feature hashing maps <code>field:value</code> into a fixed number of buckets, such as 2<sup>22</sup> = 4.2 million, with no vocabulary to maintain; new ads get a bucket automatically. The cost is collisions (unrelated IDs share a row) and no semantic meaning for the bucket. Learned embeddings give each ID a dense vector, which generalizes between similar IDs and feeds neural models, but the table is the dominant memory cost. Numeric features are bucketized so a linear layer can learn a non-linear response, and crossed features capture interactions a linear model cannot find on its own.</p>
+<p><b>Embedding memory.</b> Rows &times; dimension &times; bytes per value, in fp32. These sizes are assumptions chosen to be plausible for the scale.</p>
+<script type="application/json" class="dg" data-cap="Embedding memory by field in GB (fp32, assumed cardinalities): the user ID table alone is 64 of about 74 GB">
+{"type":"bars","horiz":true,"labels":["user_id: 500M x 32d","creative_id: 50M x 32d","ad_id: 20M x 32d","cross hash: 10M x 16d","advertiser_id: 5M x 16d","topic: 1M x 16d"],"series":[{"n":"GB","v":[64,6.4,2.56,0.64,0.32,0.064]}]}
+</script>
+<div class="callout math"><p>user_id: 500,000,000 &times; 32 &times; 4 bytes = 64 GB. creative_id: 50,000,000 &times; 32 &times; 4 = 6.4 GB. ad_id: 20,000,000 &times; 32 &times; 4 = 2.56 GB. cross: 10,000,000 &times; 16 &times; 4 = 0.64 GB. advertiser_id: 5,000,000 &times; 16 &times; 4 = 0.32 GB. topic: 1,000,000 &times; 16 &times; 4 = 0.064 GB. Total is about 74 GB. Training with Adam keeps weights plus two moment estimates, so roughly three times that (about 220 GB); serving in fp16 halves it and 8-bit row-wise quantization cuts it to about a quarter. This is why the table is sharded across hosts and why teams hash user IDs into fewer buckets or drop raw user_id in favor of behavioral features.</p></div>
+
+<h3>Labels</h3>
+<table>
+<caption>Candidate label sources</caption>
+<tr><th>Label</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Click within the window</td><td>Dense enough, fast (seconds to minutes), directly what a CPC advertiser pays for</td><td>Includes accidental clicks and click bait; fraud contaminates it</td></tr>
+<tr><td>Quality click (click plus landing-page dwell or follow-up action)</td><td>Filters accidental clicks; closer to advertiser value</td><td>Slower, needs landing-page measurement, often unavailable off-platform</td></tr>
+<tr><td>Conversion (purchase, install, signup)</td><td>True advertiser value; basis for conversion-based bidding</td><td>Sparse (often 0.01% or lower of impressions); delayed by hours to days; attribution is partly lost under privacy limits</td></tr>
+</table>
+<p><b>Decision.</b> Train on clicks that pass a validity filter, and add conversions later as a second head. A click label with validity filtering is the fastest, densest signal and matches what is billed. Four practical issues follow.</p>
+<ul>
+<li><b>Imbalance.</b> CTR is about 1% or lower, so 99% of rows are negatives. Downsampling negatives cuts training cost by close to 10x, but it shifts the base rate, so predictions must be corrected before they reach the auction (see Model Development).</li>
+<li><b>Noise.</b> Bots, click farms, double clicks, and accidental taps produce positive labels with no intent. Filter before labeling and refund advertisers; both the learner and the bill must agree on which clicks are real.</li>
+<li><b>Delay.</b> Handled by the waiting window above, with a calibration layer absorbing the small remaining bias.</li>
+<li><b>Selection and position bias.</b> The log contains only ads that won earlier auctions, shown in particular slots. Ads in higher slots collect more clicks irrespective of quality. Log slot position as a feature, and keep a small exploration slice where ads are chosen with known probabilities so inverse-propensity weighting can correct offline estimates (Joachims et al.).</li>
+</ul>
+<div class="callout warn"><p>Split data by time, not at random. Train on earlier days and validate on later days, and never downsample the validation set. A random split leaks the same ad and user across both sides and hides the drift you will meet in production.</p></div>
+
+<h2>Model Development</h2>
+<table>
+<caption>Model options</caption>
+<tr><th>Model</th><th>Idea</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Logistic regression on hashed and crossed features</td><td>Linear score on a huge sparse vector, trained online</td><td>Fast, well calibrated, tiny to serve, easy to update every minute</td><td>Crosses must be engineered by hand</td></tr>
+<tr><td>GBDT + logistic regression</td><td>Trees turn raw features into leaf indicators that feed a linear model</td><td>Automatic non-linearity and crosses; reported over 3% NE gain versus either part alone</td><td>Trees retrain in batch, so the tree part is hours stale</td></tr>
+<tr><td>Factorization machine</td><td>Pairwise interactions through shared embeddings</td><td>Learns crosses on sparse data with few parameters</td><td>Second-order only; shallow</td></tr>
+<tr><td>Wide &amp; Deep</td><td>Wide linear part memorizes crosses; deep part generalizes via embeddings</td><td>Combines memorization and generalization</td><td>Wide-part crosses are still hand-picked</td></tr>
+<tr><td>DeepFM</td><td>FM and MLP share the same embeddings</td><td>No manual crosses; end to end</td><td>FM part is second-order; calibration needs care</td></tr>
+<tr><td>Deep &amp; Cross Network (V2)</td><td>Explicit cross layers plus an MLP</td><td>Bounded-degree crosses learned automatically; strong in production reports</td><td>More compute; large embedding tables</td></tr>
+<tr><td>Two-tower</td><td>Independent user and ad encoders, dot product</td><td>Cheap retrieval over millions of ads</td><td>No fine user-by-ad interactions; weak for final scoring</td></tr>
+</table>
+<p><b>Decision.</b> Use a deep model with explicit feature crossing (DCN V2 or DeepFM) as the final scorer, trained with log loss, with an online-updated sparse layer and a calibration layer on top. Keep GBDT+LR and plain logistic regression as the baseline and the fallback. In an interview, the safe path is to start from GBDT+LR because it is simple to explain and well documented, then argue for the deep model when the feature space and data volume justify the cost.</p>
+<h3>GBDT plus logistic regression</h3>
+<p>The Facebook hybrid first trains boosted trees in batch. Each tree maps an example to one leaf, and the leaf index is treated as a categorical feature with one-hot coding. A linear classifier on those one-hot leaves then learns a weight for every learned rule. If two trees have 3 and 2 leaves and an impression lands in leaf 3 of the first and leaf 2 of the second, the linear model sees <code>[0, 0, 1, 0, 1]</code>. The paper reported that gains flatten after about 500 trees with at most 12 leaves each, and that this combination beat either model alone by over 3% in normalized entropy. The linear layer can be updated online in minutes, while the trees refit daily.</p>
+<script type="application/json" class="dg" data-cap="GBDT + LR: trees refit daily in batch and act as a feature transform; the sparse linear layer on top learns online from the click stream">
+{"type":"graph","cols":5,"gapX":40,
+ "nodes":[
+  {"id":"raw","t":"Raw features","s":"dense and categorical","c":0,"r":0,"k":"data"},
+  {"id":"trees","t":"Boosted trees","s":"e.g. 500 trees, 12 leaves","c":1,"r":0,"k":"model"},
+  {"id":"leaf","t":"Leaf one-hot","s":"one active leaf per tree","c":2,"r":0,"k":"vec"},
+  {"id":"lr","t":"Sparse logistic regression","s":"online-updated","c":3,"r":0,"k":"model"},
+  {"id":"out","t":"pCTR","s":"after calibration","c":4,"r":0,"k":"io"},
+  {"id":"batch","t":"Daily batch trainer","s":"refits the trees","c":1,"r":1},
+  {"id":"online","t":"Online trainer","s":"FTRL-Proximal on stream","c":3,"r":1}],
+ "edges":[["raw","trees"],["trees","leaf"],["leaf","lr"],["lr","out"],["batch","trees",{"d":1}],["online","lr",{"d":1}]]}
+</script>
+<p>The online linear layer is where the Google ad-click paper is useful. It trains logistic regression with FTRL-Proximal, which gives an L1-regularized, sparse model and a <b>per-coordinate learning rate</b> <code>&eta;<sub>t,i</sub> = &alpha; / (&beta; + sqrt(sum of squared gradients for feature i))</code>. Rare features keep a large step and common features settle down, which matters because a feature that appeared twice should not be updated like one seen a billion times. The Facebook paper compared learning-rate schemes and found per-coordinate rates best, with about 5% lower NE than the worst per-weight scheme. The Google paper also gives memory tricks that remain useful: probabilistic inclusion of new features, 16-bit fixed-point weights, and progressive validation (score each example before learning from it) for a cheap online metric.</p>
+<h3>Deep model with explicit crosses</h3>
+<p>At larger scale a neural model replaces trees as the interaction learner. The Deep &amp; Cross design feeds the same embedded input <code>x0</code> into two branches. The cross branch applies layers of the form <code>x_next = x0 &middot; (W x + b) + x</code> (an elementwise product with the original input), so each layer raises the polynomial degree of the learned interactions by one; three layers capture up to fourth-order crosses. The deep branch is an ordinary MLP for implicit interactions. DeepFM instead shares embeddings between a factorization machine, which handles second-order crosses, and an MLP. Wide &amp; Deep keeps a hand-crossed linear model beside the MLP.</p>
+<script type="application/json" class="dg" data-cap="Deep & Cross Network V2 style scorer: parallel cross and deep branches over the same input, joined into a logit and then calibrated">
+{"type":"stack","cols":[
+ {"t":"Cross network (explicit)","layers":[{"t":"Input x0","s":"embeddings + dense, ~1k dims","k":"data"},{"t":"Cross layer 1","s":"x0 * (Wx + b) + x"},{"t":"Cross layer 2","s":"degree 3 interactions"},{"t":"Cross layer 3","s":"degree 4 interactions","k":"model"}]},
+ {"t":"Deep network (implicit)","layers":[{"t":"Input x0","s":"same vector","k":"data"},{"t":"Dense 1024 + ReLU"},{"t":"Dense 512 + ReLU"},{"t":"Dense 256 + ReLU","k":"model"}]}],
+ "join":{"t":"Concat + logit + sigmoid","s":"then calibration layer"}}
+</script>
+<h3>Training data construction and loss</h3>
+<p>Every impression is a training row. All positives are kept; negatives are downsampled with a keep-rate <i>w</i>. The Facebook experiments found the best normalized entropy at a negative keep-rate of 0.025 among the rates they tried, so the right <i>w</i> is a tuned hyperparameter, not a constant.</p>
+<script type="application/json" class="dg" data-cap="Training set construction: keep every click, keep a fraction w of the non-clicks, train on the resampled set, then undo the sampling on the model output">
+{"type":"graph","cols":4,"gapX":60,
+ "nodes":[
+  {"id":"imp","t":"Joined impressions","s":"labeled by the joiner","c":0,"r":1,"k":"data"},
+  {"id":"pos","t":"Positives","s":"every click kept","c":1,"r":0,"k":"data"},
+  {"id":"neg","t":"Negatives","s":"no click in window","c":1,"r":2,"k":"data"},
+  {"id":"ds","t":"Downsample","s":"keep fraction w","c":2,"r":2},
+  {"id":"model","t":"Model on sampled data","s":"predicts p'","c":3,"r":1,"k":"model"},
+  {"id":"fix","t":"Recalibrate output","s":"p = p' / (p' + (1-p')/w)","c":3,"r":2}],
+ "edges":[["imp","pos"],["imp","neg"],["neg","ds","keep w"],["pos","model"],["ds","model"],["model","fix"]]}
+</script>
+<p>The loss is log loss: <code>L = &minus;[ y &middot; log p + (1 &minus; y) &middot; log(1 &minus; p) ]</code>. In words, it charges the negative log of the probability assigned to what actually happened. A confident wrong answer costs a lot, and the minimizer is the true click rate, which is why log loss yields calibrated probabilities where a ranking loss does not. For a click (y = 1), predicting 0.02 costs &minus;ln 0.02 = 3.91, while predicting 0.01 costs 4.61; for a non-click, predicting 0.01 costs only &minus;ln 0.99 = 0.010.</p>
+<p>Downsampling changes the base rate the model sees. If 1% of impressions click and only a fraction <i>w</i> of negatives is kept, the model learns a click rate that is much higher than reality. The correction follows from odds: sampled odds are true odds divided by <i>w</i>, so <code>p = p' / (p' + (1 &minus; p') / w)</code>, where p' is the model output on sampled data.</p>
+<div class="callout math"><p>Take 1 million impressions at a true CTR of 1%: 10,000 clicks and 990,000 non-clicks. Keep w = 0.1 of the negatives, which leaves 99,000. The sampled click rate is 10,000 / 109,000 = 0.0917. A perfect model trained on this set outputs p' = 0.0917 for an average impression. The correction gives p = 0.0917 / (0.0917 + 0.9083 / 0.1) = 0.0917 / 9.1747 = 0.0100, the true 1%. Another point: a score p' = 0.30 maps to 0.30 / (0.30 + 0.70 / 0.1) = 0.30 / 7.30 = 4.1%. With w = 0.025 the same raw 0.30 maps to 0.30 / (0.30 + 28) = 1.06%.</p></div>
+<script type="application/json" class="dg" data-cap="Recalibration map from sampled-space score p' to true CTR p. The same raw score means very different probabilities depending on the keep-rate, so the correction must travel with the model">
+{"type":"curve","xl":"Raw model output p' (downsampled data)","yl":"Corrected CTR p","ymax":1,
+ "series":[
+  {"n":"no sampling","c":2,"d":1,"lp":1,"pts":[[0,0],[0.5,0.5],[1,1]]},
+  {"n":"w = 0.1","c":0,"lp":6,"pts":[[0,0],[0.1,0.01099],[0.2,0.02439],[0.3,0.0411],[0.5,0.0909],[0.7,0.1892],[0.9,0.4737],[0.95,0.6552],[0.98,0.8305],[1,1]]},
+  {"n":"w = 0.025","c":1,"lp":6,"pts":[[0,0],[0.1,0.00277],[0.2,0.00621],[0.3,0.0106],[0.5,0.0244],[0.7,0.0551],[0.9,0.1837],[0.95,0.322],[0.98,0.5506],[1,1]]}],
+ "marks":[{"x":0.3,"y":0.0411,"t":"0.30 maps to 4.1%"}]}
+</script>
+<p>An alternative is to keep the model in true-probability space by giving each kept negative a training weight of 1/<i>w</i>. The Google paper takes this importance-weighting route. It needs no correction at serving time, but it raises gradient variance, so the choice is a trade-off between simplicity at serve time and statistical efficiency at train time. Whichever you choose, add a final calibration layer (isotonic or piecewise-linear, per slice) fit on a recent, un-sampled slice of served traffic. Neural networks in particular drift toward over-confidence (Guo et al.), and a monotone map fixes this without changing the ranking. Train large sparse-embedding models in a single pass over streaming data and warm-start each day from the previous checkpoint; a second pass over the same rows often overfits those embeddings sharply.</p>
+<div class="callout warn"><p>Calibrate on the traffic that the auction actually serves. The auction picks winners from many noisy estimates, so it systematically selects ads whose scores are too high (the winner's curse). A model that is calibrated on all impressions can still over-predict on the winners. Monitor calibration on served impressions, by slice, and fit the final layer there.</p></div>
+
+<h2>Evaluation</h2>
+<h3>Offline metrics</h3>
+<table>
+<caption>Offline metric candidates</caption>
+<tr><th>Metric</th><th>Definition</th><th>Flaw</th><th>Decision</th></tr>
+<tr><td>Log loss</td><td>Average negative log probability assigned to the true label</td><td>Depends on the base CTR, so it cannot be compared across datasets or days</td><td>Use for training; normalize for reporting</td></tr>
+<tr><td>Normalized entropy (NE)</td><td>Average log loss divided by the log loss of always predicting the background CTR</td><td>Single global number; hides per-slice problems; the baseline moves with data</td><td>Primary metric</td></tr>
+<tr><td>Calibration ratio</td><td>Sum of predicted clicks divided by sum of observed clicks</td><td>A ratio of 1.0 can hide errors that cancel across slices</td><td>Primary; always report per slice</td></tr>
+<tr><td>ROC-AUC</td><td>Probability that a random clicked impression scores above a random non-clicked one</td><td>Blind to calibration; dominated by easy user-level differences</td><td>Sanity check only</td></tr>
+<tr><td>Group AUC (per user or request)</td><td>AUC computed within each group, then averaged</td><td>Needs groups with both labels; ignores calibration too</td><td>Use to test within-request ordering</td></tr>
+<tr><td>Precision, recall, F1</td><td>Quality at a score threshold</td><td>There is no threshold decision in an auction</td><td>Do not use</td></tr>
+</table>
+<h4>Normalized entropy</h4>
+<p>NE is the average log loss per impression divided by the log loss of a trivial model that predicts the background CTR for every row; it equals one minus the relative information gain. Lower is better, and NE below 1 means the model beats the baseline. The division makes the metric insensitive to the base CTR: the closer the CTR is to 0 or 1, the easier it is to get a small raw log loss, and normalization removes that effect.</p>
+<div class="callout math"><p>Ten impressions, two clicks, so the background CTR is 0.2. The baseline log loss is the entropy H(0.2) = &minus;(0.2 ln 0.2 + 0.8 ln 0.8) = 0.3219 + 0.1785 = 0.5004. The model predicts 0.6 and 0.4 for the two clicks and 0.1 (four times), 0.2 (three times), and 0.3 (once) for the eight non-clicks. Click losses: &minus;ln 0.6 + &minus;ln 0.4 = 0.5108 + 0.9163 = 1.4271. Non-click losses: 4 &times; 0.1054 + 3 &times; 0.2231 + 0.3567 = 0.4214 + 0.6694 + 0.3567 = 1.4475. Total 2.8747, average 0.2875. NE = 0.2875 / 0.5004 = 0.574, so the relative information gain is about 43%. Mean prediction is 0.23 versus an observed 0.20, a calibration ratio of 1.15.</p></div>
+<script type="application/json" class="dg" data-cap="Why NE rather than raw log loss: dataset A has a 10x lower raw log loss, but its model gains more over its own baseline (NE 0.89 vs 0.96)">
+{"type":"bars","labels":["Dataset A (CTR 1%)","Dataset B (CTR 20%)"],"series":[{"n":"Log loss","v":[0.05,0.48]},{"n":"NE","v":[0.893,0.959]}]}
+</script>
+<p>The numbers in the chart: for A, entropy of a 1% CTR is 0.0560, so a model log loss of 0.050 gives NE 0.893; for B the entropy is 0.5004, so a log loss of 0.48 gives NE 0.959. Raw log loss says A is ten times better; NE says the model on A is simply a bit better than its baseline, which is the fair comparison. NE also reflects calibration: the Facebook paper notes that if a model over-predicts by 2x and a global multiplier of 0.5 fixes it, NE improves while AUC does not move at all.</p>
+<h4>AUC and its blind spots</h4>
+<p>AUC counts, over all (clicked, non-clicked) pairs, the fraction ordered correctly. It has four blind spots in ads. It ignores calibration, because any monotone transform of the scores leaves it unchanged. It mixes two kinds of ordering, between users and between ads for the same user, and a model that only learns which users click a lot scores well while adding nothing to ad choice; group AUC addresses that. It treats all pairs equally, while the auction cares about the top of the list after weighting by bids. And it is too coarse for the small gains that matter at this scale, where an NE change of a fraction of a percent is a real result.</p>
+<script type="application/json" class="dg" data-cap="AUC as correctly ordered pairs: two clicked impressions against three non-clicked ones; 5 of 6 pairs are right, so AUC is 0.833">
+{"type":"matrix","rl":"Clicked (score)","cl":"Not clicked (score)","rows":["click 0.04","click 0.02"],"cols":["0.03","0.01","0.005"],"v":[[1,1,1],[0,1,1]],"hl":[[1,0]]}
+</script>
+<div class="callout math"><p>Clicked scores 0.04 and 0.02; non-clicked scores 0.03, 0.01, 0.005. The 0.04 click beats all three (3 pairs). The 0.02 click beats 0.01 and 0.005 but loses to 0.03 (2 of 3). AUC = 5/6 = 0.833. Now multiply every score by 5. The order is identical, so AUC is still 0.833, yet the model now predicts a CTR five times too high. A model like that wrecks the auction and passes an AUC-only review.</p></div>
+<h4>Calibration</h4>
+<p>The calibration ratio is the sum of predicted probabilities over the sum of observed clicks. If a model predicts 12,000 clicks over a day with 10,000 actual clicks, the ratio is 1.20, an over-prediction of 20%. Report it per slice (country, device, placement, ad age, advertiser size), because a global 1.0 can hide a 1.5 on new ads balanced by a 0.8 on old ones. A reliability diagram bins predictions and plots the observed rate in each bin against the bin's mean prediction; a calibrated model hugs the diagonal.</p>
+<script type="application/json" class="dg" data-cap="Reliability diagram (illustrative): a calibrated model follows the dashed diagonal; an uncorrected model trained with 10x negative downsampling reads about 9 to 10 times too high">
+{"type":"curve","xl":"Predicted pCTR","yl":"Observed CTR","xmax":0.1,"ymax":0.1,
+ "series":[
+  {"n":"Ideal","c":2,"d":1,"pts":[[0,0],[0.1,0.1]]},
+  {"n":"Calibrated","c":0,"lp":4,"pts":[[0,0],[0.005,0.0052],[0.01,0.0097],[0.02,0.0205],[0.04,0.039],[0.06,0.062],[0.08,0.079],[0.1,0.1]]},
+  {"n":"Uncorrected (w = 0.1)","c":1,"lp":6,"pts":[[0,0],[0.005,0.0005],[0.01,0.001],[0.02,0.002],[0.04,0.0041],[0.06,0.0063],[0.08,0.0086],[0.1,0.011]]}]}
+</script>
+<div class="callout tip"><p>If asked "which offline metric would you ship on", answer with a set: NE for overall quality, calibration ratio per slice as a hard gate, group AUC as a diagnostic. Then add that offline metrics are computed on logs from the previous policy, so they predict online results only roughly and every launch still needs an A/B test.</p></div>
+
+<h3>Online metrics</h3>
+<table>
+<caption>Online and guardrail metrics</caption>
+<tr><th>Metric</th><th>Kind</th><th>Why it matters</th></tr>
+<tr><td>Revenue per thousand impressions (eCPM, total ad revenue)</td><td>Business</td><td>The platform's direct objective</td></tr>
+<tr><td>CTR and click volume</td><td>Engagement</td><td>Moves first, but can rise with clickbait while revenue stays flat</td></tr>
+<tr><td>Advertiser value: conversions, return on ad spend, cost per action</td><td>Business</td><td>Advertisers leave if clicks stop converting</td></tr>
+<tr><td>Budget delivery (spend divided by budget) and advertiser retention</td><td>Marketplace</td><td>Under-delivery means wasted demand; over-delivery means overspend</td></tr>
+<tr><td>Online calibration (predicted over observed) by slice</td><td>Model health</td><td>Direct view of the quantity the auction relies on</td></tr>
+<tr><td>Hide and report rate, landing-page bounce</td><td>Guardrail</td><td>Catches ads users dislike</td></tr>
+<tr><td>Time spent, sessions, retention at higher ad load</td><td>Guardrail</td><td>Short-term revenue must not cost long-term users</td></tr>
+<tr><td>p99 latency and timeout rate</td><td>Guardrail</td><td>A slow ad call delays the entire feed</td></tr>
+</table>
+<p>Ads A/B tests have pitfalls that ordinary product tests lack. Users in control and treatment draw on the same advertiser budgets, so a treatment that spends faster steals impressions from control, and the measured lift is partly cannibalization. Advertisers also react: a better model changes bids and budgets over days. Pacing systems interact with the model, so a short test can look better simply because it spent more of an unpaced budget early in the day.</p>
+<script type="application/json" class="dg" data-cap="Budget-split experiment: each advertiser's budget is cut into two slices, one per arm, so the arms cannot cannibalize each other's spend">
+{"type":"graph","cols":4,"gapX":64,
+ "nodes":[
+  {"id":"bud","t":"Advertiser daily budget","s":"shared by all users","c":0,"r":1,"k":"store"},
+  {"id":"sa","t":"Budget slice A","s":"50% of budget","c":1,"r":0},
+  {"id":"sb","t":"Budget slice B","s":"50% of budget","c":1,"r":2},
+  {"id":"ca","t":"Control traffic","s":"model v1 serves slice A","c":2,"r":0},
+  {"id":"tb","t":"Treatment traffic","s":"model v2 serves slice B","c":2,"r":2,"k":"model"},
+  {"id":"out","t":"Compare per arm","s":"revenue, value, guardrails","c":3,"r":1,"k":"io"}],
+ "edges":[["bud","sa"],["bud","sb"],["sa","ca"],["sb","tb"],["ca","out"],["tb","out"]]}
+</script>
+<ul>
+<li><b>Split the budget, not only the users.</b> Give each arm its own half of every advertiser's budget, or randomize at the campaign level, so spend is not shared. A pure user-level split is acceptable only when most budgets are not binding.</li>
+<li><b>Run long enough for pacing and learning.</b> At least a full week to cover weekday cycles, with a ramp so the online learner and pacing controllers settle.</li>
+<li><b>Watch both sides of the market.</b> Advertiser outcomes (return on spend, delivery) are outcomes, not only user metrics.</li>
+<li><b>Keep a long-term holdout.</b> A small, permanent holdout on the old model measures drift and slow effects such as ad fatigue.</li>
+</ul>
+
+<h2>Serving</h2>
+<p>The serving system has an online path that must answer in tens of milliseconds and an offline path that keeps the model and its features fresh. The two paths share exactly two things: the feature definitions and the model registry.</p>
+<script type="application/json" class="dg" data-cap="Serving architecture: the online path (top) selects, fetches features, scores, and runs the auction; the offline path (bottom) joins logs, trains, validates, and publishes models">
+{"type":"graph","cols":5,"gapX":36,
+ "groups":[{"t":"Online: per ad request","c0":0,"c1":4,"r0":0,"r1":0},{"t":"Offline and nearline: learning loop","c0":0,"c1":4,"r0":1,"r1":1}],
+ "nodes":[
+  {"id":"req","t":"Feed request","s":"user + context","c":0,"r":0,"k":"io"},
+  {"id":"sel","t":"Ad selection","s":"targeting index, budget","c":1,"r":0},
+  {"id":"fs","t":"Feature store","s":"user, ad, counters","c":2,"r":0,"k":"store"},
+  {"id":"ms","t":"pCTR model server","s":"pre-rank + main model","c":3,"r":0,"k":"model"},
+  {"id":"auc","t":"Auction + pacing","s":"rank, price, pick","c":4,"r":0},
+  {"id":"logs","t":"Impression + click logs","s":"written by ad server","c":0,"r":1,"k":"data"},
+  {"id":"join","t":"Stream joiner","s":"labels + validity","c":1,"r":1},
+  {"id":"tr","t":"Trainer","s":"warm start, incremental","c":2,"r":1,"k":"model"},
+  {"id":"gate","t":"Validation gate","s":"NE, calibration, canary","c":3,"r":1},
+  {"id":"reg","t":"Model registry","s":"versioned checkpoints","c":4,"r":1,"k":"store"}],
+ "edges":[["req","sel"],["sel","fs"],["fs","ms"],["ms","auc",{"hl":1}],["logs","join"],["join","tr"],["tr","gate"],["gate","reg"],["reg","ms","new model",{"d":1,"sa":"t","sb":"b"}],["join","fs","fresh counters",{"d":1,"sa":"t","sb":"b"}]]}
+</script>
+<h3>Latency and scale math</h3>
+<p>These figures are assumptions for the scenario, to show the reasoning an interviewer wants.</p>
+<ul>
+<li><b>Request rate.</b> 3 billion ad opportunities per day is 34,700 per second on average; assume a 3x peak, about 104,000 requests per second.</li>
+<li><b>Scoring rate.</b> 300 ads per request after pre-ranking gives 31 million model scorings per second at peak.</li>
+<li><b>Compute.</b> Assume 3 full-rank cross layers on a 1,000-dimensional input (3 &times; 1M multiply-adds) plus a 1024-512-256 MLP (about 1.7M): roughly 4.7M multiply-adds, or 9.4 MFLOP, per ad. At 31 million ads per second that is about 300 TFLOP/s. Matrix math is a few tens of accelerators; low-rank cross layers and sharing user-side work across the 300 ads cut it further.</li>
+<li><b>Memory traffic is the real cost.</b> With 40 embedding fields of 32 floats (128 bytes) each, 31 million scorings per second means 1.25 billion row lookups and about 160 GB/s of random reads, spread over many sharded hosts. Redundancy across regions and peak headroom dominate fleet size, not FLOPs.</li>
+</ul>
+<script type="application/json" class="dg" data-cap="Latency budget of the ad stage (assumed, milliseconds at p99): feature fetch and model inference take over half of the 50 ms">
+{"type":"bars","horiz":true,"labels":["Targeting + eligibility","Feature fetch","Pre-ranker","Main model inference","Auction + pacing","Network + serialization"],"series":[{"n":"ms","v":[8,12,6,15,4,5]}]}
+</script>
+<p>The budget sums to 8 + 12 + 6 + 15 + 4 + 5 = 50 ms. Two techniques recover time when it is tight: batch all 300 candidates in a single model call, and fetch user features once per request rather than once per ad.</p>
+<h3>Refresh and stability</h3>
+<p>Freshness has a measurable payoff. In the Facebook experiments, accuracy fell steadily as the gap between training and test data grew, and training daily instead of weekly improved NE by about 1%. The cure is incremental training, but fast learning also amplifies noise, bad data, and feedback loops, so each update passes a gate.</p>
+<table>
+<caption>Cadence by component</caption>
+<tr><th>Component</th><th>Update cadence</th><th>Trade-off</th></tr>
+<tr><td>Calibration layer</td><td>Minutes</td><td>Tracks short-term drift; must be fit on enough served traffic to be stable</td></tr>
+<tr><td>Sparse and embedding parameters, online linear layer</td><td>Minutes to hours</td><td>Tracks new ads quickly; noisy for rare IDs</td></tr>
+<tr><td>Dense network weights</td><td>Daily incremental, warm-started</td><td>Stable features and fewer rollbacks</td></tr>
+<tr><td>Feature definitions and architecture</td><td>Weekly full retrain from scratch</td><td>Removes accumulated drift; allows structural changes</td></tr>
+</table>
+<script type="application/json" class="dg" data-cap="Online learning loop with a validation gate: each candidate checkpoint warm-starts from the last good model and ships only if it passes holdout and canary checks">
+{"type":"graph","cols":4,"gapX":56,
+ "nodes":[
+  {"id":"stream","t":"Labeled stream","s":"minutes-old examples","c":0,"r":0,"k":"data"},
+  {"id":"train","t":"Incremental trainer","s":"new checkpoint every N min","c":1,"r":0,"k":"model"},
+  {"id":"gate","t":"Validation gate","s":"holdout NE, calibration","c":2,"r":0},
+  {"id":"canary","t":"Canary 1%","s":"live comparison","c":3,"r":0},
+  {"id":"last","t":"Last good model","s":"warm-start source","c":0,"r":1,"k":"store"},
+  {"id":"rej","t":"Reject and alert","s":"keep serving old model","c":2,"r":1,"k":"io"},
+  {"id":"prom","t":"Ramp to 100%","s":"becomes last good","c":3,"r":1,"k":"io"}],
+ "edges":[["stream","train","new data"],["train","gate"],["gate","canary","pass"],["gate","rej","fail",{"d":1}],["canary","prom"],["last","train","warm start",{"d":1}]]}
+</script>
+<p>The gate checks held-out NE against the serving model on the newest data, calibration by slice, the label click rate (to catch a broken stream), and the score distribution. The canary compares live revenue and calibration for a small traffic share. Rollback is a pointer change in the registry.</p>
+<h3>Train and serve skew</h3>
+<p>The most common silent failure in ad models is a feature that is computed one way when training and another way when serving. Prevent it by construction.</p>
+<script type="application/json" class="dg" data-cap="Skew prevention by logging: the ad server's own feature snapshot flows into training, instead of recomputing features offline from warehouse tables that have since changed">
+{"type":"graph","cols":4,"gapX":56,
+ "nodes":[
+  {"id":"srv","t":"Ad server","s":"computes features once","c":0,"r":0},
+  {"id":"snap","t":"Feature snapshot","s":"exact vector + served pCTR","c":1,"r":0,"k":"data"},
+  {"id":"log","t":"Impression log","s":"point-in-time values","c":2,"r":0,"k":"data"},
+  {"id":"trn","t":"Trainer","s":"reads the logged vector","c":3,"r":0,"k":"model"},
+  {"id":"wh","t":"Warehouse tables","s":"features as of today","c":1,"r":1,"k":"store"},
+  {"id":"rec","t":"Offline recompute","s":"avoid: values have drifted","c":2,"r":1}],
+ "edges":[["srv","snap",{"hl":1}],["snap","log",{"hl":1}],["log","trn",{"hl":1}],["wh","rec"],["rec","trn","skew risk",{"d":1}]]}
+</script>
+<table>
+<caption>Skew prevention</caption>
+<tr><th>Risk</th><th>Prevention</th></tr>
+<tr><td>Different code for the same feature</td><td>One shared transformation library, or log the final feature vector at serving time and train on exactly that vector</td></tr>
+<tr><td>Historical counters computed "as of now" in training</td><td>Point-in-time values: use the counter value logged at impression time, never recompute from the full day's data</td></tr>
+<tr><td>Missing or defaulted features in production</td><td>Log missing rates per feature; alert on change; serve with the same defaults used in training</td></tr>
+<tr><td>Different model version in the log than in the metrics</td><td>Log <code>model_ver</code> and <code>served_pctr</code> with each impression and compare to a replay of the logged request through the offline pipeline</td></tr>
+</table>
+<h3>Failure modes and monitoring</h3>
+<table>
+<caption>Failure modes and degradation</caption>
+<tr><th>Failure</th><th>Symptom</th><th>Mitigation</th></tr>
+<tr><td>Feature store slow or down</td><td>Latency spikes, missing features</td><td>Timeout with default values and a model trained to tolerate them; fall back to a small model using cached or contextual features</td></tr>
+<tr><td>Model servers overloaded</td><td>p99 above budget</td><td>Shed load by reducing candidates (top 100 instead of 300); route to a lighter model; autoscale</td></tr>
+<tr><td>Click stream stalls</td><td>Labeled CTR drops, model under-predicts</td><td>Joiner input monitor; trainer auto-disconnect on abrupt label shifts</td></tr>
+<tr><td>Bad model published</td><td>Revenue or calibration drops after rollout</td><td>Validation gate, canary, instant registry rollback</td></tr>
+<tr><td>Pacing controller outage</td><td>Budgets overspent or starved</td><td>Safe default multiplier and hard budget caps enforced in the auction</td></tr>
+</table>
+<p>Monitor, per slice: predicted over observed CTR; streaming NE on a held-out, un-sampled slice; feature missing rates and distribution shift (for example the population stability index); joiner lag and label delay; score distribution of winners; and budget delivery. Alert on calibration first, since it is the metric that moves money.</p>
+
+<h3>Challenges</h3>
+<p>Two of these deserve a closer look because interviewers often probe them: cold-start ads and budget pacing.</p>
+<p><b>Cold start.</b> A new ad has no history, and its CTR estimate is noisy. For a true CTR of 1%, the standard error of an empirical estimate after <i>n</i> impressions is sqrt(p(1&minus;p)/n), so the relative error is about sqrt(99/n).</p>
+<script type="application/json" class="dg" data-cap="Relative standard error of a 1% CTR estimate as impressions accumulate: about 10,000 impressions are needed to pin it to within 10%">
+{"type":"bars","labels":["100 impressions","1,000","10,000","100,000"],"series":[{"n":"Relative std. error (%)","v":[99.5,31.5,9.9,3.1]}]}
+</script>
+<p>The arithmetic: sqrt(99/100) = 0.995, sqrt(99/1,000) = 0.315, sqrt(99/10,000) = 0.099, and sqrt(99/100,000) = 0.031. A fresh ad therefore lives in a regime where the model's own estimate is mostly prior. The strategies below fill that gap.</p>
+<table>
+<caption>Cold-start strategies</caption>
+<tr><th>Strategy</th><th>How it works</th><th>Risk</th></tr>
+<tr><td>Content and context features</td><td>Creative embeddings, category, text, device; these carry signal with no history</td><td>Weaker than behavioral history</td></tr>
+<tr><td>Hierarchical priors</td><td>Smooth ad CTR toward its campaign, advertiser, and category averages; for example (clicks + 2) / (impressions + 200)</td><td>Prior too strong delays learning</td></tr>
+<tr><td>Exploration budget</td><td>Give new ads a protected share of impressions (epsilon-greedy, or Thompson sampling using the posterior variance)</td><td>Costs short-term revenue; must be capped</td></tr>
+<tr><td>Uncertainty-aware score</td><td>Rank by an upper confidence bound for new ads, then fade it out as data accrues</td><td>Needs calibrated uncertainty</td></tr>
+<tr><td>Advertiser-level transfer</td><td>Use the advertiser's other ads' behavior as features</td><td>New advertisers have none</td></tr>
+</table>
+<p><b>Budget pacing.</b> An advertiser with a daily budget can exhaust it in the morning if its ads simply win every auction they enter, missing the evening audience and starving later learning. A pacing controller spreads spend by multiplying the ad's score or entry probability with a factor adjusted from observed spend against a target curve. Apply pacing as a separate multiplier in the auction, never by distorting pCTR, so the model stays calibrated and the controller stays debuggable.</p>
+<script type="application/json" class="dg" data-cap="Cumulative spend over a day (illustrative): without pacing the budget is gone by 9 a.m.; a controller follows the traffic shape and ends exactly at the budget">
+{"type":"curve","xl":"Hour of day","yl":"Share of daily budget spent","xmax":24,"ymax":1,
+ "series":[
+  {"n":"Spend ASAP","c":1,"lp":2,"pts":[[0,0],[3,0.2],[6,0.6],[9,1],[24,1]]},
+  {"n":"Even","c":2,"d":1,"lp":1,"pts":[[0,0],[24,1]]},
+  {"n":"Traffic-shaped","c":0,"lp":3,"pts":[[0,0],[6,0.1],[12,0.42],[18,0.75],[24,1]]}]}
+</script>
+<table>
+<caption>Other challenges</caption>
+<tr><th>Challenge</th><th>Approach</th></tr>
+<tr><td>Speed</td><td>Pre-ranker, batching, user-side computation shared across candidates, quantized embeddings in memory, regional replicas</td></tr>
+<tr><td>Diversity and fatigue</td><td>Frequency caps, features for ads already seen, a re-rank step so one advertiser does not fill adjacent slots</td></tr>
+<tr><td>Fairness and policy</td><td>Restricted targeting and delivery audits for housing, employment, and credit categories; exclude protected attributes from features and test delivery by group</td></tr>
+<tr><td>Privacy</td><td>Honor opt-outs; reduce reliance on cross-app identifiers; use first-party and contextual signals, on-device aggregation, and noisy or aggregated conversion reports</td></tr>
+<tr><td>Fraud and click spam</td><td>Rule and model filters before labeling and billing; invalid-click refunds; throttle suspicious sources</td></tr>
+<tr><td>Feedback loops</td><td>Exploration slice, uncertainty bonuses, a long-term holdout, and calibration checks on winners</td></tr>
+</table>
+
+<h2>Other Talking Points</h2>
+<ul>
+<li><b>Multi-task CTR and CVR.</b> Advertisers who optimize for conversions need P(click) &times; P(convert | click); training the conversion head only on clicked rows is biased, so models such as ESMM train both heads over all impressions and multiply them.</li>
+<li><b>Position bias.</b> Higher slots get more clicks regardless of quality; train with slot as a feature and serve with a fixed default, or use a separate position tower, so the model does not credit the slot to the ad.</li>
+<li><b>Counterfactual evaluation.</b> Logs only contain ads that won, so offline estimates are biased; keep a small randomized exploration slice and use inverse-propensity weighting to compare candidate models offline.</li>
+<li><b>Privacy changes.</b> Limits on tracking remove cross-app signals and delay or aggregate conversion data, so expect weaker historical features, more modeled conversions, and a larger role for contextual and first-party features.</li>
+<li><b>Feedback loops.</b> Ads shown more collect more data and higher confidence, while unshown ads stay unknown; exploration and uncertainty-aware scoring keep the system from locking in early winners.</li>
+<li><b>Winner's curse.</b> Selecting the maximum of noisy estimates over-predicts the winners; calibrate on served traffic and consider shrinking estimates by their uncertainty.</li>
+<li><b>Fraud filtering.</b> Invalid clicks poison labels and bills at the same time, so the filter belongs before the joiner output and its decisions must be logged and auditable.</li>
+<li><b>Ad quality and user value.</b> Add heads for hide and report probability and rank by <code>bid &times; pCTR</code> plus a user-value term, so a high bid cannot buy a bad experience.</li>
+<li><b>Why not only a two-tower.</b> Dot-product models are the right tool for retrieval and pre-ranking over millions of ads, but they cannot represent fine cross features or give reliably calibrated probabilities for pricing.</li>
+<li><b>Reserve prices and ad load.</b> A minimum score keeps low-value ads out, and the number of ad slots is itself a trade-off between revenue and user experience, tested with long-running experiments.</li>
+</ul>
+
+<h2 class="nonum">Check yourself</h2>
+<p class="qa-intro">Questions are tagged by the level they target. The first set checks Senior-level fundamentals and arithmetic; Staff and Principal questions probe trade-offs, operations, experimentation and organization. Try to answer aloud for two minutes before opening one.</p>
+<div class="qa-bar" data-qa></div>
+<details class="ans" data-lvl="sr"><summary>Why can a model with better AUC still lose revenue in the auction?</summary>AUC only measures order and is unchanged by any monotone rescaling of scores. The auction ranks by bid times pCTR and prices against the runner-up's score, so what matters is the value of each score. A model can order users and ads well yet over-predict specific ads, or be globally off by a constant factor. In the worked example, over-predicting one ad by 2x kept the pCTR order but moved the winner and cut revenue per impression from $0.018 to $0.010. Use NE and per-slice calibration as gates, and AUC only as a ranking sanity check.</details>
+<details class="ans" data-lvl="sr"><summary>Numeric: CTR is 2% and you keep 5% of negatives. The model outputs 0.30 on sampled data. What is the real pCTR?</summary>With w = 0.05: p = p' / (p' + (1 &minus; p') / w) = 0.30 / (0.30 + 0.70 / 0.05) = 0.30 / (0.30 + 14) = 0.30 / 14.30 = 0.021, about 2.1%. Sanity check: the sampled base rate is 0.02 / (0.02 + 0.98 &times; 0.05) = 0.02 / 0.069 = 0.29, so a score of 0.30 is just above average, and 2.1% is just above the true 2%. If you forgot to correct, you would bill and rank as if the click chance were 30%.</details>
+<details class="ans" data-lvl="sr"><summary>How do you choose the label waiting window, and what happens if it is too short?</summary>Plot the cumulative arrival of clicks after impression and weigh coverage against delay and buffer cost. If 98.5% of clicks arrive within 10 minutes, then at a true CTR of 1% the labeled CTR is 0.985%, so the model under-predicts by 1.5% (correctable by a factor of about 1/0.985 = 1.015 if coverage is stable). Joiner state at 34,700 impressions per second with 1 KB each is about 21 GB for a 10-minute window. Too short a window mislabels late clicks as negatives and biases the model low; too long delays learning. For slow signals like conversions, model the delay or use the fake-negative and re-emit scheme with importance weights.</details>
+<details class="ans" data-lvl="sr"><summary>Why is a two-tower model a poor choice for the final ad scorer?</summary>It reduces the interaction between user and ad to a dot product of two embeddings computed independently, so it cannot represent rich crosses such as user history with this advertiser, or creative type by device and slot. It also gives no natural calibrated probability, which pricing requires. Its strength is that ad embeddings can be pre-computed and searched with ANN, so it fits retrieval and pre-ranking, where cost per ad must be tiny. The final stage scores only a few hundred ads, so a heavier interaction model is affordable there.</details>
+<details class="ans" data-lvl="sr"><summary>Numeric: a new ad_id field has 40 million IDs with 24-dimension embeddings. How much memory for serving in fp16 and for training with Adam in fp32?</summary>Serving in fp16: 40,000,000 &times; 24 &times; 2 bytes = 1.92 GB. Training in fp32 with Adam keeps weights and two moment estimates, three copies of 40,000,000 &times; 24 &times; 4 bytes = 3.84 GB each, so 11.52 GB. The table is sharded across hosts, with hot rows cached. Options to shrink it: hash IDs into fewer buckets, use smaller dimensions for rare IDs, 8-bit row-wise quantization for serving, or a sparse optimizer such as Adagrad that keeps one accumulator per row.</details>
+<details class="ans" data-lvl="st"><summary>An A/B test of a new model shows CTR up 2% but revenue flat and hides up 10%. What do you conclude and do next?</summary>The model is finding clicks, not value: more clicks at similar revenue means the extra clicks are cheap (priced against lower runner-up scores) or low quality, and the hide increase says users dislike what is shown. Check calibration per slice and on winners first, since over-prediction on a segment pulls in poor ads. Check whether the arms shared budgets, which can make a CTR lift partly cannibalization. Look at advertiser outcomes and conversion quality. Do not ship on CTR alone; add a user-value or hide-probability term to the ranking score and rerun with a budget-split design.</details>
+<details class="ans" data-lvl="st"><summary>pCTR is well calibrated overall but over-predicts by 30 percent for new advertisers. What is the impact and the fix?</summary><p>In an auction, the score multiplies the bid, so over-predicted ads win slots they should not. Short term this can raise revenue (advertisers pay for clicks that never come), but it lowers advertiser return, causes churn, and distorts the market: the winner's curse in action. Overall calibration hides it because errors cancel across segments.</p><p>Fixes: add ad-age and advertiser-history features so the model knows it is uncertain; calibrate per segment (for example isotonic regression by ad-age bucket); shrink estimates toward a prior using the number of impressions; and give new ads an explicit exploration treatment instead of letting noisy estimates decide. Monitor expected calibration error by segment and alarm on any slice, not just the average.</p><p class="probe"><b>Likely follow-ups:</b> How do you calibrate a segment with very few examples? &middot; What do you tell advertisers whose ads lose due to shrinkage?</p><p class="signal"><b>What makes this Staff-level:</b> You connect a calibration error to auction incentives and marketplace health.</p></details>
+<details class="ans" data-lvl="st"><summary>You optimize for conversions, which arrive days after the click. How do you train with delayed labels?</summary><p>Options: wait for a full attribution window (clean but stale), train on partial data (fresh but biased toward fast conversions), or train on fresh data with a correction. A common approach treats recent clicks as provisional negatives and uses a delay model or importance weights to correct the bias when a conversion arrives later; this keeps the model fresh without waiting. Choose the window from the empirical delay distribution, for example the time by which 95 percent of conversions have arrived.</p><p>Add privacy-era complications: aggregated or noisy conversion reporting means labels may be partial or delayed by design, so you predict conversions from modeled, aggregated signals and validate with randomized experiments. Monitor with a delay-corrected calibration check, since a naive check will look bad on recent data.</p><p class="probe"><b>Likely follow-ups:</b> How do you evaluate the model on data that is still maturing? &middot; What do you do when the platform reports conversions only in aggregate?</p><p class="signal"><b>What makes this Staff-level:</b> You know the freshness-versus-bias trade-off and the effect of privacy changes on labels.</p></details>
+<details class="ans" data-lvl="pr"><summary>Design an experiment for an ads auction where advertisers share a budget across the control and treatment arms.</summary><p>A user-level split is contaminated: an advertiser with a fixed budget spends more in one arm and therefore less in the other, so arms interfere through pacing. Better designs split the supply that is shared: randomize at the advertiser level, split each advertiser's budget between arms (two budget-controlled universes), or use geographic or time-based experiments for coarse changes.</p><p>Pick metrics for all three parties: platform revenue, advertiser value (return on ad spend, conversions per dollar) and user experience (hides, reports, time spent). Run long enough to cover pacing cycles and learning effects, keep a persistent holdout for long-term effects, and pre-register the decision rule. State the residual bias of your design and how you would detect it.</p><p class="probe"><b>Likely follow-ups:</b> What is the sample size cost of advertiser-level randomization? &middot; How would you detect leakage between arms?</p><p class="signal"><b>What makes this Principal-level:</b> You identify the interference mechanism and choose the randomization unit to remove it.</p></details>
+<details class="ans" data-lvl="st"><summary>Revenue drops 3 percent after a deploy; offline metrics were unchanged. How do you debug?</summary><p>Work from cheapest checks to deepest: (1) sample ratio and traffic split: did the experiment assign correctly? (2) model and calibration versions in the serving path; (3) feature availability: null rates, default fill rates, and staleness of each feature; (4) compare logged serving-time features against what training saw for the same impressions (train-serve skew); (5) upstream schema or logging changes; (6) auction-side changes that interact with the new scores.</p><p>Mitigate first: roll back to the previous version while investigating. Prevent recurrence: log serving features and train on logged features, shadow-score new models before they take traffic, canary with automatic rollback on calibration and revenue alarms, run golden-request tests in CI, and monitor feature distributions with alerts per feature.</p><p class="probe"><b>Likely follow-ups:</b> Which check would you do first if the drop is concentrated in one placement? &middot; How do you tell a bad model from a bad experiment?</p><p class="signal"><b>What makes this Staff-level:</b> You have a systematic, time-boxed debug order and you fix the system that let it happen.</p></details>
+
+<h2 class="nonum">References</h2>
+<ol class="refs">
+<li>He et al. Practical Lessons from Predicting Clicks on Ads at Facebook. ADKDD 2014. <a href="https://dl.acm.org/doi/10.1145/2648584.2648589">dl.acm.org</a></li>
+<li>McMahan et al. Ad Click Prediction: a View from the Trenches. KDD 2013. <a href="https://research.google/pubs/ad-click-prediction-a-view-from-the-trenches/">research.google</a></li>
+<li>Cheng et al. Wide &amp; Deep Learning for Recommender Systems. arXiv:1606.07792. <a href="https://arxiv.org/abs/1606.07792">arxiv.org</a></li>
+<li>Guo et al. DeepFM: A Factorization-Machine based Neural Network for CTR Prediction. arXiv:1703.04247. <a href="https://arxiv.org/abs/1703.04247">arxiv.org</a></li>
+<li>Wang et al. Deep &amp; Cross Network for Ad Click Predictions. arXiv:1708.05123. <a href="https://arxiv.org/abs/1708.05123">arxiv.org</a></li>
+<li>Wang et al. DCN V2: Improved Deep &amp; Cross Network and Practical Lessons for Web-scale Learning to Rank Systems. WWW 2021. <a href="https://arxiv.org/abs/2008.13535">arxiv.org</a></li>
+<li>Chapelle. Modeling Delayed Feedback in Display Advertising. KDD 2014. <a href="https://dl.acm.org/doi/10.1145/2623330.2623634">dl.acm.org</a></li>
+<li>Ktena et al. Addressing Delayed Feedback for Continuous Training with Neural Networks in CTR Prediction. RecSys 2019. <a href="https://arxiv.org/abs/1907.06558">arxiv.org</a></li>
+<li>Edelman, Ostrovsky, Schwarz. Internet Advertising and the Generalized Second-Price Auction. American Economic Review, 2007. <a href="https://www.aeaweb.org/articles?id=10.1257/aer.97.1.242">aeaweb.org</a></li>
+<li>Weinberger et al. Feature Hashing for Large Scale Multitask Learning. ICML 2009. <a href="https://arxiv.org/abs/0902.2206">arxiv.org</a></li>
+<li>Joachims, Swaminathan, Schnabel. Unbiased Learning-to-Rank with Biased Feedback. WSDM 2017. <a href="https://arxiv.org/abs/1608.04468">arxiv.org</a></li>
+<li>Ma et al. Entire Space Multi-Task Model: An Effective Approach for Estimating Post-Click Conversion Rate. SIGIR 2018. <a href="https://arxiv.org/abs/1804.07931">arxiv.org</a></li>
+<li>Xu et al. Smart Pacing for Effective Online Ad Campaign Optimization. KDD 2015. <a href="https://arxiv.org/abs/1506.05851">arxiv.org</a></li>
+<li>Guo et al. On Calibration of Modern Neural Networks. ICML 2017. <a href="https://arxiv.org/abs/1706.04599">arxiv.org</a></li>
+</ol>
+</main></div>
+<script src="assets/dg.js"></script>
+<script src="assets/nav.js"></script>
+<script src="assets/qa.js"></script>
+</body>
+</html>

@@ -1,0 +1,543 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Video Recommendation System</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-slug="video-recommendation">
+<div class="topbar"><a href="index.html">&larr; ML System Design Study Guide</a><span style="color:var(--muted)">Chapter 6 of 11</span></div>
+<div class="layout"><aside class="toc" id="toc"></aside>
+<main>
+<div class="kicker">Chapter 6</div>
+<h1>Video Recommendation System</h1>
+<p class="lead">Design the personalized homepage of a large video platform: for every visit, pick about twenty videos out of billions that this particular person will enjoy, in a few hundred milliseconds. No model can score the whole catalog per request, so the standard answer is a funnel: a cheap, embedding-based <b>candidate generation</b> stage narrows the catalog to about a thousand, a heavy <b>multi-task ranker</b> scores them, and a <b>re-ranker</b> applies diversity, safety and freshness rules. The hard parts are choosing an objective that is not clickbait, correcting the biases hidden in logged data, and serving brand-new users and brand-new videos.</p>
+
+<h2>Clarifying Requirements</h2>
+<div class="dlg">
+<div class="turn c"><span>Candidate</span><p>Which surface are we designing: the homepage, the "up next" panel after a video, or search?</p></div>
+<div class="turn i"><span>Interviewer</span><p>The personalized homepage only. A user opens the app and sees a feed of videos; the feed may scroll.</p></div>
+<div class="turn c"><span>Candidate</span><p>What is the business goal, and how do we know a recommendation was good?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Engagement: users should find videos they like and keep coming back. Pure clicks are not the goal.</p></div>
+<div class="turn c"><span>Candidate</span><p>What is the scale of the catalog and the user base?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Billions of videos in total and about ten million new uploads a day. Assume a very large user base, a couple of hundred million daily active users.</p></div>
+<div class="turn c"><span>Candidate</span><p>What do we know about the user and the video at request time?</p></div>
+<div class="turn i"><span>Interviewer</span><p>For users: profile fields such as language and country, device, and a long watch and search history. For videos: ID, title, tags, language, duration, uploader, upload time and visual or audio content.</p></div>
+<div class="turn c"><span>Candidate</span><p>Which feedback signals do we log, and are any of them delayed?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Impressions, clicks, watch time, completion, likes, shares, and "not interested" or dislike. Watch time arrives while the video plays, so it is not available instantly.</p></div>
+<div class="turn c"><span>Candidate</span><p>Latency and freshness expectations?</p></div>
+<div class="turn i"><span>Interviewer</span><p>The homepage must render within a few hundred milliseconds end to end. A new video should be eligible for recommendation within minutes, not days.</p></div>
+<div class="turn c"><span>Candidate</span><p>Do we have to handle new users and new videos with no history?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Yes, both. Cold start is a first-class requirement.</p></div>
+<div class="turn c"><span>Candidate</span><p>Any constraints on content policy, diversity or creator fairness?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Unsafe content must not be recommended, the feed should not be twenty near-identical videos, and small creators should have a path to be discovered.</p></div>
+<div class="turn c"><span>Candidate</span><p>What is out of scope?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Ads, notifications, search and the next-video panel. Also skip the video upload pipeline and moderation models; assume a safety score is available per video.</p></div>
+</div>
+<div class="summary"><p>Build a personalized homepage recommender for a video platform with billions of videos, about ten million uploads a day and hundreds of millions of daily users. Objective: long-term engagement without clickbait. Inputs: user profile, history and context plus video content and statistics. Output: roughly twenty ranked videos per page within a few hundred milliseconds, with diversity, safety filtering, and support for new users and new videos.</p></div>
+
+<script type="application/json" class="dg" data-cap="The product loop: a visit triggers a recommendation request, the user's reactions are logged, and those logs train the next model version">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"open","t":"User opens the app","s":"context: device, time, place","c":0,"r":0,"k":"user"},
+  {"id":"home","t":"Homepage feed","s":"about 20 videos, scrollable","c":1,"r":0,"k":"io"},
+  {"id":"act","t":"User reactions","s":"skip, click, watch, like, dislike","c":2,"r":0,"k":"user"},
+  {"id":"log","t":"Event logs","s":"impressions plus outcomes","c":3,"r":0,"k":"data"},
+  {"id":"rec","t":"Recommender","s":"generate, rank, re-rank","c":1,"r":1,"k":"model"},
+  {"id":"tr","t":"Training data","s":"labels built from outcomes","c":3,"r":1,"k":"data"}],
+ "edges":[["open","rec","request"],["rec","home","ranked list",{"hl":1}],["home","act"],["act","log"],["log","tr","daily + stream"],["tr","rec","retrain",{"d":1}]]}
+</script>
+
+<h2>Frame the Problem as an ML Task</h2>
+<h3>ML objective</h3>
+<p>"Engagement" is a business word, not a training label. A candidate has to pick something that can be logged per impression, predicted by a model, and that does not distort the feed. Compare the usual options on one imaginary catalog of four video types.</p>
+<script type="application/json" class="dg" data-cap="Each single objective crowns a different winner, and each winner has a flaw (illustrative scores, normalized to 0-1 per series)">
+{"type":"bars","labels":["Clickbait, 8 min","Tutorial, 12 min","Short clip, 45 s","Feature film, 90 min"],
+ "series":[{"n":"Click rate","v":[0.9,0.5,0.6,0.3]},{"n":"Completion rate","v":[0.15,0.6,0.95,0.1]},{"n":"Watch time","v":[0.2,0.55,0.05,1.0]}],"max":1.1}
+</script>
+<table>
+<caption>Objective options for the homepage ranker</caption>
+<tr><th>Objective</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Maximize clicks</td><td>Densest signal, every impression has a label, easy to train</td><td>Rewards misleading thumbnails; users click and leave. Position bias is strongest here</td></tr>
+<tr><td>Maximize completed views</td><td>Rewards satisfying videos</td><td>Favors very short videos; long, valuable videos rarely "complete"</td></tr>
+<tr><td>Maximize watch time</td><td>Closest to time spent, hard to fake</td><td>Favors long videos, can reward compulsive content, arrives late and is noisy</td></tr>
+<tr><td>Maximize explicit feedback (likes, shares)</td><td>Clear statement of preference</td><td>Very sparse, under 1 percent of impressions, and skewed to a few active users</td></tr>
+<tr><td>Survey or "worth my time" rating</td><td>Directly measures satisfaction</td><td>Tiny volume; usable as a calibration signal, not a primary label</td></tr>
+<tr><td>Blend of several predicted behaviors</td><td>Balances short-term engagement with satisfaction; tunable</td><td>Needs a multi-task model and weights chosen by experiments</td></tr>
+</table>
+<div class="callout warn"><p>Do not train on clicks alone. A click only says the thumbnail and title were attractive; it says nothing about whether the video delivered. A click-trained model learns to find the most tempting packaging, and the platform pays for it in abandoned sessions and lost trust.</p></div>
+<div class="callout key"><p>Decision. Use a <b>meaningful watch</b> (watched at least 30 seconds or half the video, whichever is shorter) as the main positive for candidate generation, and predict several behaviors in the ranker (meaningful watch, expected minutes, like, share, dislike). The final score is a weighted blend of those predictions, with the weights tuned in A/B tests against retention, not by hand.</p></div>
+
+<h3>Input and output</h3>
+<p>Conceptually the system is a function: given a user and a context, return an ordered list of videos. Internally it scores user-video pairs, so the practical contract is score(user, context, video), evaluated cheaply for a thousand candidates and exactly for a hundred.</p>
+<script type="application/json" class="dg" data-cap="The contract of the system: user, context and catalog in, a short ranked page out">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"u","t":"User profile + history","s":"watched, searched, liked","c":0,"r":0,"k":"user"},
+  {"id":"ctx","t":"Context","s":"device, hour, location, network","c":0,"r":1,"k":"io"},
+  {"id":"cat","t":"Video catalog","s":"billions; ~10M new per day","c":0,"r":2,"k":"store"},
+  {"id":"sys","t":"Recommendation system","s":"retrieve, rank, re-rank","c":1,"r":1,"cs":2,"k":"model"},
+  {"id":"out","t":"Ranked homepage","s":"20 videos, each with a score","c":3,"r":1,"k":"io"}],
+ "edges":[["u","sys"],["ctx","sys"],["cat","sys"],["sys","out",{"hl":1}]]}
+</script>
+
+<h3>ML category</h3>
+<p>Recommendation can be framed several ways. The table compares the families a candidate should know; the figures after it show the intuition behind the first three.</p>
+<table>
+<caption>Model families for recommendation</caption>
+<tr><th>Family</th><th>Idea</th><th>Strengths</th><th>Weaknesses</th></tr>
+<tr><td>Content-based filtering</td><td>Recommend videos whose features resemble what the user liked</td><td>Works for new videos; explainable; no other users needed</td><td>Narrow, repeats the same topic; needs good features per user</td></tr>
+<tr><td>Collaborative filtering (neighbors, matrix factorization)</td><td>Users who behaved alike like the same things; factor the interaction matrix into user and video vectors</td><td>Finds surprising items; needs no content understanding</td><td>Cold start for new users and videos; sparse matrix; ID tables are huge</td></tr>
+<tr><td>Hybrid two-tower retrieval</td><td>Learn user and video embeddings from both IDs and features; score by dot product</td><td>Handles cold start through features; ANN-friendly; scales to the full catalog</td><td>Dot product limits feature interactions; sampling bias in training</td></tr>
+<tr><td>Sequence models (RNN or transformer over history)</td><td>Predict the next watch from the ordered history</td><td>Captures session intent and recency</td><td>Heavier to serve; best placed inside a tower or the ranker</td></tr>
+<tr><td>Pointwise deep ranker (multi-task)</td><td>Predict several behaviors for each (user, video) pair with full feature crossing</td><td>Most accurate; rich features; multiple objectives</td><td>Too slow for more than about a thousand candidates per request</td></tr>
+<tr><td>Reinforcement learning</td><td>Optimize long-term reward of a sequence of recommendations</td><td>Targets long-term value directly</td><td>Off-policy bias, unstable training, hard to evaluate; use selectively</td></tr>
+</table>
+<script type="application/json" class="dg" data-cap="Content-based, collaborative and hybrid retrieval in one picture: what each uses as signal and where each breaks">
+{"type":"graph","cols":4,
+ "groups":[{"t":"Content-based","c0":0,"c1":3,"r0":0,"r1":0},{"t":"Collaborative filtering","c0":0,"c1":3,"r0":1,"r1":1},{"t":"Hybrid (our choice)","c0":0,"c1":3,"r0":2,"r1":2}],
+ "nodes":[
+  {"id":"a1","t":"Videos you liked","c":0,"r":0,"k":"user"},
+  {"id":"a2","t":"Video features","s":"topic, tags, audio","c":1,"r":0,"k":"vec"},
+  {"id":"a3","t":"Most similar videos","c":2,"r":0},
+  {"id":"a4","t":"Filter bubble","s":"needs rich features","c":3,"r":0,"k":"io"},
+  {"id":"b1","t":"Users like you","c":0,"r":1,"k":"user"},
+  {"id":"b2","t":"Co-watch patterns","s":"who watched what","c":1,"r":1,"k":"data"},
+  {"id":"b3","t":"What they enjoyed","c":2,"r":1},
+  {"id":"b4","t":"Cold start","s":"new users and videos","c":3,"r":1,"k":"io"},
+  {"id":"c1","t":"IDs + features","c":0,"r":2,"k":"vec"},
+  {"id":"c2","t":"Learned embeddings","s":"two towers","c":1,"r":2,"k":"model"},
+  {"id":"c3","t":"Nearest in one space","c":2,"r":2},
+  {"id":"c4","t":"Handles both","s":"behavior plus content","c":3,"r":2,"k":"io"}],
+ "edges":[["a1","a2"],["a2","a3"],["a3","a4"],["b1","b2"],["b2","b3"],["b3","b4"],["c1","c2"],["c2","c3"],["c3","c4"]]}
+</script>
+<p>Collaborative filtering starts from a user-video matrix. Most entries are unknown, because each user has seen a tiny fraction of the catalog. The task is to predict the blanks.</p>
+<script type="application/json" class="dg" data-cap="Interaction matrix: shading is engagement (watch fraction); question marks are videos the user never saw, which the model must fill in">
+{"type":"matrix","rl":"Users","cl":"Videos","rows":["u1","u2","u3","u4"],"cols":["v1","v2","v3","v4","v5"],
+ "v":[[1,null,0.5,null,0.2],[null,1,null,0.6,null],[0.5,null,1,null,0.8],[null,0.7,null,1,null]],"unk":"?"}
+</script>
+<p>Matrix factorization (Koren et al., 2009) explains the matrix with k numbers per user and per video. The predicted engagement of user i on video j is the dot product of their vectors, trained to match the observed cells. A two-tower model is the same picture with the embedding lookup replaced by a neural network over IDs and features, which is what lets it embed a video it has never seen.</p>
+<script type="application/json" class="dg" data-cap="Matrix factorization: user and video vectors are multiplied, and the error on observed cells updates both embeddings">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"uid","t":"User i","s":"ID or features","c":0,"r":0,"k":"user"},
+  {"id":"ue","t":"User vector","s":"k = 64 numbers","c":1,"r":0,"k":"vec"},
+  {"id":"vid","t":"Video j","s":"ID or features","c":0,"r":1,"k":"img"},
+  {"id":"ve","t":"Video vector","s":"k = 64 numbers","c":1,"r":1,"k":"vec"},
+  {"id":"dot","t":"Dot product","s":"sum of products","c":2,"r":0},
+  {"id":"pred","t":"Predicted engagement","c":3,"r":0,"k":"io"},
+  {"id":"loss","t":"Loss on observed cells","s":"squared or log loss","c":3,"r":1,"k":"svc"},
+  {"id":"obs","t":"Observed outcome","s":"watched or not","c":3,"r":2,"k":"data"}],
+ "edges":[["uid","ue"],["vid","ve"],["ue","dot"],["ve","dot"],["dot","pred",{"hl":1}],["pred","loss"],["obs","loss"]]}
+</script>
+<p>Our formulation is the multi-stage funnel. The eligible pool is reduced by cheap models that score a lot of items, then by expensive models that score few. This is the structure described in the YouTube papers (Covington et al., 2016) and is what the interviewer expects.</p>
+<script type="application/json" class="dg" data-cap="The funnel: each stage uses a more expensive model on fewer videos (counts are design assumptions)">
+{"type":"funnel","stages":[
+ {"t":"Eligible corpus","s":"quality, language, age, safety filters","n":"100M+","m":"billions in catalog"},
+ {"t":"Candidate generation","s":"two-tower ANN plus other sources","n":"~1,000"},
+ {"t":"Ranking","s":"multi-task deep model scores all 1,000","n":"~100"},
+ {"t":"Re-ranking","s":"diversity, safety, freshness, exploration","n":"20"}]}
+</script>
+<div class="callout tip"><p>State the counts and the cost per stage out loud. "A 10-millisecond ANN lookup returns 1,000 candidates, a 40-millisecond deep ranker reorders them" shows you understand that the funnel exists to fit a latency budget, not as a ritual.</p></div>
+
+<h2>Data Preparation</h2>
+<h3>Data engineering</h3>
+<p>Three sources feed the system: the video catalog, the user table, and the interaction log. Assume 200 million daily active users, five homepage loads each, twenty impressions per load. That is 20 billion impressions per day; at about 100 bytes each the impression log grows by roughly 2 TB per day, so 30 days of training data is about 60 TB. With an assumed 5 percent click rate and 2 percent meaningful-watch rate, that is about 1 billion clicks and 400 million meaningful watches per day.</p>
+<table>
+<caption>Videos (catalog and statistics, sample rows)</caption>
+<tr><th>video_id</th><th>uploader</th><th>title</th><th>language</th><th>duration_s</th><th>uploaded_at</th><th>views_24h</th></tr>
+<tr><td>v_81c2</td><td>ch_77</td><td>Sourdough in 10 minutes</td><td>en</td><td>612</td><td>2026-11-05 08:14</td><td>182,400</td></tr>
+<tr><td>v_93fa</td><td>ch_12</td><td>Alpine hiking vlog</td><td>de</td><td>1,540</td><td>2026-11-05 11:02</td><td>310</td></tr>
+</table>
+<table>
+<caption>Users (profile, sample rows)</caption>
+<tr><th>user_id</th><th>age_bucket</th><th>country</th><th>language</th><th>device</th><th>signup_date</th></tr>
+<tr><td>u_5530</td><td>25-34</td><td>BR</td><td>pt</td><td>android</td><td>2023-02-11</td></tr>
+<tr><td>u_9021</td><td>35-44</td><td>US</td><td>en</td><td>tv</td><td>2026-11-04</td></tr>
+</table>
+<table>
+<caption>Interaction log (one row per impression, outcome joined later)</caption>
+<tr><th>user_id</th><th>video_id</th><th>slot</th><th>shown_at</th><th>clicked</th><th>watch_s</th><th>liked</th><th>disliked</th></tr>
+<tr><td>u_5530</td><td>v_81c2</td><td>1</td><td>2026-11-05 09:00:02</td><td>1</td><td>418</td><td>1</td><td>0</td></tr>
+<tr><td>u_5530</td><td>v_55aa</td><td>2</td><td>2026-11-05 09:00:02</td><td>0</td><td>0</td><td>0</td><td>0</td></tr>
+<tr><td>u_9021</td><td>v_93fa</td><td>7</td><td>2026-11-05 09:02:40</td><td>1</td><td>9</td><td>0</td><td>1</td></tr>
+</table>
+<p>Two logging rules matter more than any model choice. First, <b>log impressions, not just clicks</b>: without the videos that were shown and ignored there are no negatives and no way to measure click rate. Second, <b>log the exact features used at serving time</b> next to each impression, so training sees what the model saw (point-in-time correctness) instead of recomputing features later and leaking the future. Also log the slot, device and the model version, since slot is needed to correct position bias and the version is needed to debug experiments.</p>
+
+<h3>Feature engineering</h3>
+<p>Features come from three entities plus the history. The most important decisions are how to encode high-cardinality IDs and how to summarize a long, variable-length history into a fixed vector.</p>
+<table>
+<caption>Features by entity and how to encode them</caption>
+<tr><th>Entity</th><th>Feature</th><th>Encoding and reasoning</th></tr>
+<tr><td>Video</td><td>Video ID</td><td>Learned embedding (64-d) for the top 10M IDs by impressions; the long tail shares 1M hash buckets (hashing trick)</td></tr>
+<tr><td>Video</td><td>Title and tags</td><td>Tokenize, hash, average word embeddings or use a small text encoder; gives new videos a meaning at upload time</td></tr>
+<tr><td>Video</td><td>Language, uploader ID</td><td>Language: embedding. Uploader: embedding with hashing; strong prior for new videos from known channels</td></tr>
+<tr><td>Video</td><td>Duration, age since upload</td><td>Log or bucketize; age matters because freshness decays quickly</td></tr>
+<tr><td>Video</td><td>Popularity statistics (views 24h, smoothed click rate)</td><td>Log transform and smoothing; updated by streaming jobs every few minutes</td></tr>
+<tr><td>Video</td><td>Visual and audio embeddings</td><td>Frozen pre-trained encoders, computed once at upload; another cold-start channel</td></tr>
+<tr><td>User</td><td>Watch history (last 50 meaningful watches)</td><td>Look up video embeddings and average them into one vector; recency-weighted if desired</td></tr>
+<tr><td>User</td><td>Search history</td><td>Tokenize and average like titles</td></tr>
+<tr><td>User</td><td>Language, country, age bucket, account age</td><td>Embeddings and buckets. Use sensitive attributes only where policy allows</td></tr>
+<tr><td>Context</td><td>Device, hour, day of week, network quality</td><td>Categorical embeddings; encode hour cyclically (sine and cosine); TV sessions prefer long content</td></tr>
+</table>
+<p>Embedding table sizes drive memory. A full table for one billion video IDs at 64 dimensions and 4 bytes per float is 256 GB, far too big to replicate to every serving machine and mostly wasted on videos with a handful of impressions. Keeping the 10 million most-seen IDs plus 1 million hash buckets for everything else costs 11M x 64 x 4 B = 2.8 GB. Hash collisions blur the tail, which is acceptable because tail videos are better described by their content features.</p>
+<script type="application/json" class="dg" data-cap="Feature pipeline: each entity is encoded separately, the history is averaged into one vector, and each tower produces a 128-d embedding">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"vf","t":"Video features","s":"ID, title, language, age","c":0,"r":0,"k":"data"},
+  {"id":"uf","t":"User and context","s":"language, device, hour","c":0,"r":1,"k":"data"},
+  {"id":"hf","t":"Watch history","s":"last 50 videos","c":0,"r":2,"k":"data"},
+  {"id":"enc1","t":"Lookup and hash","s":"IDs, text tokens, buckets","c":1,"r":0},
+  {"id":"enc2","t":"Normalize, bucketize","c":1,"r":1},
+  {"id":"enc3","t":"Average embeddings","s":"mean of video vectors","c":1,"r":2},
+  {"id":"vt","t":"Video tower","c":2,"r":0,"k":"model"},
+  {"id":"ut","t":"User tower","c":2,"r":1,"k":"model"},
+  {"id":"vv","t":"Video embedding","s":"128-d, cached","c":3,"r":0,"k":"vec"},
+  {"id":"uv","t":"User embedding","s":"128-d, per request","c":3,"r":1,"k":"vec"}],
+ "edges":[["vf","enc1"],["uf","enc2"],["hf","enc3"],["enc1","vt"],["enc2","ut"],["enc3","ut"],["vt","vv"],["ut","uv"]]}
+</script>
+<div class="callout tip"><p>Mention "example age" and the point-in-time rule together: Covington et al. feed the age of the training example as a feature and set it to zero at serving, so the model learns that the distribution of watches shifts over time instead of averaging over the whole training window.</p></div>
+
+<h3>Labels</h3>
+<table>
+<caption>Label sources</caption>
+<tr><th>Source</th><th>Definition</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Explicit feedback</td><td>Like, share, dislike, survey answer</td><td>Unambiguous intent; good for satisfaction heads</td><td>Under 1 percent coverage; biased to engaged users</td></tr>
+<tr><td>Implicit: meaningful watch</td><td>Watched at least min(30 s, 50 percent of duration)</td><td>Dense enough (about 2 percent of impressions), hard to fake, scale-free across lengths</td><td>Noisy: autoplay, background tabs, shared accounts; arrives late</td></tr>
+<tr><td>Implicit: click</td><td>User opened the video</td><td>Densest and immediate</td><td>Clickbait and position bias dominate</td></tr>
+</table>
+<div class="callout key"><p>Decision. Positives are meaningful watches, weighted by watch fraction or capped minutes; negatives are impressions that were not clicked, or clicked and abandoned within seconds; likes, shares and dislikes become auxiliary heads in the ranker. Click alone is demoted to an input signal for fast feedback.</p></div>
+<p>Four data problems deserve an explicit answer.</p>
+<ul>
+<li><b>Imbalance.</b> With a 2 percent positive rate, either weight positives or downsample negatives. If negatives are kept at rate r, correct the predicted probability afterwards: p = p' / (p' + (1 - p') / r). For r = 0.1 a raw prediction of 0.30 becomes 0.30 / (0.30 + 7) = 0.041.</li>
+<li><b>Noise.</b> Drop sessions with bot-like patterns, impressions below the fold that the user never saw (use viewport logging), and ultra-short accidental clicks; down-weight shared-device accounts.</li>
+<li><b>Delayed feedback.</b> A long video's watch time is unknown for minutes. Log progress heartbeats every 10 seconds, train batch jobs only on impressions older than a maturity window (for example 24 hours), and for streaming updates use a label-delay correction in the style of Chapelle (2014) or treat unmatured impressions as unlabeled rather than negative.</li>
+<li><b>Bias.</b> Logged data only contains what the previous recommender chose to show (exposure bias), and top slots get more attention (position bias). Handle position with a shallow tower (below), exposure with a small random-exploration slice that also gives unbiased evaluation data, and popularity bias with sampling correction.</li>
+</ul>
+<p>Split data by time, never randomly: train on days 1 to 28, validate on day 29, test on day 30. A random split lets the model see tomorrow's trends through today's data. For each training example use only the history that existed before the impression, and when the target is "the next watch", predict that watch rather than a randomly held-out one, which would leak future information into the history features (Covington et al.).</p>
+
+<h2>Model Development</h2>
+<h3>Options and decision</h3>
+<table>
+<caption>Candidate generation and ranking options</caption>
+<tr><th>Stage</th><th>Option</th><th>Strengths</th><th>Weaknesses</th></tr>
+<tr><td>Candidate generation</td><td>Item-to-item co-watch counts</td><td>Simple, strong baseline, explainable</td><td>No personalization beyond the seed video; popularity-heavy</td></tr>
+<tr><td>Candidate generation</td><td>Matrix factorization</td><td>Cheap to train and to serve with ANN</td><td>ID-only; cannot embed new users or videos; no features</td></tr>
+<tr><td>Candidate generation</td><td><b>Two-tower neural retrieval</b></td><td>Features and IDs; cold start handled by content features; ANN-ready</td><td>Needs negative sampling and bias correction</td></tr>
+<tr><td>Ranking</td><td>Gradient-boosted trees</td><td>Fast, strong with dense features, good baseline</td><td>Weak at huge sparse IDs and multiple tasks</td></tr>
+<tr><td>Ranking</td><td><b>Deep multi-task model with mixture-of-experts</b></td><td>Learns feature interactions; one model, several behaviors; gates reduce task conflict</td><td>Heavier serving; weights of the blend must be tuned</td></tr>
+</table>
+<div class="callout key"><p>Decision. Two-tower retrieval for candidate generation (plus a few simple sources), a multi-task mixture-of-experts network for ranking, and a rule-plus-greedy-optimizer layer for re-ranking. Each stage can be replaced independently, which is why companies deploy this structure.</p></div>
+
+<h3>Candidate generation: the two-tower model</h3>
+<p>The user tower turns user features, the averaged watch history and context into a 128-d vector; the video tower does the same for a video. Both vectors are L2-normalized and the relevance score is their dot product divided by a temperature. Because the score separates into one term per side, every video vector can be precomputed and indexed; at request time only the user tower runs.</p>
+<script type="application/json" class="dg" data-cap="Two-tower retrieval model: independent towers, one shared embedding space, dot-product score">
+{"type":"stack","cols":[
+ {"t":"User tower (online, per request)","layers":[{"t":"User + context features","s":"avg history emb, language, device, hour"},{"t":"Dense 512 + ReLU"},{"t":"Dense 256 + ReLU"},{"t":"L2-normalized 128-d","s":"user embedding","k":"model"}]},
+ {"t":"Video tower (offline, per video)","layers":[{"t":"Video features","s":"ID, title, uploader, duration, age"},{"t":"Dense 512 + ReLU"},{"t":"Dense 256 + ReLU"},{"t":"L2-normalized 128-d","s":"video embedding","k":"model"}]}],
+ "join":{"t":"Dot product / temperature","s":"relevance score"}}
+</script>
+<p>Training examples come from the logs. Each positive is a (user, video) pair with a meaningful watch. Negatives matter more than any architecture detail, because retrieval has to separate the right video from the billions it never saw.</p>
+<script type="application/json" class="dg" data-cap="Constructing training examples: positives from meaningful watches, negatives from ignored impressions plus sampled videos">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"log","t":"Impression log","s":"user, video, slot, time","c":0,"r":0,"k":"data"},
+  {"id":"join","t":"Join outcomes","s":"clicks, watch seconds","c":1,"r":0},
+  {"id":"lab","t":"Labeler","s":"meaningful watch?","c":2,"r":0},
+  {"id":"pos","t":"Positives","s":"label 1, weight = watch fraction","c":3,"r":0,"k":"io"},
+  {"id":"cor","t":"Video corpus","s":"popularity-weighted sample","c":0,"r":1,"k":"store"},
+  {"id":"smp","t":"Negative sampler","s":"in-batch, random, hard","c":1,"r":1},
+  {"id":"neg","t":"Negatives","s":"ignored impressions + sampled","c":2,"r":1,"k":"io"},
+  {"id":"ts","t":"Training batch","s":"time-split, point-in-time","c":3,"r":1,"k":"model"}],
+ "edges":[["log","join"],["join","lab"],["lab","pos","label 1",{"hl":1}],["lab","neg","unclicked"],["cor","smp"],["smp","neg"],["neg","ts"],["pos","ts"]]}
+</script>
+<table>
+<caption>Negative sampling choices for retrieval</caption>
+<tr><th>Negatives</th><th>How</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Impressed, not watched</td><td>Videos that were shown to the user and ignored</td><td>Realistic: the user actually saw them</td><td>Only covers what the old system chose; ignoring can be due to position, not dislike</td></tr>
+<tr><td>Random from corpus</td><td>Uniform or popularity-weighted sample</td><td>Easy, covers the whole catalog, cheap</td><td>Easy negatives; the model learns coarse topics only</td></tr>
+<tr><td>In-batch</td><td>Other positives in the same batch act as negatives for each user</td><td>Free (no extra tower passes), batch size 4,096 gives 4,095 negatives per example</td><td>Popular videos are over-represented; needs logQ correction</td></tr>
+<tr><td>Hard negatives</td><td>ANN neighbors of the user that were not watched</td><td>Sharpens fine distinctions</td><td>Can include unlabeled true positives (false negatives); destabilizes if overused</td></tr>
+</table>
+<p>The loss is a sampled softmax. For a batch of B pairs, treat each user's own video as the correct class among the B videos in the batch. Cross-entropy pushes the correct video's score above the others. The matrix below is the batch: row i is the softmax for user i, the highlighted diagonal is the positive, and the other cells in the row are in-batch negatives.</p>
+<script type="application/json" class="dg" data-cap="In-batch softmax: each row is a softmax over the batch; the diagonal is the positive; column 1 scores high for everyone because it is a popular video (illustrative)">
+{"type":"matrix","rl":"Users in batch","cl":"Videos in batch","rows":["u1","u2","u3","u4"],"cols":["v1","v2","v3","v4"],
+ "v":[[0.9,0.3,0.2,0.2],[0.6,0.8,0.1,0.3],[0.7,0.2,0.85,0.1],[0.6,0.4,0.2,0.9]],"hl":"diag"}
+</script>
+<p>The catch is <b>sampling bias</b>. Videos appear in a batch in proportion to how often they are watched, so a popular video is drawn as a negative far more often than a uniform sampler would draw it. The model then learns to push popular videos down for everyone, which hurts the head of the distribution. Yi et al. (2019) fix this by subtracting the log of each video's sampling probability from its logit: s_corrected = s - log p. The probability p is the video's frequency in the training stream, estimated online with a streaming sketch, because the catalog changes every day and no fixed vocabulary exists.</p>
+<div class="callout math"><p>Take one user with three videos in the batch. Sampling probabilities: A (popular) p = 0.5, B p = 0.125, C p = 0.0625. The user actually watched C. Raw scores: A 1.2, B 0.4, C 1.0. Without correction, softmax gives C a probability of e^1.0 / (e^1.2 + e^0.4 + e^1.0) = 2.718 / 7.530 = 0.361, loss = -ln 0.361 = 1.02. With correction add -ln p to each score: A 1.2 + 0.693 = 1.893, B 0.4 + 2.079 = 2.479, C 1.0 + 2.773 = 3.773. Now C gets e^3.773 / (e^1.893 + e^2.479 + e^3.773) = 43.49 / 62.06 = 0.701, loss = 0.356. The popular video A beat C by 0.2 in raw score, yet the corrected loss is mild: A is the negative that is sampled most often, so beating C is expected of it and should not be punished as hard. The rare positive C is not drowned out by popular negatives.</p></div>
+<div class="callout warn"><p>Uncorrected in-batch softmax pushes retrieval toward the long tail and hides popular good videos, and corrected-but-miscalibrated frequency estimates push the other way. Always check the retrieved set's popularity distribution against the training positives.</p></div>
+
+<h3>Retrieval sources and ANN lookup</h3>
+<p>One model never gives the best candidate set. Production systems merge several sources, each with a quota, then deduplicate and filter.</p>
+<script type="application/json" class="dg" data-cap="Candidate generation merges multiple sources (quotas are assumptions) into about 1,000 candidates after filtering">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"s1","t":"Two-tower ANN","s":"quota ~500, personalized","c":0,"r":0,"k":"model"},
+  {"id":"s2","t":"Item-to-item co-watch","s":"quota ~200, seeded by history","c":0,"r":1},
+  {"id":"s3","t":"Subscriptions","s":"quota ~100, new uploads","c":0,"r":2},
+  {"id":"s4","t":"Trending in region","s":"quota ~100, popularity","c":0,"r":3},
+  {"id":"s5","t":"Fresh + explore pool","s":"quota ~100, new videos","c":0,"r":4},
+  {"id":"mg","t":"Merge + dedupe","s":"one pool, keep source tag","c":1,"r":2},
+  {"id":"fl","t":"Eligibility filters","s":"watched, blocked, unsafe, age-gated","c":2,"r":2},
+  {"id":"cd","t":"About 1,000 candidates","c":3,"r":2,"k":"io"}],
+ "edges":[["s1","mg",null,{"hl":1}],["s2","mg"],["s3","mg"],["s4","mg"],["s5","mg"],["mg","fl"],["fl","cd"]]}
+</script>
+<p>The two-tower source needs a nearest-neighbor search over about 100 million video vectors per request. Exact search costs 100M x 128 x 2 = 25.6 GFLOP per query, which is impossible at tens of thousands of queries per second, so use approximate nearest neighbor (ANN) search that trades a few percent of recall for a 100x speedup.</p>
+<script type="application/json" class="dg" data-cap="ANN retrieval: the user embedding lies between two interest clusters and returns its nearest videos from both (illustrative 2-D projection)">
+{"type":"embed","h":330,"seed":9,"nn":6,"xl":"embedding dimension 1 (2-D projection)",
+ "clusters":[{"n":"Cooking","x":150,"y":150,"r":30,"k":9},{"n":"Travel","x":450,"y":110,"r":30,"k":9},{"n":"Gaming","x":640,"y":210,"r":28,"k":8},{"n":"Music","x":330,"y":245,"r":26,"k":8}],
+ "query":{"x":300,"y":140,"t":"user embedding"}}
+</script>
+<table>
+<caption>ANN options for 100M vectors of 128 floats (rough orders of magnitude; tune on your data)</caption>
+<tr><th>Method</th><th>Memory</th><th>Query time</th><th>Notes</th></tr>
+<tr><td>Exact (brute force)</td><td>51.2 GB as float32 (100M x 512 B)</td><td>Hundreds of ms to seconds on a CPU shard</td><td>Perfect recall; only for evaluation or tiny shards</td></tr>
+<tr><td>IVF with product quantization</td><td>About 3.2 GB at 32 B per vector</td><td>A few to tens of ms</td><td>Compact; recall limited by quantization; re-score top hits with exact vectors</td></tr>
+<tr><td>HNSW graph</td><td>12.8 GB at int8 plus about 12 GB of graph links</td><td>Low single-digit ms</td><td>High recall, supports incremental inserts; most RAM-hungry</td></tr>
+<tr><td>Learned quantization (for example ScaNN)</td><td>Similar to PQ</td><td>Low ms</td><td>Optimizes for dot-product error, helps recall at the same memory</td></tr>
+</table>
+<p>Shard the index by video ID across machines so that each shard returns its top K and a coordinator merges them. Keep a small separate "fresh" index for videos uploaded in the last hours that supports instant inserts, and merge its hits with the main index; the nightly rebuild folds them in.</p>
+
+<h3>Ranking: multi-task and position-aware</h3>
+<p>The ranker sees about 1,000 candidates and can afford hundreds of features, cross-features between user and video, and the retrieval score itself. Following Zhao et al. (2019), a single network predicts several behaviors through a <b>multi-gate mixture-of-experts</b> (MMoE, Ma et al. 2018): shared expert sub-networks, and for each task a learned softmax gate that chooses how to mix the experts. This lets related tasks (watch, completion) share structure while unrelated ones (like and dislike) take different mixes, which reduces the negative transfer that a plain shared-bottom network suffers.</p>
+<script type="application/json" class="dg" data-cap="Multi-task ranker with mixture-of-experts: shared experts, one gated head per behavior, a weighted blend as the final score">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"in","t":"Features","s":"user, video, context, retrieval score","c":0,"r":1,"k":"data"},
+  {"id":"ex","t":"Shared experts","s":"8 expert MLPs","c":1,"r":1,"k":"model"},
+  {"id":"h1","t":"Watch head","s":"P(meaningful watch), minutes","c":2,"r":0},
+  {"id":"h2","t":"Appreciation head","s":"P(like), P(share)","c":2,"r":1},
+  {"id":"h3","t":"Regret head","s":"P(dislike), P(not interested)","c":2,"r":2},
+  {"id":"bl","t":"Weighted blend","s":"final ranking score","c":3,"r":1,"k":"io"}],
+ "edges":[["in","ex"],["ex","h1","gate-weighted",{"hl":1}],["ex","h2"],["ex","h3"],["h1","bl"],["h2","bl"],["h3","bl"]]}
+</script>
+<p>The watch head follows Covington et al.: a logistic regression where each positive example is weighted by its watch time and each negative has weight 1. The model's odds then approximate expected watch time, and at serving time the output exp(w.x + b) is used as the watch-time prediction.</p>
+<div class="callout math"><p>Why watch-time weighting works. Suppose a video had N = 100 impressions, k = 5 clicks, and 20 minutes of total watch time. Weighted logistic regression learns odds = (sum of positive weights) / (N - k) = 20 / 95 = 0.2105. Expected watch time per impression is E[T] = 20 / 100 = 0.20 minutes and the click rate is P = 0.05, so E[T] / (1 - P) = 0.2105, which is close to E[T] (1 + P) = 0.21. For a small click rate the learned odds therefore equal expected minutes per impression. Caveat: with a larger P the approximation is loose, and the target still rewards long videos, so cap watch time or normalize it by duration.</p></div>
+<p>The final score blends the head outputs. A linear blend is simple and tunable: score = 1.0 x P(watch) + 0.5 x P(like) + 1.0 x P(share) - 3.0 x P(dislike) + 0.02 x E[minutes], with expected minutes capped at 30.</p>
+<div class="callout math"><p>Clickbait versus value. Video A: P(watch) 0.30, P(like) 0.02, P(share) 0.005, P(dislike) 0.06, E[minutes] 1.0 gives 0.30 + 0.01 + 0.005 - 0.18 + 0.02 = 0.155. Video B: P(watch) 0.22, P(like) 0.08, P(share) 0.02, P(dislike) 0.01, E[minutes] 6 gives 0.22 + 0.04 + 0.02 - 0.03 + 0.12 = 0.370. B outranks A even though A has the higher chance of being watched, because A is disliked more often and rarely appreciated. The weights themselves are tuned with online experiments (or Pareto search over retention and satisfaction), not chosen by hand.</p></div>
+<p>Another trap is <b>position bias</b>: a video in slot 1 is clicked more than the same video in slot 8, so logged clicks mix relevance with placement. Zhao et al. add a <b>shallow tower</b> that sees only position and device features. During training its logit is added to the main tower's logit, so the main tower is free to explain only the relevance part. At serving time the shallow tower is dropped. Randomly zeroing the position input during training (position dropout) keeps the main tower from leaning on it.</p>
+<script type="application/json" class="dg" data-cap="Position bias: training adds a shallow position-only logit; serving uses the relevance tower alone and lets sorting decide positions">
+{"type":"graph","cols":4,
+ "groups":[{"t":"Training","c0":0,"c1":3,"r0":0,"r1":1},{"t":"Serving","c0":0,"c1":3,"r0":2,"r1":2}],
+ "nodes":[
+  {"id":"f","t":"Content features","s":"user, video, context","c":0,"r":0,"k":"data"},
+  {"id":"p","t":"Position + device","s":"slot, screen type","c":0,"r":1,"k":"io"},
+  {"id":"mt","t":"Main tower","s":"learns relevance","c":1,"r":0,"k":"model"},
+  {"id":"st","t":"Shallow tower","s":"learns position effect","c":1,"r":1},
+  {"id":"ad","t":"Add logits","c":2,"r":0},
+  {"id":"ls","t":"Sigmoid + loss","s":"against click or watch label","c":3,"r":0,"k":"svc"},
+  {"id":"f2","t":"Content features","c":0,"r":2,"k":"data"},
+  {"id":"m2","t":"Main tower only","c":1,"r":2,"k":"model"},
+  {"id":"sc","t":"Position-free score","c":2,"r":2,"k":"io"},
+  {"id":"so","t":"Sort decides slots","c":3,"r":2,"k":"io"}],
+ "edges":[["f","mt"],["p","st"],["mt","ad"],["st","ad"],["ad","ls"],["f2","m2"],["m2","sc",null,{"hl":1}],["sc","so","sort"]]}
+</script>
+
+<h3>Re-ranking</h3>
+<p>The ranker optimizes each video independently, so its top 20 can be near-duplicates or all from one creator. A last stage reshapes the list with business rules, applied in this order: remove policy violations and demote borderline content, drop near-duplicates and cap videos per creator, then choose a diverse subset, then add freshness and exploration slots.</p>
+<script type="application/json" class="dg" data-cap="Re-ranking pipeline: policy first, then duplicates, then diversity, then freshness and exploration">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"t","t":"Ranked top 100","s":"with blended scores","c":0,"r":0,"k":"io"},
+  {"id":"sf","t":"Safety + policy","s":"remove, demote borderline","c":1,"r":0},
+  {"id":"dd","t":"Dedupe + caps","s":"duplicates, 2 per creator","c":2,"r":0},
+  {"id":"dv","t":"Diversity selection","s":"MMR or DPP","c":3,"r":0,"k":"model"},
+  {"id":"fe","t":"Freshness + explore","s":"reserve slots, boost new","c":3,"r":1},
+  {"id":"fin","t":"Final 20 videos","c":2,"r":1,"k":"io"}],
+ "edges":[["t","sf"],["sf","dd"],["dd","dv"],["dv","fe"],["fe","fin",null,{"hl":1}]]}
+</script>
+<p>Maximal marginal relevance (MMR; Carbonell and Goldstein, 1998) picks items greedily: at each step choose the candidate that maximizes lambda x score - (1 - lambda) x (maximum similarity to the items already chosen). Determinantal point processes (DPP) generalize this by modeling the volume spanned by the selected embeddings, with fast greedy solvers (Chen et al., 2018).</p>
+<div class="callout math"><p>MMR with lambda = 0.7. Candidates: A has score 0.80, B has 0.78 and similarity 0.9 to A, C has 0.70 and similarity 0.2 to A. A is picked first. For B: 0.7 x 0.78 - 0.3 x 0.9 = 0.546 - 0.270 = 0.276. For C: 0.7 x 0.70 - 0.3 x 0.2 = 0.490 - 0.060 = 0.430. C beats B even though B has the higher raw score, because B is nearly a copy of A. Lambda is a product dial: higher means more relevance, lower means more variety.</p></div>
+
+<h3>Cold start and exploration</h3>
+<p>Cold start has two different faces. A <b>new user</b> has no history, so personalization must come from context and a few questions. A <b>new video</b> has no impressions, so it has no behavioral signal and the ID embedding is untrained.</p>
+<script type="application/json" class="dg" data-cap="New-user flow: start from context and popular content, then switch to the normal personalized path after a few meaningful watches">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"nu","t":"New user","s":"no history","c":0,"r":0,"k":"user"},
+  {"id":"ob","t":"Context + onboarding","s":"topics, language, country, device","c":1,"r":0},
+  {"id":"cs","t":"Cold-start candidates","s":"popular per region and topic","c":2,"r":0,"k":"store"},
+  {"id":"rk","t":"Ranker","s":"history features set to default","c":3,"r":0,"k":"model"},
+  {"id":"fw","t":"First watches","s":"3 to 5 interactions","c":3,"r":1,"k":"data"},
+  {"id":"uh","t":"Update history features","s":"streaming, within a minute","c":2,"r":1},
+  {"id":"pc","t":"Personalized candidates","s":"two-tower takes over","c":1,"r":1,"k":"io"}],
+ "edges":[["nu","ob"],["ob","cs"],["cs","rk"],["rk","fw","feedback"],["fw","uh"],["uh","pc",null,{"hl":1}]]}
+</script>
+<script type="application/json" class="dg" data-cap="New-video flow: content-based embedding at upload, a small exploration budget, then graduation to the main index based on measured engagement">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"nv","t":"New upload","s":"no impressions yet","c":0,"r":0,"k":"img"},
+  {"id":"ct","t":"Video tower","s":"title, thumbnail, audio, channel","c":1,"r":0,"k":"model"},
+  {"id":"fi","t":"Fresh index","s":"searchable within minutes","c":2,"r":0,"k":"store"},
+  {"id":"ex","t":"Exploration slots","s":"at most 2 of 20 per page","c":3,"r":0},
+  {"id":"ee","t":"Early engagement","s":"watch and like rates","c":3,"r":1,"k":"data"},
+  {"id":"bd","t":"Bandit update","s":"UCB or Thompson sampling","c":2,"r":1},
+  {"id":"gr","t":"Graduate or fade","s":"after ~1,000 impressions","c":1,"r":1},
+  {"id":"mi","t":"Main ANN index","c":0,"r":1,"k":"store"}],
+ "edges":[["nv","ct"],["ct","fi"],["fi","ex"],["ex","ee"],["ee","bd"],["bd","gr"],["gr","mi",null,{"hl":1}]]}
+</script>
+<p>Exploration is a deliberate cost: showing an unproven video displaces a proven one. A bandit policy (epsilon-greedy, upper confidence bound as in LinUCB by Li et al. 2010, or Thompson sampling) decides how much to explore per video based on uncertainty: few impressions means a wide confidence interval, and the optimistic estimate earns more traffic until the interval shrinks. Always log the probability with which each exploratory item was shown, so you can later evaluate policies offline with inverse-propensity weighting.</p>
+<script type="application/json" class="dg" data-cap="Slot allocation on one page of 20: most slots exploit the ranker, a small share is reserved for exploration (assumption: 15 percent, tuned by A/B test)">
+{"type":"bars","horiz":true,"labels":["Top ranked picks","Fresh-video exploration","New-interest exploration"],"series":[{"n":"Slots per page","v":[17,2,1]}],"max":20}
+</script>
+
+<h2>Evaluation</h2>
+<h3>Offline metrics</h3>
+<p>Candidate generation and ranking need different offline checks. Retrieval is judged on <b>recall</b>: did the candidate set contain what the user later watched? Ranking is judged on <b>order quality</b> and per-head <b>probability quality</b>. One ranked list is used for all examples below: five recommended videos, of which positions 1, 3 and 5 were watched meaningfully, and the user also watched one other relevant video that was not in the list (so R = 4 relevant in total).</p>
+<script type="application/json" class="dg" data-cap="The worked-example list: three of five recommendations were watched (highlighted); bars are the ranker's predicted scores (illustrative)">
+{"type":"ranklist","ql":"User u","q":"Top-5 homepage","qs":"R = 4 relevant videos exist","items":[
+ {"t":"Sourdough in 10 minutes","s":"watched","v":0.91,"hl":1},
+ {"t":"Top 10 gadgets of the year","s":"skipped","v":0.84},
+ {"t":"Live jazz piano session","s":"watched","v":0.77,"hl":1},
+ {"t":"Daily news roundup","s":"skipped","v":0.71},
+ {"t":"Alpine hiking vlog","s":"watched","v":0.66,"hl":1}]}
+</script>
+<table>
+<caption>Offline metrics: definition, example on the list above, flaw, decision</caption>
+<tr><th>Metric</th><th>Definition</th><th>Mini example</th><th>Flaw</th><th>Decision</th></tr>
+<tr><td>Recall@k (retrieval)</td><td>Relevant videos found in the top k, divided by all relevant videos</td><td>Candidate set holds 3 of the user's 4 later watches: 3 / 4 = 0.75</td><td>Ignores order and how many candidates were wasted</td><td>Use for candidate generation, k = 1,000</td></tr>
+<tr><td>Precision@k</td><td>Relevant in the top k divided by k</td><td>3 watched in the top 5: 3 / 5 = 0.60</td><td>Ignores order inside the top k and unretrieved relevant items</td><td>Use as an easy sanity metric, k = 5 to 20</td></tr>
+<tr><td>mAP@k</td><td>Average, over positions where a relevant item appears, of precision at that position; divide by min(R, k); then average over users</td><td>(1/1 + 2/3 + 3/5) / 4 = 0.567. A second user with one watch in slot 2 has AP = 0.5, so mAP = 0.533</td><td>Binary relevance only; treats a skip and a dislike the same</td><td>Use for ranking, with graded gains if available</td></tr>
+<tr><td>nDCG@k</td><td>Discounted gain of the list divided by that of the ideal list; discount 1 / log2(position + 1)</td><td>DCG = 1 + 0.5 + 0.387 = 1.887; ideal DCG (four hits first) = 1 + 0.631 + 0.5 + 0.431 = 2.562; nDCG = 0.737</td><td>Needs a gain definition; less intuitive to explain</td><td>Use as the main ranking metric, graded gain (like 3, watch 2, click 1)</td></tr>
+<tr><td>MRR</td><td>Mean of 1 / rank of the first relevant item</td><td>Lists with the first hit at 1 and at 2: (1 + 0.5) / 2 = 0.75</td><td>Only the first hit counts; a feed has many slots</td><td>Do not use for the homepage</td></tr>
+<tr><td>AUC and log-loss per head</td><td>AUC: chance a random positive scores above a random negative; log-loss: average negative log-likelihood</td><td>Positives 0.9, 0.6, 0.4 and negatives 0.7, 0.3: 4 of 6 pairs ordered, AUC = 0.667</td><td>AUC ignores calibration and position; log-loss is sensitive to rare events</td><td>Use to compare head versions and detect regressions</td></tr>
+<tr><td>Calibration (predicted vs observed rate)</td><td>Mean prediction divided by mean outcome, per bucket</td><td>Predicted 0.10, observed 0.08: ratio 1.25, over-confident</td><td>Says nothing about order</td><td>Required, because blend weights assume calibrated probabilities</td></tr>
+<tr><td>Coverage and diversity</td><td>Share of catalog or topics appearing in recommendations; average pairwise dissimilarity in a page</td><td>20 videos from 4 topics: topic entropy and creator count tracked</td><td>Not a quality metric by itself</td><td>Track as guardrail</td></tr>
+</table>
+<div class="callout math"><p>Check the nDCG arithmetic. Hits sit at positions 1, 3 and 5, so DCG = 1/log2(2) + 1/log2(4) + 1/log2(6) = 1 + 0.5 + 0.387 = 1.887. The ideal list would place four relevant items in positions 1 to 4: 1 + 1/log2(3) + 1/log2(4) + 1/log2(5) = 1 + 0.631 + 0.5 + 0.431 = 2.562. nDCG@5 = 1.887 / 2.562 = 0.737.</p></div>
+<div class="callout warn"><p>Offline metrics computed on logged data inherit the old system's bias: the user could only watch what was shown. Offline gains of 1 to 2 percent often disappear online, and the reverse happens too. Use offline metrics to filter ideas, then decide with an A/B test.</p></div>
+
+<h3>Online metrics and guardrails</h3>
+<table>
+<caption>Online metrics</caption>
+<tr><th>Metric</th><th>What it measures</th><th>Role</th></tr>
+<tr><td>Watch time per user per day</td><td>Total engagement</td><td>Primary, but never alone</td></tr>
+<tr><td>Meaningful-watch rate and completion rate</td><td>Whether recommendations delivered</td><td>Primary quality</td></tr>
+<tr><td>Click-through rate</td><td>Attractiveness of the packaging</td><td>Diagnostic only (clickbait)</td></tr>
+<tr><td>Likes, shares, "worth my time" survey</td><td>Satisfaction</td><td>Primary satisfaction</td></tr>
+<tr><td>7-day and 28-day return rate</td><td>Long-term value</td><td>Decision metric, measured in a long holdout</td></tr>
+<tr><td>Dislike and "not interested" rate</td><td>Regret</td><td>Guardrail, must not rise</td></tr>
+<tr><td>Report rate, harmful-content impressions</td><td>Safety</td><td>Hard guardrail</td></tr>
+<tr><td>Topic entropy, creators per user per week, new-creator impression share</td><td>Diversity and creator health</td><td>Guardrail</td></tr>
+<tr><td>Server latency p50 and p99, error rate</td><td>System health</td><td>Hard guardrail</td></tr>
+</table>
+<p>Run A/B tests with user-level randomization and a sample size sized for the metric's variance; watch time is heavy-tailed, so use trimming or ratio metrics with variance reduction (for example CUPED). Beware several pitfalls:</p>
+<ul>
+<li><b>Novelty effect.</b> Any change in the feed lifts curiosity for a few days. Run at least two weeks and check that the effect does not decay week over week.</li>
+<li><b>Interference.</b> Users share one catalog and creators respond to exposure, so a treatment that pulls traffic toward some creators changes the world seen by the control group. For supply-side changes randomize at creator level or use geo or time-split designs.</li>
+<li><b>Short-term versus long-term.</b> A ranker that raises today's watch time can reduce next month's visits. Keep a small long-term holdout (for example 1 percent of users who stay on an older policy for months), the approach described by Hohnhold et al. (2015) for ads quality.</li>
+<li><b>Metric gaming and seasonality.</b> Compare against a concurrent control, never against last week; track guardrails with sequential testing so a safety regression stops the ramp.</li>
+</ul>
+<div class="callout tip"><p>Say which metric would make you ship even if watch time fell: for example a clear rise in survey satisfaction and 28-day retention with a small watch-time dip. It shows you treat engagement as a proxy and not as the goal.</p></div>
+
+<h2>Serving</h2>
+<h3>Architecture and scale</h3>
+<p>The online path handles a request in about 150 milliseconds of server time; the offline path trains models, rebuilds indexes and refreshes features. Both read the same feature definitions to avoid train-serve skew.</p>
+<script type="application/json" class="dg" data-cap="Serving architecture: online request path (top), stores (middle) and the offline path (bottom); the registry deploys the towers and the ranker, and the index builder re-embeds all videos">
+{"type":"graph","cols":5,
+ "groups":[{"t":"Online: request path","c0":0,"c1":4,"r0":0,"r1":1},{"t":"Offline: training and indexing","c0":0,"c1":4,"r0":2,"r1":2}],
+ "gapX":30,
+ "nodes":[
+  {"id":"cl","t":"Client app","c":0,"r":0,"k":"io"},
+  {"id":"rs","t":"Rec service","s":"orchestrates","c":1,"r":0},
+  {"id":"cg","t":"Candidate gen","s":"user tower + ANN","c":2,"r":0,"k":"model"},
+  {"id":"rk","t":"Ranking","s":"multi-task model","c":3,"r":0,"k":"model"},
+  {"id":"rr","t":"Re-ranking","s":"rules, diversity","c":4,"r":0},
+  {"id":"fs","t":"Feature store","s":"user and video","c":1,"r":1,"k":"store"},
+  {"id":"ann","t":"ANN index","s":"video vectors","c":3,"r":1,"k":"store"},
+  {"id":"pol","t":"Policy store","s":"safety, blocks","c":4,"r":1,"k":"store"},
+  {"id":"lg","t":"Event logs","c":0,"r":2,"k":"data"},
+  {"id":"tp","t":"Training","s":"daily + stream","c":1,"r":2},
+  {"id":"mr","t":"Model registry","c":2,"r":2,"k":"store"},
+  {"id":"ib","t":"Index builder","s":"embeds videos","c":3,"r":2}],
+ "edges":[["cl","rs"],["rs","cg"],["cg","rk"],["rk","rr"],["fs","rs"],["cg","ann"],["pol","rr"],["lg","tp"],["tp","mr"],["mr","cg","deploy",{"d":1}],["mr","ib"],["ib","ann"]]}
+</script>
+<p>Scale assumptions: 200 million daily users and five homepage loads each is 1 billion requests per day, or 1e9 / 86,400 = 11.6k queries per second on average and about 35k at a 3x peak. Each request scores 1,000 candidates, so the ranker must score about 35 million candidates per second at peak. At an assumed 6 MFLOP per candidate that is about 210 TFLOP per second, which means a few thousand CPU cores or a few dozen accelerators with batching. Batch all 1,000 candidates of a request into one inference call to keep the hardware efficient.</p>
+<script type="application/json" class="dg" data-cap="Latency budget for the server side of one request (p99 milliseconds, assumed); total 150 ms">
+{"type":"bars","horiz":true,"labels":["User feature fetch","User tower inference","ANN + other sources (parallel)","Merge and filter","Candidate feature hydration","Ranking inference (1,000)","Re-ranking","Serialize and network"],
+ "series":[{"n":"p99 ms","v":[15,5,25,10,25,40,10,20]}],"max":48}
+</script>
+<p>Caching reduces both cost and tail latency: cache the user embedding for a few minutes (it changes only when history changes), cache video features and video embeddings in memory on the ranker, precompute and store the top 100 ranked list per session so infinite scroll requests the next page from the cache instead of rerunning the funnel, and serve popular, region-level lists to unauthenticated or cold users.</p>
+
+<h3>Model refresh, freshness and failure handling</h3>
+<ul>
+<li><b>Refresh cadence.</b> Retrain the ranker daily on a rolling 30-day window and fine-tune on streaming data every few hours. Retrain the two-tower daily; after each retrain re-embed the corpus (100M videos through the video tower is a minutes-long GPU job) and rebuild the ANN index. Insert videos uploaded since the last build into the fresh index within minutes.</li>
+<li><b>Feature freshness.</b> Stream the last-hour video statistics and the user's latest meaningful watches into the feature store within a minute. History freshness is what makes the feed react to "I just watched a cooking video".</li>
+<li><b>Warm start.</b> New model versions start from the previous weights and are rolled out as shadow traffic, then 1 percent, then wider, with automatic rollback on guardrail breach.</li>
+</ul>
+<table>
+<caption>Failure modes and degradation</caption>
+<tr><th>Failure</th><th>Detect</th><th>Degrade to</th></tr>
+<tr><td>ANN shard slow or down</td><td>Per-shard timeout (30 ms)</td><td>Return partial results; other sources fill the quota</td></tr>
+<tr><td>Ranker over budget or unavailable</td><td>Deadline propagation, health checks</td><td>Use retrieval scores plus popularity, or a lightweight tree model</td></tr>
+<tr><td>Feature store stale or missing</td><td>Freshness and null-rate alarms</td><td>Default feature values; fall back to context-only ranking</td></tr>
+<tr><td>Bad model deployed</td><td>Calibration and guardrail monitors, shadow comparison</td><td>Automatic rollback to the previous version</td></tr>
+<tr><td>Entire stack unavailable</td><td>Synthetic checks</td><td>Static per-country and per-language trending list from cache</td></tr>
+</table>
+<p>Monitor input drift (feature distributions and null rates), embedding health (norm and cluster shifts), prediction calibration per head and per slice (new users, regions, devices), the share of impressions going to videos younger than 24 hours, index staleness, and end-to-end latency at p50 and p99.</p>
+
+<h3>Challenges</h3>
+<table>
+<caption>Recurring challenges and mitigations</caption>
+<tr><th>Challenge</th><th>Why it is hard</th><th>Mitigation</th></tr>
+<tr><td>Cold start</td><td>No behavior for new users or videos</td><td>Content towers, creator priors, context-only paths, exploration budget</td></tr>
+<tr><td>Speed</td><td>Billions of videos in a few hundred ms</td><td>Funnel, ANN, precomputed video vectors, batching, caches</td></tr>
+<tr><td>Diversity and filter bubbles</td><td>The model repeats what already works</td><td>MMR or DPP re-ranking, per-creator caps, interest-exploration slots</td></tr>
+<tr><td>Creator fairness</td><td>Popularity feedback loops starve small creators</td><td>New-creator boosts, exposure caps, track impression share by creator size</td></tr>
+<tr><td>Safety</td><td>Engagement-optimized models surface borderline content</td><td>Hard filters plus score demotion before blending; separate safety classifiers, audits</td></tr>
+<tr><td>Privacy</td><td>History is sensitive</td><td>Consent, retention limits, deletion, no sensitive attributes, aggregate-only analytics</td></tr>
+</table>
+
+<h2>Other Talking Points</h2>
+<ul>
+<li>Long-term satisfaction versus engagement: a ranker tuned on watch time can raise daily minutes while lowering retention, so include survey and regret signals in the blend and check them in a long holdout.</li>
+<li>Reinforcement learning (REINFORCE with an off-policy correction, Chen et al. 2019) optimizes sequences of recommendations directly, but needs propensity logging and careful variance control; mention it as a next step, not the baseline.</li>
+<li>Sequence models over the watch history (transformer or recurrent) capture intent within a session; place them inside the user tower and measure whether the latency cost buys recall.</li>
+<li>Creator ecosystem health matters because creators leave if exposure is unpredictable; track impression share and time-to-first-1,000-views for new creators, and consider supply-side experiments.</li>
+<li>Safety demotion is a score multiplier applied before blending, not a post-hoc patch, so borderline videos fall in rank without being deleted, with appeals and audits to avoid silent over-blocking.</li>
+<li>Counterfactual evaluation (inverse-propensity weighting on exploration traffic) gives cheaper policy comparisons than full A/B tests, provided propensities are logged.</li>
+<li>Embedding-table memory and the hashing trick (Weinberger et al., 2009) bound model size, and collisions are a known accuracy trade-off for the long tail.</li>
+<li>Re-embedding the corpus after every tower retrain is mandatory: user and video vectors from different model versions live in different spaces and cannot be compared.</li>
+<li>Multi-objective weights should be revisited as the product changes; treat them as a policy with an owner, a review cadence and an experiment history.</li>
+<li>Kids and sensitive audiences need separate, stricter policies and often a separate candidate pool; a single global model should not decide them.</li>
+</ul>
+
+<h2 class="nonum">Check yourself</h2>
+<p class="qa-intro">Questions are tagged by the level they target. The first set checks Senior-level fundamentals and arithmetic; Staff and Principal questions probe trade-offs, operations, experimentation and organization. Try to answer aloud for two minutes before opening one.</p>
+<div class="qa-bar" data-qa></div>
+<details class="ans" data-lvl="sr"><summary>Why is predicting clicks a bad sole objective for a video homepage, and what would you use instead?</summary>A click measures the packaging, not the content. A click-trained model learns to surface tempting thumbnails and titles, which raises click rate and lowers satisfaction, completion and returning visits. Use a meaningful watch (for example at least 30 seconds or half the video) as the label, weight by watch fraction or capped minutes, add like, share and dislike heads in a multi-task model, and blend them with weights tuned against retention and survey satisfaction in online experiments.</details>
+<details class="ans" data-lvl="sr"><summary>A video is shown 100 times, clicked 5 times, and watched for a total of 20 minutes. What odds does a watch-time-weighted logistic regression learn, and why?</summary>Positives are weighted by watch time and negatives by 1, so the learned odds equal the sum of positive weights divided by the number of negatives: 20 / (100 - 5) = 0.2105. This is E[T] / (1 - P) with E[T] = 0.20 minutes per impression and P = 0.05, which is close to E[T] (1 + P) = 0.21. For a small click rate the odds therefore estimate expected minutes per impression, so exp of the model's output can be used as a watch-time score. The approximation worsens for large click rates and still favors long videos unless watch time is capped.</details>
+<details class="ans" data-lvl="sr"><summary>Why do in-batch negatives need a logQ correction, and what happens without it?</summary>In-batch negatives are other users' positives, so a video appears as a negative in proportion to its popularity. Popular videos are therefore penalized more than uniform sampling would, and the model learns to score them too low for everyone; the retrieved set drifts toward the tail. Subtracting log p (p is the video's sampling probability, estimated from a streaming frequency sketch) from each logit removes this built-in prior. In the chapter's example the loss for a rare positive falls from 1.02 to 0.36 because the popular negative that beat it is expected to appear and is down-weighted.</details>
+<details class="ans" data-lvl="sr"><summary>The latency budget is 150 ms and ranking takes 40 ms for 1,000 candidates. A product manager wants 5,000 candidates. What do you do?</summary>Do not simply multiply the cost: five times the candidates is roughly 200 ms of ranking, far over budget, plus more feature hydration. Options: add a cheap first-stage ranker (a small tree model or distilled network) that cuts 5,000 candidates to 1,000 for the heavy model; first measure whether recall@5000 is meaningfully higher than recall@1000 on held-out data, since the marginal candidates are low-quality; batch and quantize the ranker; or split the work across more machines in parallel. Decide with the marginal recall and with an A/B test of the added cost, not on intuition.</details>
+<details class="ans" data-lvl="st"><summary>How would you give a brand-new video a fair chance without hurting user experience?</summary>At upload compute its embedding with the video tower from title, thumbnail, audio and channel, and insert it into a fresh index within minutes so it can appear in candidates immediately. Reserve a small, capped share of slots (for example 2 of 20 for fresh videos) and choose which new videos get them with a bandit policy such as Thompson sampling, so uncertainty earns exposure. Measure early meaningful-watch and dislike rates; videos with strong engagement graduate to the main index and normal ranking, weak ones fade. Log the exposure probability for later counterfactual analysis and apply safety filters before exploration.</details>
+<details class="ans" data-lvl="st"><summary>An A/B test of a new ranker shows +3 percent watch time in week 1 and +0.5 percent in week 3. How do you decide?</summary>The decay points to a novelty effect, so the week-1 number overstates the long-run gain. Look at the per-week trend, at satisfaction and regret metrics (survey, dislike, return rate), and at guardrails such as diversity and creator exposure. Extend the test or hold out a small share of users for a longer window to measure the settled effect. Ship only if the settled watch-time gain is significant and satisfaction and retention are flat or better, since a gain driven by novelty or compulsive content is not a durable improvement.</details>
+<details class="ans" data-lvl="st"><summary>Watch time is up in the A/B test, but retention and survey satisfaction are down. What do you change?</summary><p>The proxy has drifted from the goal. Add a satisfaction signal: collect a small, random sample of survey responses (for example "was this worth your time?"), train a model to predict it for all impressions, and use that prediction as an additional head in the blend or as a constraint. Penalize patterns that inflate minutes without satisfaction (clickbait: high click, short watch after click; autoplay chains).</p><p>Measure long term with a persistent holdout of a small percentage of users for months and cohort retention at 28 days. When you need an earlier read, use a surrogate index that predicts long-term outcomes from several short-term metrics, validated against past experiments. Make the guardrail explicit: a launch cannot ship if survey-based satisfaction or retention drops beyond a stated tolerance, even if watch time rises.</p><p class="probe"><b>Likely follow-ups:</b> How big must the holdout be to see a 0.3 percent retention change? &middot; How do you stop the survey from becoming a new target to game?</p><p class="signal"><b>What makes this Staff-level:</b> You treat the objective itself as a hypothesis to be tested, with a long-term measurement plan.</p></details>
+<details class="ans" data-lvl="st"><summary>How do you set an exploration budget and avoid a feedback loop where the model only learns about what it already shows?</summary><p>Put exploration where uncertainty is highest and cost lowest: new videos and new users. Use a bandit-style bonus (Thompson sampling or an upper-confidence bonus) at the candidate or ranking stage for items with few impressions, capped per user and per slate position. Reserve a small slice of traffic (around one to two percent) for randomized or lightly randomized slates that log propensities; this gives unbiased data for training corrections and for counterfactual evaluation.</p><p>Evaluate with off-policy estimators (clipped inverse propensity scoring or doubly robust) and confirm online. Track the cost of exploration as lost watch time per user and the benefit as faster item discovery; set the budget where marginal learning value equals marginal cost, and revisit as the catalog grows.</p><p class="probe"><b>Likely follow-ups:</b> Why clip the importance weights, and what bias do you accept? &middot; How does exploration interact with the re-ranker's diversity rules?</p><p class="signal"><b>What makes this Staff-level:</b> You can quantify exploration's cost, and you build the unbiased data source that makes later evaluation possible.</p></details>
+<details class="ans" data-lvl="pr"><summary>Several surfaces (homepage, Shorts, notifications) compete for the same user attention. How do you set objectives and avoid local optimization?</summary><p>Define a user-level objective shared by all surfaces (for example, a satisfaction-weighted engagement per week, with retention as a guardrail) and measure each surface by its contribution to it, not by its own clicks. Use cross-surface holdouts and incremental measurement, because a gain on one surface that cannibalizes another is not a gain.</p><p>Organizationally: a metric council owns definitions, changes are versioned, and conflicts are resolved with experiments rather than by team size. Where surfaces genuinely need different behavior (a short-form feed versus a lean-back TV app), share the core models and let surface-specific layers handle the differences.</p><p class="probe"><b>Likely follow-ups:</b> How do you attribute a session's value across surfaces? &middot; What happens when two teams' launches interact?</p><p class="signal"><b>What makes this Principal-level:</b> You move the conversation from surface metrics to a user-level objective and say how it is governed.</p></details>
+<details class="ans" data-lvl="st"><summary>How do you design recommendations that are safe for teenagers and avoid rabbit holes?</summary><p>Use age-aware policies as hard constraints and score modifiers: restrict eligible categories, apply stricter safety demotion, and cap repetition of sensitive topics in a session. Add a diversity constraint at re-rank time that limits consecutive items from the same sensitive cluster, and add friction (a break reminder, a topic reset) when a session loops.</p><p>Measure it: the share of sensitive-category impressions among at-risk cohorts, repeat exposure rates, and user-reported well-being from surveys, as launch guardrails next to engagement. Be explicit that this trades some engagement for safety, get sign-off from policy and product, and give users controls (reset recommendations, not interested).</p><p class="probe"><b>Likely follow-ups:</b> How do you know a user is a teen when age is unreliable? &middot; What engagement loss would you accept and who decides?</p><p class="signal"><b>What makes this Staff-level:</b> You tie safety to concrete mechanisms and metrics, and you name the trade-off and who owns it.</p></details>
+
+<h2 class="nonum">References</h2>
+<ol class="refs">
+<li>Covington, Adams, Sargin. <a href="https://research.google/pubs/deep-neural-networks-for-youtube-recommendations/">Deep Neural Networks for YouTube Recommendations</a>. RecSys 2016.</li>
+<li>Yi, Yang, Hong, Cheng, Hong, Wei, Chi, Zhao. <a href="https://dl.acm.org/doi/10.1145/3298689.3346996">Sampling-Bias-Corrected Neural Modeling for Large Corpus Item Recommendations</a>. RecSys 2019.</li>
+<li>Zhao, Hong, Wei, Chen, Nath, Andrews, Kumthekar, Sathiamoorthy, Yi, Chi. <a href="https://dl.acm.org/doi/10.1145/3298689.3346997">Recommending What Video to Watch Next: A Multitask Ranking System</a>. RecSys 2019.</li>
+<li>Koren, Bell, Volinsky. <a href="https://doi.org/10.1109/MC.2009.263">Matrix Factorization Techniques for Recommender Systems</a>. IEEE Computer, 2009.</li>
+<li>Ma, Zhao, Yi, Chen, Hong, Chi. <a href="https://dl.acm.org/doi/10.1145/3219819.3220007">Modeling Task Relationships in Multi-task Learning with Multi-gate Mixture-of-Experts</a>. KDD 2018.</li>
+<li>Johnson, Douze, Jegou. <a href="https://arxiv.org/abs/1702.08734">Billion-scale similarity search with GPUs</a> (FAISS). 2017.</li>
+<li>Malkov, Yashunin. <a href="https://arxiv.org/abs/1603.09320">Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs</a>. 2016.</li>
+<li>Carbonell, Goldstein. <a href="https://dl.acm.org/doi/10.1145/290941.291025">The Use of MMR, Diversity-Based Reranking for Reordering Documents and Producing Summaries</a>. SIGIR 1998.</li>
+<li>Chen, Zhang, Zhou. <a href="https://arxiv.org/abs/1709.05135">Fast Greedy MAP Inference for Determinantal Point Process to Improve Recommendation Diversity</a>. NeurIPS 2018.</li>
+<li>Chen, Beutel, Covington, Jain, Belletti, Chi. <a href="https://arxiv.org/abs/1812.02353">Top-K Off-Policy Correction for a REINFORCE Recommender System</a>. WSDM 2019.</li>
+<li>Li, Chu, Langford, Schapire. <a href="https://arxiv.org/abs/1003.0146">A Contextual-Bandit Approach to Personalized News Article Recommendation</a> (LinUCB). WWW 2010.</li>
+<li>Hohnhold, O'Brien, Tang. <a href="https://dl.acm.org/doi/10.1145/2783258.2788583">Focusing on the Long-term: It's Good for Users and Business</a>. KDD 2015.</li>
+<li>Chapelle. <a href="https://dl.acm.org/doi/10.1145/2623330.2623634">Modeling Delayed Feedback in Display Advertising</a>. KDD 2014.</li>
+<li>Weinberger, Dasgupta, Langford, Smola, Attenberg. <a href="https://arxiv.org/abs/0902.2206">Feature Hashing for Large Scale Multitask Learning</a>. ICML 2009.</li>
+</ol>
+</main></div>
+<script src="assets/dg.js"></script>
+<script src="assets/nav.js"></script>
+<script src="assets/qa.js"></script>
+</body>
+</html>

@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Similar Listings on Vacation Rental Platforms</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-slug="similar-listings">
+<div class="topbar"><a href="index.html">&larr; ML System Design Study Guide</a><span style="color:var(--muted)">Chapter 9 of 11</span></div>
+<div class="layout"><aside class="toc" id="toc"></aside>
+<main>
+<div class="kicker">Chapter 9</div>
+<h1>Similar Listings on Vacation Rental Platforms</h1>
+<p class="lead">On a vacation rental platform, a guest who lands on a listing that is too expensive, too small, or booked for their dates needs a fast path to a better alternative. The "similar listings" carousel on the listing page is that path. The hard parts are that every home is unique and can be booked by only one party for a given set of dates, new homes appear daily, and "similar" has to mean "a guest who liked this would also consider that". The core idea is to learn listing embeddings from browsing sessions, in the style of word2vec, and then retrieve neighbours inside the same market under live availability and price constraints.</p>
+
+<h2>Clarifying Requirements</h2>
+<p>This chapter follows the public Airbnb work on listing embeddings (Grbovic and Cheng, KDD 2018) and its follow-ups, but the design is meant to transfer to any marketplace of unique, single-capacity items: vacation rentals, hotels, used cars, real estate. Start the interview by pinning down the product, the signals, and the constraints.</p>
+<div class="dlg">
+<div class="turn c"><span>Candidate</span><p>What is the business goal of the carousel?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Increase bookings by helping guests who are browsing find an alternative when the current listing is not quite right.</p></div>
+<div class="turn c"><span>Candidate</span><p>Where is it shown, and what is the input?</p></div>
+<div class="turn i"><span>Interviewer</span><p>On the listing detail page. The input is the listing being viewed, plus check-in and check-out dates and guest count when the guest has set them.</p></div>
+<div class="turn c"><span>Candidate</span><p>Should results be personalized to the guest?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Start with a seed-listing model that is the same for every guest. You may mention personalization as an extension, but the first version should not need a user profile.</p></div>
+<div class="turn c"><span>Candidate</span><p>What data do we have?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Logged-in browsing sessions with listing views and dwell time, wishlist saves, and bookings. Assume about 60 million logged-in listing views per day.</p></div>
+<div class="turn c"><span>Candidate</span><p>How big is the catalogue, and how fast does it change?</p></div>
+<div class="turn i"><span>Interviewer</span><p>About 5 million active listings. Tens of thousands of new listings are added each day, and availability and prices change constantly.</p></div>
+<div class="turn c"><span>Candidate</span><p>Must the carousel respect hard constraints?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Yes. Everything shown must be available for the guest's dates, accept their party size, and sit in a similar price band. Showing a sold-out home is the worst failure.</p></div>
+<div class="turn c"><span>Candidate</span><p>What is the latency budget?</p></div>
+<div class="turn i"><span>Interviewer</span><p>The carousel loads with the page. Assume 100 ms at p99 for the recommendation call, and about 30 million carousel renders per day, with peaks around three times the average.</p></div>
+<div class="turn c"><span>Candidate</span><p>What about new listings with no history?</p></div>
+<div class="turn i"><span>Interviewer</span><p>They must be eligible within a day, otherwise new hosts get no traffic and the inventory stays stale.</p></div>
+<div class="turn c"><span>Candidate</span><p>How will success be measured, and what is out of scope?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Carousel click-through and bookings that start from the carousel, without hurting overall bookings. Search ranking, ads, and price recommendations are out of scope.</p></div>
+</div>
+<div class="summary"><p>Given the listing a guest is viewing, return about 12 ranked listings that are behaviorally similar, available for the guest's dates, within a sensible price band, and able to host the party. Train from browsing sessions and bookings over a catalogue of about 5 million listings, support new listings within a day, and answer in 100 ms at p99.</p></div>
+
+<script type="application/json" class="dg" data-cap="The carousel sits on the path between a listing the guest cannot book and a listing they can. Every impression and click it produces becomes tomorrow's training data.">
+{"type":"graph","cols":5,"gapX":64,
+ "nodes":[
+  {"id":"s1","t":"Search results","s":"guest browses a market","c":0,"r":0,"k":"io"},
+  {"id":"s2","t":"Listing page A","s":"too pricey or booked","c":1,"r":0,"k":"svc"},
+  {"id":"s3","t":"Similar carousel","s":"12 alternatives","c":2,"r":0,"k":"model"},
+  {"id":"s4","t":"Listing page B","s":"guest taps a card","c":3,"r":0,"k":"svc"},
+  {"id":"s5","t":"Booking","s":"request or instant book","c":4,"r":0,"k":"io"},
+  {"id":"lg","t":"Impression and click logs","s":"training data for the next model","c":2,"r":1,"k":"data"}],
+ "edges":[["s1","s2","click"],["s2","s3","render"],["s3","s4","click",{"hl":1}],["s4","s5","book"],["s3","lg","",{"d":1,"sa":"b","sb":"t"}],["s4","lg","",{"d":1}]]}
+</script>
+
+<h2>Frame the Problem as an ML Task</h2>
+<h3>ML objective</h3>
+<p>"Similar" is not self-defining. A candidate may be tempted to say "same neighbourhood, same price, same number of bedrooms", but that is a feature filter, not an objective. The objective we care about is that the guest finds a listing they will book. Several formulations are plausible.</p>
+<table>
+<caption>Candidate objectives for the carousel</caption>
+<tr><th>Objective</th><th>Idea</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Attribute similarity</td><td>Rank by distance in a hand-built space of location, price, type, beds, amenities</td><td>No training data, explainable, works for brand-new listings</td><td>Weights are guesses; misses style, vibe, and what guests actually compare</td></tr>
+<tr><td>Predict the next click</td><td>Given a listing, predict the listing the guest views next in the session</td><td>Plentiful signal, models real consideration sets</td><td>Clicks can be noisy and position-biased; says nothing about whether the guest likes the result</td></tr>
+<tr><td>Predict the booking</td><td>Given a listing, predict which listing is eventually booked in the same trip</td><td>Directly aligned with revenue</td><td>Sparse: only about a percent of sessions end in a booking</td></tr>
+<tr><td>Learn co-engagement embeddings</td><td>Place listings that appear in the same sessions near each other, with extra weight on the booked listing</td><td>Uses all clicks, still sees bookings, gives one vector per listing for fast kNN</td><td>Needs enough sessions per listing; cold start needs a fallback</td></tr>
+</table>
+<div class="callout key"><p><b>Decision.</b> Learn co-engagement embeddings: listings that are viewed in the same sessions should be close, and the listing that was eventually booked is treated as a context for every click in its session. Clicks supply volume, bookings supply the business signal. The system retrieves nearest neighbours and then applies hard constraints and a small re-ranker.</p></div>
+
+<h3>Input and output</h3>
+<p>Treat the system as a function from a seed listing and stay context to an ordered list. The seed listing carries most of the information; dates and guests are used for filtering rather than for similarity.</p>
+<script type="application/json" class="dg" data-cap="Black-box view. The model uses only the seed listing; dates and party size act as hard filters, and recent searches are an optional later extension.">
+{"type":"graph","cols":3,"gapX":70,
+ "nodes":[
+  {"id":"a","t":"Seed listing","s":"id, market, type, price","c":0,"r":0,"k":"io"},
+  {"id":"b","t":"Stay context","s":"dates and guests, if set","c":0,"r":1,"k":"io"},
+  {"id":"c","t":"Guest signals","s":"recent searches (optional)","c":0,"r":2,"k":"io"},
+  {"id":"sys","t":"Similar-listings system","s":"embeddings, filters, re-rank","c":1,"r":1,"k":"model"},
+  {"id":"out","t":"12 ranked listings","s":"available, in budget, in market","c":2,"r":1,"k":"io"},
+  {"id":"lg","t":"Exposure logs","s":"what was shown and clicked","c":2,"r":2,"k":"data"}],
+ "edges":[["a","sys"],["b","sys"],["c","sys","",{"d":1}],["sys","out"],["sys","lg","",{"d":1}]]}
+</script>
+<script type="application/json" class="dg" data-cap="Example output for a seed listing. Scores are cosine similarities between listing embeddings (illustrative); price and availability are checked after retrieval.">
+{"type":"ranklist","ql":"Seed listing","q":"Studio near Alfama, Lisbon","qs":"2 guests, $95 per night","items":[
+ {"t":"Loft in Mouraria","s":"similarity 0.91, $102, available","v":0.91,"hl":1},
+ {"t":"Renovated flat, Graca","s":"similarity 0.88, $88, available","v":0.88},
+ {"t":"Studio by the cathedral","s":"similarity 0.84, $110, available","v":0.84}]}
+</script>
+
+<h3>ML category</h3>
+<table>
+<caption>Model families for similar-item retrieval</caption>
+<tr><th>Family</th><th>How it works</th><th>Strengths</th><th>Weaknesses</th></tr>
+<tr><td>Content-based</td><td>Embed or bucket listing attributes (location, price, type, amenities, photo and text embeddings) and take nearest neighbours</td><td>Handles new listings; easy to explain and debug</td><td>Similar on paper is not similar in behaviour; cannot learn vibe or neighbourhood character from fields</td></tr>
+<tr><td>Behavioral embeddings (skip-gram on sessions)</td><td>Treat each browsing session as a sentence of listing IDs and train a word2vec-style model</td><td>Captures what guests compare, including style and location nuance; tiny model; cosine kNN is trivial</td><td>One free vector per ID, so cold start needs a fallback and tail listings are noisy</td></tr>
+<tr><td>Two-tower with metadata</td><td>Both listings in a pair pass through a tower that mixes ID embeddings and attributes; train contrastively</td><td>Cold start handled by attribute inputs; richer features</td><td>More machinery, more negatives to engineer, features need daily refresh</td></tr>
+<tr><td>Graph embeddings (GraphSAGE, PinSage)</td><td>Build a listing co-engagement graph; aggregate neighbour and content features with a GNN</td><td>Combines graph structure and content; inductive for new nodes</td><td>Heavy training and serving; harder to iterate; overkill for a first version</td></tr>
+</table>
+<div class="callout tip"><p>In an interview, start with the behavioral skip-gram model, because it is the best match to the data you have and it is a small, strong baseline. Then name the two-tower and graph models as the upgrade path for cold start and richer features, and say what evidence would push you there (for example, a large share of traffic going to listings with under a week of history).</p></div>
+
+<p>Why does behavior beat attributes? Figure 4 shows the intuition. Two listings can have identical specs and price but sit in different cities, so they will never be compared. Two listings can look different on paper, yet guests repeatedly open both in the same session because they share a neighbourhood, a design style, or a view. Co-engagement carries all of that for free.</p>
+<script type="application/json" class="dg" data-cap="Behavioral similarity (solid, highlighted) follows what guests compare. Attribute similarity (dashed) can link listings that nobody would ever consider together.">
+{"type":"net","h":300,"nodes":[
+ {"id":"a","t":"A","x":12,"y":50,"k":"me","s":"Lisbon loft, $95"},
+ {"id":"b","t":"B","x":52,"y":14,"k":"hit","s":"Lisbon flat, $110"},
+ {"id":"d","t":"D","x":66,"y":50,"k":"hit","s":"Lisbon studio, $88"},
+ {"id":"c","t":"C","x":50,"y":88,"k":"cand","s":"Porto loft, $95"},
+ {"id":"e","t":"E","x":90,"y":18,"k":"other","s":"Lisbon penthouse, $420"}],
+ "edges":[["a","b",{"hl":1,"l":"40 co-clicks"}],["a","d",{"hl":1,"l":"12"}],["a","c",{"d":1,"l":"same specs, other city"}],["a","e",{"d":1,"l":"same area, 4x price"}]]}
+</script>
+<p>The chosen formulation: each listing becomes a point in a 32-dimensional space. Distance reflects how often listings co-occur in sessions. Because most sessions stay inside one market, listings cluster by market first, then by type and price within the market.</p>
+<script type="application/json" class="dg" data-cap="Illustrative 2-D view of listing embeddings: markets form clusters, and types separate inside a market. The query listing's nearest neighbours (dashed) are the carousel candidates.">
+{"type":"embed","h":340,"seed":9,"nn":3,
+ "clusters":[
+  {"n":"Lisbon: entire homes","x":160,"y":160,"r":30,"k":9,"c":0,"m":"c"},
+  {"n":"Lisbon: rooms","x":270,"y":250,"r":22,"k":7,"c":0,"m":"t"},
+  {"n":"Porto: entire homes","x":420,"y":120,"r":28,"k":8,"c":1,"m":"c"},
+  {"n":"Algarve: villas","x":560,"y":240,"r":28,"k":8,"c":2,"m":"s"},
+  {"n":"Berlin: flats","x":650,"y":100,"r":26,"k":7,"c":3,"m":"c"}],
+ "query":{"x":172,"y":168,"t":"seed listing"}}
+</script>
+
+<h2>Data Preparation</h2>
+<h3>Data engineering</h3>
+<p>Three sources matter: the listing catalogue, the interaction logs, and the bookings table. The interaction log is the training corpus, so its quality sets the ceiling of the model.</p>
+<table>
+<caption>Listing view log (sample rows). Assumed volume: 60 million rows per day, about 200 bytes each, so about 12 GB per day and about 1.1 TB for a 90-day training window.</caption>
+<tr><th>ts</th><th>user_id (hashed)</th><th>listing_id</th><th>event</th><th>dwell_s</th><th>search_dates</th></tr>
+<tr><td>2026-03-02 09:02:11</td><td>u_88</td><td>L_1042</td><td>view</td><td>80</td><td>Apr 10-14</td></tr>
+<tr><td>2026-03-02 09:05:40</td><td>u_88</td><td>L_2217</td><td>view</td><td>95</td><td>Apr 10-14</td></tr>
+<tr><td>2026-03-02 09:12:03</td><td>u_88</td><td>L_5521</td><td>view</td><td>12</td><td>Apr 10-14</td></tr>
+</table>
+<table>
+<caption>Listing catalogue (sample rows). Roughly 5 million active rows, refreshed continuously; availability lives in a separate calendar store.</caption>
+<tr><th>listing_id</th><th>market</th><th>type</th><th>price_night</th><th>capacity</th><th>beds</th><th>reviews</th><th>created_at</th></tr>
+<tr><td>L_1042</td><td>Lisbon</td><td>entire home</td><td>95</td><td>2</td><td>1</td><td>31</td><td>2023-05-01</td></tr>
+<tr><td>L_2217</td><td>Lisbon</td><td>entire home</td><td>110</td><td>3</td><td>2</td><td>8</td><td>2025-11-20</td></tr>
+<tr><td>L_9000</td><td>Lisbon</td><td>private room</td><td>48</td><td>2</td><td>1</td><td>0</td><td>2026-03-02</td></tr>
+</table>
+<table>
+<caption>Bookings (sample rows). Joined to sessions on user and time to mark booked sessions.</caption>
+<tr><th>booking_id</th><th>user_id</th><th>listing_id</th><th>booked_at</th><th>checkin</th><th>nights</th></tr>
+<tr><td>B_501</td><td>u_88</td><td>L_2217</td><td>2026-03-02 10:08</td><td>2026-04-10</td><td>4</td></tr>
+<tr><td>B_502</td><td>u_17</td><td>L_1042</td><td>2026-03-02 11:30</td><td>2026-06-02</td><td>7</td></tr>
+</table>
+<p>The pipeline groups clicks by user, orders them by time, cuts sessions at inactivity gaps, cleans out noise, and tags sessions that end in a booking.</p>
+<script type="application/json" class="dg" data-cap="Session construction pipeline. Each cleaning step removes a known source of false co-occurrence.">
+{"type":"graph","cols":5,"gapX":50,
+ "nodes":[
+  {"id":"lg","t":"Click logs","s":"60M views per day","c":0,"r":0,"k":"data"},
+  {"id":"g","t":"Group by user","s":"sort by time","c":1,"r":0},
+  {"id":"sp","t":"Split at 30 min gaps","s":"inactivity rule","c":2,"r":0},
+  {"id":"cl","t":"Clean noisy clicks","s":"dwell, bots, length","c":3,"r":0},
+  {"id":"se","t":"Sessions","s":"2 or more clicks","c":4,"r":0,"k":"data"},
+  {"id":"bk","t":"Booking events","s":"user, listing, time","c":4,"r":1,"k":"data"},
+  {"id":"tg","t":"Tag booked sessions","s":"last click is the booking","c":3,"r":1},
+  {"id":"ts","t":"Training set","s":"about 720M sessions","c":2,"r":1,"k":"store"}],
+ "edges":[["lg","g"],["g","sp"],["sp","cl"],["cl","se"],["se","tg","",{"sa":"b","sb":"t"}],["bk","tg"],["tg","ts","save"]]}
+</script>
+<p>The timeline below shows two of the rules on a real-looking trace. A short dwell marks an accidental click, and an inactivity gap of more than 30 minutes ends the session. After cleaning, session 1 is (A, B) and session 2 is (D, E).</p>
+<script type="application/json" class="dg" data-cap="Raw clicks of one user. Listing C is dropped (12 s dwell, likely accidental); a 47-minute gap between C and D starts a new session.">
+{"type":"graph","cols":5,"gapX":76,
+ "groups":[{"t":"Session 1","c0":0,"c1":2,"r0":0,"r1":0},{"t":"Session 2","c0":3,"c1":4,"r0":0,"r1":0}],
+ "nodes":[
+  {"id":"a","t":"Listing A","s":"09:02, 80 s","c":0,"r":0},
+  {"id":"b","t":"Listing B","s":"09:05, 95 s","c":1,"r":0},
+  {"id":"c","t":"Listing C","s":"09:12, 12 s, dropped","c":2,"r":0,"k":"io"},
+  {"id":"d","t":"Listing D","s":"09:59, 140 s","c":3,"r":0},
+  {"id":"e","t":"Listing E","s":"10:04, 75 s","c":4,"r":0}],
+ "edges":[["a","b"],["b","c"],["c","d","gap 47 min",{"d":1,"hl":1}],["d","e"]]}
+</script>
+<p>Cleaning rules matter more than they look. The Airbnb paper drops clicks with under 30 seconds of dwell and discards sessions with fewer than two clicks. The same logic extends naturally to bots and crawlers (impossible click rates, no mouse events), to very long sessions (a single sitting with hundreds of listings is usually a script or a property manager, so cap length and window), and to listings viewed through a host's own link rather than through browsing. Each of these would otherwise create false co-occurrences that pull unrelated listings together.</p>
+<p>Sessions are summarised by a co-click matrix. Figure 8 shows a toy market of five listings with row-normalised co-click shares. Two blocks appear: A, B, D form one consideration set (central neighbourhood) and C, E another (beachside). Skip-gram does not build this matrix explicitly, but it learns a low-rank factorisation of something very close to it, which is why it generalises to pairs never co-clicked directly.</p>
+<script type="application/json" class="dg" data-cap="Toy co-click matrix for five Lisbon listings (row-normalised shares of each row's co-clicks, shown to one decimal; the diagonal is not defined). Two consideration sets are visible as blocks.">
+{"type":"matrix","rl":"Seed listing","cl":"Co-clicked listing","rows":["A","B","C","D","E"],"cols":["A","B","C","D","E"],"unk":"-",
+ "v":[[null,0.73,0.18,0.07,0.02],[0.67,null,0.13,0.2,0],[0.2,0.16,null,0.04,0.6],[0.17,0.5,0.08,null,0.25],[0.03,0,0.81,0.16,null]],
+ "hl":[[0,1],[1,0],[2,4],[4,2]]}
+</script>
+<div class="callout math"><p><b>Row normalisation.</b> Raw weekly co-click counts for A are B 40, C 10, D 4, E 1, so the row total is 55 and the shares are 40/55 = 0.73, 10/55 = 0.18, 4/55 = 0.07, 1/55 = 0.02. For E the counts are A 1, B 0, C 30, D 6 (total 37), giving 30/37 = 0.81. The matrix is not symmetric after normalisation because rows have different totals.</p></div>
+
+<h3>Feature engineering</h3>
+<p>The skip-gram model has no features at all: its input is a listing ID. Features matter in three other places: the cold-start path, the filters, and the re-ranker.</p>
+<table>
+<caption>Features by entity</caption>
+<tr><th>Entity</th><th>Feature</th><th>Encoding</th><th>Used by</th></tr>
+<tr><td>Listing</td><td>Market, country</td><td>Categorical ID; also drives the market shard</td><td>Candidate lookup, cold start</td></tr>
+<tr><td>Listing</td><td>Room type (entire, private, shared)</td><td>3-way categorical</td><td>Cold start, filter</td></tr>
+<tr><td>Listing</td><td>Price per night and per guest</td><td>Log, then bucketed by quantile within market</td><td>Cold start bucket, price band filter</td></tr>
+<tr><td>Listing</td><td>Capacity, beds, bedrooms, bathrooms</td><td>Integers, capped</td><td>Capacity filter, re-ranker</td></tr>
+<tr><td>Listing</td><td>Review count, average rating, host acceptance rate</td><td>Bucketed; counts on log scale</td><td>Re-ranker quality score</td></tr>
+<tr><td>Listing</td><td>Latitude and longitude</td><td>Raw plus geohash prefix</td><td>Cold start neighbours, distance feature</td></tr>
+<tr><td>Listing</td><td>Calendar and price per night, per date</td><td>Bitmap of availability plus price array, read live</td><td>Live availability filter</td></tr>
+<tr><td>Pair (seed, candidate)</td><td>Cosine similarity of embeddings</td><td>Float in [-1, 1]</td><td>Retrieval score, re-ranker</td></tr>
+<tr><td>Pair</td><td>Price ratio, distance between listings</td><td>Log ratio; kilometres</td><td>Re-ranker</td></tr>
+<tr><td>Context</td><td>Guest count, trip length, lead time</td><td>Integers, bucketed</td><td>Filters, optional re-ranker</td></tr>
+</table>
+<p>The same metadata gives us the cold-start path. A brand-new listing has no clicks, so it is not in the vocabulary. Following the Airbnb paper, we find the three geographically closest listings (within 10 miles) that already have embeddings, share the new listing's room type, and fall in the same price bucket, and we average their vectors. The paper reports that this covers more than 98 percent of new listings.</p>
+<script type="application/json" class="dg" data-cap="Cold-start path. A new listing borrows a provisional embedding from similar, nearby listings and is replaced by its own learned vector once it has enough sessions.">
+{"type":"graph","cols":4,"gapX":56,
+ "nodes":[
+  {"id":"md","t":"Host-entered metadata","s":"market, type, price, location","c":0,"r":0,"k":"data"},
+  {"id":"ns","t":"Neighbour search","s":"10 miles, same type and price","c":1,"r":0},
+  {"id":"v3","t":"3 nearest listings","s":"each has a trained vector","c":2,"r":0,"k":"vec"},
+  {"id":"mn","t":"Mean vector","s":"provisional embedding","c":3,"r":0,"k":"model"},
+  {"id":"tr","t":"Daily training","s":"learns own vector from clicks","c":1,"r":1},
+  {"id":"st","t":"Embedding store","s":"serving index","c":3,"r":1,"k":"store"}],
+ "edges":[["md","ns"],["ns","v3"],["v3","mn"],["mn","st","serve",{"hl":1}],["tr","st","replaces",{"d":1}]]}
+</script>
+
+<h3>Labels</h3>
+<p>Skip-gram is self-supervised, so there are no human labels. What differs is where positive pairs come from.</p>
+<table>
+<caption>Sources of positive signal</caption>
+<tr><th>Source</th><th>What counts as positive</th><th>Strength</th><th>Problem</th></tr>
+<tr><td>Co-clicks in a session</td><td>Listings viewed within a window of each other, with enough dwell</td><td>Abundant: hundreds of millions of sessions</td><td>Exploration noise, position bias in search results, accidental clicks</td></tr>
+<tr><td>Bookings</td><td>The booked listing is a positive for every click in its session</td><td>Directly aligned with revenue, reflects a decision</td><td>Rare, delayed, host acceptance also matters</td></tr>
+<tr><td>Wishlist saves and inquiries</td><td>Saved or messaged listings, treated like soft bookings</td><td>Stronger than a click, much denser than bookings</td><td>Saves can be a way to bookmark, not intent to book; behaviour varies by user</td></tr>
+</table>
+<div class="callout key"><p><b>Decision.</b> Use co-clicks as the backbone, add the booked listing as a global context for booked sessions (see Model Development), and optionally treat saves as a weaker version of the same trick. Do not train on bookings alone.</p></div>
+<p>Four data issues to name in the interview. <b>Imbalance:</b> booked sessions are a small share, so the global-context term is applied only to them and is not diluted by an aggressive negative ratio. <b>Noise:</b> dwell and length filters, plus a minimum count so that a listing needs a few dozen appearances before getting its own vector. <b>Delay:</b> bookings arrive hours or days after the last click, so the training window ends a few days early, or sessions are re-tagged in a nightly batch. <b>Bias:</b> clicks come mostly from what search showed, so very popular listings dominate. Subsampling frequent items, as word2vec does, reduces this, and the re-ranker can add a mild exposure penalty.</p>
+
+<h2>Model Development</h2>
+<h3>Model options</h3>
+<table>
+<caption>Options for producing listing vectors</caption>
+<tr><th>Option</th><th>Training signal</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Skip-gram with negative sampling (word2vec) on sessions</td><td>Context prediction within a click window</td><td>Simple, fast, proven at scale on 4.5M listings; one hyperparameter set to tune</td><td>No metadata; cold start separate; ignores order beyond the window</td></tr>
+<tr><td>Item2vec / matrix factorisation of the co-click matrix</td><td>Pointwise mutual information of co-occurrence</td><td>Closed-form-ish, easy to reason about</td><td>Same cold start; loses the session boundary structure</td></tr>
+<tr><td>Two-tower with ID plus metadata</td><td>Contrastive loss over (seed, positive) pairs with sampled negatives</td><td>Learns from attributes, handles new listings natively</td><td>More engineering; negative sampling design dominates quality</td></tr>
+<tr><td>GraphSAGE or PinSage on the co-engagement graph</td><td>Graph-based contrastive loss with random-walk positives</td><td>Aggregates content and graph structure</td><td>Costly; hard to refresh daily over millions of nodes</td></tr>
+</table>
+<div class="callout key"><p><b>Decision.</b> Ship skip-gram with negative sampling, with the two marketplace adaptations below (booked listing as global context, in-market negatives), plus the metadata-average cold-start fallback. Keep the two-tower model as the next step if cold-start traffic grows.</p></div>
+
+<p>The word2vec analogy makes the model easy to explain: a listing is a word, a session is a sentence, and the log of all sessions is the corpus. Words that appear in similar contexts get similar vectors; so do listings that appear among similar neighbouring clicks.</p>
+<script type="application/json" class="dg" data-cap="The word2vec analogy: each layer of the language model has a direct counterpart in the listing model.">
+{"type":"stack","cols":[
+ {"t":"Language model","layers":[{"t":"Word","s":"token with a meaning"},{"t":"Sentence","s":"ordered words"},{"t":"Text corpus","s":"billions of sentences"},{"t":"Word vector","s":"similar contexts, similar vectors","k":"model"}]},
+ {"t":"Listing model","layers":[{"t":"Listing ID","s":"one home"},{"t":"Click session","s":"ordered listing views"},{"t":"Session corpus","s":"hundreds of millions of sessions"},{"t":"Listing vector","s":"32 numbers per listing","k":"model"}]}]}
+</script>
+<p>Training pairs come from a sliding window. For every click in a session (the centre), listings within m positions on either side become positive context. The Airbnb paper does not hinge on one window size; treat m between 3 and 5 as a starting range that you tune offline.</p>
+<script type="application/json" class="dg" data-cap="Pair generation with window m = 2. With centre C, the positive pairs are (C,A), (C,B), (C,D), (C,E). The window then slides one click to the right.">
+{"type":"graph","cols":5,"gapX":50,
+ "groups":[{"t":"Session window, m = 2","c0":0,"c1":4,"r0":0,"r1":0}],
+ "nodes":[
+  {"id":"a","t":"Click 1","s":"listing A","c":0,"r":0},
+  {"id":"b","t":"Click 2","s":"listing B","c":1,"r":0},
+  {"id":"c","t":"Click 3","s":"centre C","c":2,"r":0,"k":"model"},
+  {"id":"d","t":"Click 4","s":"listing D","c":3,"r":0},
+  {"id":"e","t":"Click 5","s":"listing E","c":4,"r":0},
+  {"id":"p","t":"Positive pairs for C","s":"(C,A) (C,B) (C,D) (C,E)","c":2,"r":1,"k":"data"}],
+ "edges":[["a","p","",{"sa":"b","sb":"t"}],["b","p","",{"sa":"b","sb":"t"}],["c","p","",{"hl":1}],["d","p","",{"sa":"b","sb":"t"}],["e","p","",{"sa":"b","sb":"t"}]]}
+</script>
+<div class="callout math"><p><b>Pair counts.</b> A session with 7 clicks and window m = 2 yields 2 + 3 + 4 + 4 + 4 + 3 + 2 = 22 ordered positive pairs (edge clicks have fewer neighbours). If the 7th click is the booking, each of the other 6 clicks also predicts the booked listing: 6 extra positive terms, 28 in total. Long sessions therefore dominate the loss, which is another reason to cap session length.</p></div>
+
+<p>The architecture is two embedding tables, one for listings as centres (input vectors) and one for listings as contexts (output vectors). The score of a pair is the dot product of the centre's input vector and the context's output vector, passed through a sigmoid. Only the input vectors are kept for serving.</p>
+<script type="application/json" class="dg" data-cap="Skip-gram with negative sampling. Table sizes assume 5M listings and 32 dimensions; only the input table is exported to serving.">
+{"type":"stack","cols":[
+ {"t":"Centre side","layers":[{"t":"Centre listing l","s":"one ID out of about 5M","k":"data"},{"t":"Input embedding table","s":"5M x 32, exported"},{"t":"Vector v_l","s":"32 numbers","k":"model"}]},
+ {"t":"Context side","layers":[{"t":"Context c","s":"neighbour, booked, or negative","k":"data"},{"t":"Output embedding table","s":"5M x 32, discarded"},{"t":"Vector v'_c","s":"32 numbers","k":"model"}]}],
+ "join":{"t":"sigmoid(v_l . v'_c)","s":"target 1 for positives, 0 for negatives"}}
+</script>
+<h3>Loss and the two marketplace adaptations</h3>
+<p>For each positive pair the model maximises the log of the sigmoid of the dot product, and for each sampled negative it maximises the log of one minus that sigmoid. Equivalently it minimises the logistic loss on a set of 1-labelled and 0-labelled pairs. Computing a softmax over 5 million listings would be far too slow, so a handful of negatives stands in for the denominator.</p>
+<p><b>Adaptation 1, in-market negatives.</b> Standard word2vec draws negatives at random from the whole vocabulary. For listings, positives are almost always in the same market (guests rarely compare Lisbon to Bali), and random negatives are almost always in another market. The model then solves the easy question, "same market or not", and never learns to separate a studio from a villa in the same city. The Airbnb paper adds a second set of negatives sampled from the market of the centre listing, which sharpens within-market similarity, the thing a carousel needs.</p>
+<script type="application/json" class="dg" data-cap="Negatives for a Lisbon centre listing A. Random global negatives are trivially far; in-market negatives are the hard cases that teach type and price distinctions.">
+{"type":"net","h":320,"nodes":[
+ {"id":"a","t":"A","x":50,"y":50,"k":"me","s":"Lisbon loft (centre)"},
+ {"id":"p","t":"B","x":14,"y":16,"k":"hit","s":"co-clicked: positive"},
+ {"id":"x","t":"X","x":86,"y":14,"k":"other","s":"Bali villa"},
+ {"id":"y","t":"Y","x":92,"y":56,"k":"other","s":"Oslo cabin"},
+ {"id":"m","t":"M","x":16,"y":84,"k":"cand","s":"Lisbon villa, $400"},
+ {"id":"n","t":"N","x":60,"y":90,"k":"cand","s":"Lisbon room, $40"}],
+ "edges":[["a","p",{"hl":1,"l":"positive"}],["a","x",{"d":1,"l":"easy"}],["a","y",{"d":1,"l":"easy"}],["a","m",{"d":1,"l":"hard"}],["a","n",{"d":1,"l":"hard"}]]}
+</script>
+<p><b>Adaptation 2, booked listing as global context.</b> In a booked session, the booked listing is the strongest evidence of what the guest wanted. The paper adds a term so that every centre click in a booked session also predicts the booked listing, even when it lies outside the window. Over many sessions this pulls the listings that precede a booking toward the listings that get booked.</p>
+<script type="application/json" class="dg" data-cap="Booked listing as global context. Each click predicts its neighbours (chain) and the booked listing (highlighted), regardless of distance in the session.">
+{"type":"net","h":300,"nodes":[
+ {"id":"h","t":"H","x":50,"y":14,"k":"hit","s":"booked listing"},
+ {"id":"a","t":"A","x":10,"y":80,"k":"fr","s":"click 1"},
+ {"id":"b","t":"B","x":34,"y":80,"k":"fr","s":"click 2"},
+ {"id":"c","t":"C","x":58,"y":80,"k":"fr","s":"click 3"},
+ {"id":"d","t":"D","x":82,"y":80,"k":"fr","s":"click 4"}],
+ "edges":[["a","b"],["b","c"],["c","d"],["a","h",{"hl":1}],["b","h",{"hl":1}],["c","h",{"hl":1,"l":"always predicted"}],["d","h",{"hl":1}]]}
+</script>
+<div class="callout math"><p><b>One training step, by hand.</b> Suppose the centre vector and context vectors give dot products of +2.0 for a positive pair, +1.0 for an in-market negative, and -2.0 for a random global negative. The logistic losses are -ln(sigmoid(2)) = 0.127, -ln(1 - sigmoid(1)) = -ln(0.269) = 1.313, and -ln(1 - sigmoid(-2)) = -ln(0.881) = 0.127 for the global one. The total is 0.127 + 1.313 + 0.127 = 1.567. The in-market negative contributes almost 10 times the loss of the others, and its gradient on the score has magnitude sigmoid(1) = 0.269 against sigmoid(-2) = 0.119 for the random negative. In-market negatives carry the learning signal; random negatives are cheap regularisation.</p></div>
+
+<table>
+<caption>Training choices and starting values. Values marked as assumptions are typical defaults to tune offline; the paper's own settings are noted where reported.</caption>
+<tr><th>Choice</th><th>Options</th><th>Trade-off</th><th>Starting value</th></tr>
+<tr><td>Embedding dimension</td><td>16, 32, 64, 128</td><td>Higher d fits head listings better but overfits the tail, which sees few clicks, and costs memory and latency</td><td>32 (the Airbnb paper uses d = 32)</td></tr>
+<tr><td>Window m</td><td>2 to 5</td><td>Large windows blur consideration sets; small windows waste long sessions</td><td>3 to 5 (assumption), tuned offline</td></tr>
+<tr><td>Negatives per positive</td><td>5 to 20 total, split global and in-market</td><td>More negatives help quality but slow training linearly</td><td>5 global plus 5 in-market (assumption)</td></tr>
+<tr><td>Minimum appearances</td><td>5 to 50</td><td>Low counts give noisy vectors; high counts push more listings to cold start</td><td>20 (assumption)</td></tr>
+<tr><td>Refresh</td><td>Incremental versus from scratch</td><td>Incremental is cheaper; scratch avoids drift. The paper retrains from scratch daily on a sliding multi-month window with a fixed seed and uses only cosine similarity downstream</td><td>Daily, from scratch</td></tr>
+</table>
+<div class="callout warn"><p>Embeddings from different training runs live in different coordinate systems. Never compare a vector from today's run with one stored yesterday, and never mix the old and new tables in one index. Swap the whole table, index, and cached top-K lists together as one versioned artifact.</p></div>
+
+<h2>Evaluation</h2>
+<h3>Offline metrics</h3>
+<p>There are no per-recommendation labels, so offline evaluation replays history. The Airbnb paper's test: for sessions that ended in a booking, use the listings clicked earlier in the session as the seed, rank the booked listing against the candidates in its market, and record its rank. The better the embeddings, the closer the booked listing sits to the top, and the effect should grow as the seed gets closer to the booking.</p>
+<table>
+<caption>Offline metrics for similar-listings retrieval. Mini examples use five held-out booked sessions whose booked listing ranked 1, 3, 8, 2, and 25 among the candidates.</caption>
+<tr><th>Metric</th><th>Definition</th><th>Mini example</th><th>Flaw</th><th>Decision</th></tr>
+<tr><td>Mean rank of the booked listing</td><td>Average position of the booked listing in the ranked candidates; lower is better</td><td>(1 + 3 + 8 + 2 + 25) / 5 = 7.8</td><td>One outlier dominates: without the rank-25 case the mean is 3.5</td><td>Report with the median (3), as a debugging view</td></tr>
+<tr><td>Hit rate at k</td><td>Share of sessions where the booked listing is within the top k</td><td>k = 3: ranks 1, 3, 2 qualify, so 3/5 = 0.60</td><td>Ignores position inside the top k; sensitive to the choice of candidate set size</td><td>Primary offline metric, with k = 12 to match the carousel</td></tr>
+<tr><td>Mean reciprocal rank (MRR)</td><td>Average of 1 divided by the booked listing's rank</td><td>(1 + 0.333 + 0.125 + 0.5 + 0.04) / 5 = 0.40</td><td>Over-rewards rank 1; hard to read in absolute terms</td><td>Secondary, for position-sensitive comparisons</td></tr>
+<tr><td>Catalogue coverage</td><td>Distinct listings that appear in any top-12 list divided by active listings</td><td>400 distinct listings across the top-12 lists of 1,000 listings: 0.40</td><td>Says nothing about relevance; can be raised with random results</td><td>Guardrail against popularity collapse and unfair exposure</td></tr>
+<tr><td>Price-fit rate</td><td>Share of shown candidates whose price lies in the seed's band</td><td>9 of 12 shown are inside the band: 0.75</td><td>Depends on the band definition; rewards boring results</td><td>Guardrail, tracked after filters</td></tr>
+</table>
+<div class="callout math"><p><b>Hit rate and MRR by hand.</b> Ranks 1, 3, 8, 2, 25. Hit rate at 1 is 1/5 = 0.20, at 3 it is 3/5 = 0.60 (ranks 1, 3, 2), at 10 it is 4/5 = 0.80 (adds rank 8), at 30 it is 5/5 = 1.00. MRR = (1 + 1/3 + 1/8 + 1/2 + 1/25) / 5 = 1.998 / 5 = 0.40. The mean rank of 7.8 looks mediocre while hit rate at 10 is 0.80: the two metrics weigh the tail differently, which is why you should report both.</p></div>
+<script type="application/json" class="dg" data-cap="Illustrative offline ablation: mean rank of the booked listing among 100 in-market candidates, seeded by the last click or the click five steps before booking (lower is better). The qualitative ordering follows the Airbnb paper's ablation; the values are made up.">
+{"type":"bars","labels":["Attribute similarity","Skip-gram","+ booked global context","+ in-market negatives"],
+ "series":[{"n":"Seed: last click","v":[34,22,18,15]},{"n":"Seed: 5 clicks earlier","v":[52,38,31,27]}]}
+</script>
+<script type="application/json" class="dg" data-cap="Illustrative hit rate at k versus k for three models over 100 in-market candidates. At k = 12 the full model finds the booked listing in about three of four sessions.">
+{"type":"curve","xl":"k (number of recommended listings)","yl":"Hit rate at k","xmax":50,"ymax":1,"series":[
+ {"n":"Full model","c":0,"lp":3,"pts":[[0,0],[1,0.2],[3,0.4],[5,0.53],[10,0.7],[20,0.84],[50,0.96]]},
+ {"n":"Skip-gram","c":1,"lp":4,"pts":[[0,0],[1,0.15],[3,0.33],[5,0.45],[10,0.62],[20,0.78],[50,0.93]]},
+ {"n":"Attributes","c":2,"d":1,"lp":4,"pts":[[0,0],[1,0.08],[3,0.19],[5,0.28],[10,0.42],[20,0.6],[50,0.85]]}],
+ "marks":[{"x":12,"y":0.73,"t":"carousel size"}]}
+</script>
+<div class="callout warn"><p>Offline replay inherits the logging policy: candidates and clicks were shaped by what search and the old carousel showed. A model that beats the old one offline may still lose online. Also note that the booked listing may have been the guest's only available option, not their favourite. Treat offline results as a filter for ideas, and spend A/B tests only on the winners.</p></div>
+
+<h3>Online metrics</h3>
+<table>
+<caption>Online metrics and guardrails</caption>
+<tr><th>Metric</th><th>Type</th><th>Definition</th><th>Why it matters</th></tr>
+<tr><td>Carousel click-through rate</td><td>Engagement</td><td>Carousel clicks divided by carousel impressions</td><td>First sign that results are relevant; the Airbnb test reported +21 percent CTR for the embedding model</td></tr>
+<tr><td>Bookings started from the carousel</td><td>Business</td><td>Booking flows (or bookings) whose last listing view came from the carousel, per 1,000 page views</td><td>The metric the carousel exists for</td></tr>
+<tr><td>Guests who book a carousel listing</td><td>Business</td><td>Share of booking guests whose booked listing was found in the carousel; the paper reports +4.9 percent</td><td>Measures discovery, not just curiosity</td></tr>
+<tr><td>Total bookings per visitor</td><td>Guardrail</td><td>All bookings divided by unique visitors, carousel on or off</td><td>The carousel must not simply cannibalise search</td></tr>
+<tr><td>Host-side health</td><td>Guardrail</td><td>Host rejection and cancellation rate on carousel-driven bookings</td><td>A two-sided market must not trade guest clicks for host frustration</td></tr>
+<tr><td>Exposure spread</td><td>Guardrail</td><td>Share of impressions on the top 1 percent of listings; share going to listings under 30 days old</td><td>Detects popularity collapse and new-host starvation</td></tr>
+<tr><td>Page latency</td><td>Guardrail</td><td>p99 of the recommendation call and page render</td><td>Slow carousels hurt the page they sit on</td></tr>
+<tr><td>Dead-end rate</td><td>Guardrail</td><td>Clicks on cards that turn out to be unavailable or off-budget</td><td>The live-filter pipeline's quality in one number</td></tr>
+</table>
+<script type="application/json" class="dg" data-cap="Illustrative treatment-arm funnel (assumed numbers): 1.0M carousel page views produce 35,000 clicks (CTR 3.5%), 4,200 booking-flow starts, and 1,050 bookings.">
+{"type":"funnel","stages":[
+ {"t":"Listing pages with carousel","s":"treatment arm","n":"1,000,000"},
+ {"t":"Carousel clicks","s":"CTR 3.5%","n":"35,000"},
+ {"t":"Booking flow starts","s":"12% of clicks","n":"4,200"},
+ {"t":"Bookings","s":"25% of starts","n":"1,050"}]}
+</script>
+<p>Two effects must be handled explicitly in an experiment. First, <b>position bias</b>: cards on the left of a carousel get more clicks regardless of quality. Figure 18 shows an illustrative pattern. When you log clicks as training data or compare rankers, record the displayed position, and when you evaluate a new ranker, randomise a small slice of traffic to measure position effects instead of assuming them away. Airbnb's search team describes position bias handling in their ranking work (references 9 and 10).</p>
+<script type="application/json" class="dg" data-cap="Illustrative click share by carousel position, indexed to position 1 = 100. The curve is made up but typical in shape: attention decays quickly across a horizontal carousel.">
+{"type":"bars","labels":["Pos 1","Pos 2","Pos 3","Pos 4","Pos 5","Pos 6","Pos 7","Pos 8"],"series":[{"n":"Relative click share","v":[100,62,45,33,26,21,17,14]}],"max":120}
+</script>
+<p>Second, <b>interference</b>. In a marketplace with unique, single-capacity inventory, treatment and control guests compete for the same homes. If the treatment arm is better at steering guests to a listing, it consumes capacity that control guests would have booked. Naive user-level A/B tests then overstate the gain; Johari and colleagues analyse this bias formally (reference 13). Mitigations include randomising by market or by geographic cluster, running long enough to see saturation, and comparing total bookings per market rather than only carousel-attributed ones.</p>
+<div class="callout math"><p><b>Sample size.</b> A common rule of thumb for a two-arm test on a rate p is n per arm of about 16 p(1-p) / delta squared, for 80 percent power at alpha = 0.05. For CTR at 3.5 percent and a 5 percent relative lift (delta = 0.00175): n = 16 x 0.035 x 0.965 / 0.00175 squared = 0.5404 / 0.0000030625, about 176,000 impressions per arm. For bookings per page view at 0.105 percent (1,050 per million) and the same relative lift (delta = 0.00005): n = 16 x 0.00105 x 0.99895 / (0.00005 squared) = 0.01678 / 0.0000000025, about 6.7 million page views per arm. At 30 million renders per day split in two, the volume arrives in under a day, but you still run for at least one to two weeks to cover weekly cycles, booking lag, and market saturation.</p></div>
+<div class="callout tip"><p>If you are asked what you would ship first, say: launch the embedding model against the old attribute-plus-search carousel, primary metric bookings per visitor with carousel CTR as the diagnostic, guardrails on host rejection, new-listing exposure, and latency, and randomise by market if you suspect capacity interference.</p></div>
+
+<h2>Serving</h2>
+<p>The online path is a short chain: look up candidates for the seed, filter them against live inventory, re-rank a small set, log the impression. The expensive work happens offline.</p>
+<script type="application/json" class="dg" data-cap="Serving architecture. Offline jobs build sessions, train embeddings from scratch daily, and publish a versioned embedding and neighbour store; the online path reads it, filters with live data, and re-ranks.">
+{"type":"graph","cols":5,"gapX":46,
+ "groups":[{"t":"Online: per listing page view","c0":0,"c1":4,"r0":0,"r1":0},{"t":"Offline: daily","c0":0,"c1":4,"r0":1,"r1":1}],
+ "nodes":[
+  {"id":"pg","t":"Listing page","s":"seed, dates, guests","c":0,"r":0,"k":"io"},
+  {"id":"sv","t":"Similar-listings service","s":"orchestrates the call","c":1,"r":0},
+  {"id":"cd","t":"Candidate lookup","s":"top-K cache, else in-market kNN","c":2,"r":0},
+  {"id":"fr","t":"Filter and re-rank","s":"live calendar, price, quality","c":3,"r":0},
+  {"id":"ca","t":"Carousel","s":"12 cards, logged","c":4,"r":0,"k":"io"},
+  {"id":"lg","t":"Click and booking logs","s":"90-day window","c":0,"r":1,"k":"data"},
+  {"id":"sb","t":"Session builder","s":"cleaning, booked tags","c":1,"r":1},
+  {"id":"tr","t":"Skip-gram training","s":"from scratch, fixed seed","c":2,"r":1,"k":"model"},
+  {"id":"es","t":"Embedding and top-K store","s":"versioned, sharded by market","c":3,"r":1,"k":"store"},
+  {"id":"cs","t":"New-listing job","s":"mean of nearest neighbours","c":4,"r":1}],
+ "edges":[["pg","sv"],["sv","cd"],["cd","fr"],["fr","ca"],["lg","sb"],["sb","tr"],["tr","es"],["cs","es","fills"],["es","cd","reads",{"d":1,"sa":"t","sb":"b"}]]}
+</script>
+<h3>Retrieval cascade and the funnel</h3>
+<p>Each stage shrinks the candidate set by an order of magnitude. Retrieval is deliberately scoped to the seed's market, which is what makes exact search affordable.</p>
+<script type="application/json" class="dg" data-cap="Candidate funnel for one request, with assumed sizes: a market shard of about 50,000 listings is cut to 100 by embedding similarity, to about 30 by live filters, and to 12 shown cards.">
+{"type":"funnel","stages":[
+ {"t":"Market shard","s":"same market as the seed","n":"~50,000","m":"5M active listings"},
+ {"t":"Embedding top-K","s":"cosine, exact or ANN","n":"100"},
+ {"t":"Live filters","s":"dates, price band, capacity","n":"~30"},
+ {"t":"Blend and diversify","s":"quality, distance, host caps","n":"12 shown"}]}
+</script>
+<div class="callout math"><p><b>Latency math (assumptions).</b> A market of 50,000 listings at 32 dimensions needs 50,000 x 32 = 1.6 million multiply-adds per query. The largest market, say 300,000 listings, needs 9.6 million, about 2 ms at an assumed 5 billion multiply-adds per second on one core. Brute-force cosine inside the market is therefore fast enough, and the Airbnb paper does the same: it scores listings from the seed's market on sharded machines. Approximate indexes such as HNSW only become necessary for cross-market or very large shard sizes. The Airbnb search team also reports that HNSW was a poor fit for them because of heavy real-time filtering and about 10,000 listing updates per second, and chose an inverted-file index instead (reference 12).</p></div>
+<p>Nightly top-K precomputation is also cheap. Assume 5 million listings with 2.5 million in 50 large markets of 50,000 each, and the rest in small ones. Exact all-pairs inside the large markets costs 50 x 50,000 squared x 32 = 4 x 10^12 multiply-adds, and the small markets add about 10^11. At an assumed 100 billion multiply-adds per second per node, that is roughly 41 seconds of compute on one node plus top-K selection overhead, so it fits easily into a daily job on a few machines.</p>
+<script type="application/json" class="dg" data-cap="Memory footprint for 5M listings under assumptions (MB). Storing vectors is cheap at d = 32; a top-100 neighbour cache with fp16 scores costs more than the vectors but is still only 3 GB.">
+{"type":"bars","horiz":true,"labels":["Vectors, 32-d fp32","Vectors, 64-d fp32","Vectors, 128-d fp32","Top-100 cache (id + fp16 score)"],"series":[{"n":"Memory (MB)","v":[640,1280,2560,3000]}]}
+</script>
+<div class="callout math"><p><b>Index size.</b> 5,000,000 listings x 32 dimensions x 4 bytes = 640 MB; at 64 dimensions it is 1,280 MB, at 128 it is 2,560 MB. A top-100 neighbour cache stores 100 entries of 4-byte ID plus 2-byte fp16 score, 6 bytes each, per listing: 5,000,000 x 100 x 6 = 3.0 GB. All of this fits in memory on a single machine, so the real sizing question is replication for 1,000 peak requests per second (30 million per day, average 347 per second, peak about three times higher), not capacity.</p></div>
+<h3>Filters, re-ranking, and the fallback</h3>
+<p>The cache gives candidates by similarity only. Everything that changes minute to minute is checked live. Availability for the guest's dates comes from the calendar service; price band and capacity come from the listing store.</p>
+<script type="application/json" class="dg" data-cap="Live filter and re-rank logic. If fewer than 12 survive the filters, the service falls back to a live in-market kNN query that applies the filters inside the search.">
+{"type":"graph","cols":4,"gapX":56,
+ "nodes":[
+  {"id":"c","t":"Top-100 candidates","s":"cached neighbours","c":0,"r":0,"k":"data"},
+  {"id":"av","t":"Availability","s":"calendar cache, all nights","c":1,"r":0},
+  {"id":"pr","t":"Price band","s":"0.7x to 1.5x of seed","c":2,"r":0},
+  {"id":"cp","t":"Capacity and rules","s":"guests, pets, minimum stay","c":3,"r":0},
+  {"id":"bl","t":"Blend score","s":"similarity, quality, distance","c":3,"r":1,"k":"model"},
+  {"id":"hc","t":"Host and area caps","s":"max 2 per host","c":2,"r":1},
+  {"id":"t12","t":"Top 12","s":"shown in order","c":1,"r":1,"k":"io"},
+  {"id":"fb","t":"Fallback: live kNN","s":"filters inside the search","c":0,"r":1,"k":"svc"}],
+ "edges":[["c","av"],["av","pr"],["pr","cp"],["cp","bl"],["bl","hc"],["hc","t12"],["c","fb","too few left",{"d":1}],["fb","t12","",{"d":1}]]}
+</script>
+<div class="callout math"><p><b>How many survive?</b> Suppose 60 percent of cached neighbours are available for the dates and 50 percent of those pass price and capacity. Expected survivors from 100 candidates: 100 x 0.6 x 0.5 = 30, comfortably above the 12 needed. In a peak season where only 20 percent are available, 100 x 0.2 x 0.5 = 10, which falls short, so the fallback must be live. For a seed priced at $95 per night, the price band 0.7x to 1.5x is $66.50 to $142.50 per night. The 0.7 and 1.5 are assumptions; tune them on dead-end rate and booking data.</p></div>
+<p>The final order is a blend. Cosine similarity leads, with small contributions for quality (reviews, acceptance rate), price fit, and distance from the seed. A lightweight learned ranker can replace hand weights once enough carousel impressions are logged.</p>
+<div class="callout math"><p><b>Blend example.</b> Take weights 0.6 similarity, 0.2 quality, 0.1 price fit, 0.1 proximity (assumed). Candidate X: similarity 0.90, quality 0.70, price fit 0.80, proximity 0.90, so 0.54 + 0.14 + 0.08 + 0.09 = 0.85. Candidate Y: similarity 0.93, quality 0.40, price fit 0.50, proximity 0.60, so 0.558 + 0.08 + 0.05 + 0.06 = 0.748. X wins despite lower raw similarity, because Y is poorly reviewed and far off budget.</p></div>
+<h3>Failure modes, refresh, and monitoring</h3>
+<table>
+<caption>Failure modes and graceful degradation</caption>
+<tr><th>Failure</th><th>Symptom</th><th>Response</th></tr>
+<tr><td>Embedding store unavailable</td><td>No candidates for any listing</td><td>Serve a static per-market list of popular, high-quality listings; alert and fail open</td></tr>
+<tr><td>Calendar service slow</td><td>p99 latency breach</td><td>Tight timeout; fall back to last cached availability and hide listings whose cache is older than a threshold</td></tr>
+<tr><td>Fewer than 12 survive filters</td><td>Short carousel</td><td>Live kNN with filters pushed down; if still short, relax the price band stepwise and log it</td></tr>
+<tr><td>New listing with no vector</td><td>Never recommended</td><td>Provisional mean-of-neighbours vector from the daily job</td></tr>
+<tr><td>Bad training run</td><td>Cosine scores collapse or clusters merge</td><td>Automated checks before publish (below), keep the previous version live, roll back with one flag</td></tr>
+</table>
+<p><b>Refresh.</b> Retrain every day from scratch on a sliding window of several months with a fixed seed, publish embeddings, build the neighbour cache, and run the new-listing job as one versioned release. Availability and price are never baked in; they are read live. <b>Monitoring.</b> Watch embedding drift (mean cosine between a fixed probe set of listings across versions), neighbour overlap at 10 between consecutive versions (an abrupt drop signals a bad run), share of listings with a trained vector versus provisional, cache age, dead-end rate, and carousel CTR by market. Pre-publish checks mirror the Airbnb paper's sanity tests: listings in the same neighbourhood should be closer than listings in different cities, and listings of the same type and price band should be closer than listings of different ones.</p>
+<table>
+<caption>Challenges and how the design addresses them</caption>
+<tr><th>Challenge</th><th>Why it is hard</th><th>Approach</th></tr>
+<tr><td>Cold start</td><td>New listings have no sessions</td><td>Metadata-average vector (reported to cover over 98 percent of new listings), daily replacement, a small exposure boost</td></tr>
+<tr><td>Speed</td><td>100 ms budget, 1,000 peak requests per second</td><td>Market-scoped exact search or cached top-100, live filters, small re-ranker</td></tr>
+<tr><td>Diversity</td><td>Nearest neighbours can be near-duplicates of one host</td><td>Host and area caps, similarity-aware diversification</td></tr>
+<tr><td>Fairness to hosts</td><td>Popular listings absorb attention and compound it</td><td>Subsample frequent listings in training, exposure caps, track exposure spread as a guardrail</td></tr>
+<tr><td>Privacy</td><td>Sessions are personal browsing history</td><td>Hash user IDs, drop them after session construction (as in the paper), aggregate retention limits</td></tr>
+<tr><td>Seasonality</td><td>A ski town's neighbours in July differ from January</td><td>Retrain daily on a window short enough to follow the season; add date-aware filters and optionally date-bucketed co-click counts</td></tr>
+</table>
+
+<h2>Other Talking Points</h2>
+<ul>
+<li><b>Personalization with recent searches.</b> Start with a seed-only model; later, add the guest's recent searches to the re-ranker or retrieve with a blend of the seed vector and the average vector of recently viewed listings, because guests narrow their taste over a trip.</li>
+<li><b>Seasonality.</b> Retrain on a sliding window that follows the season, and consider weighting recent sessions more heavily, because a beach market's consideration sets shift when school holidays start.</li>
+<li><b>Dateless pages.</b> About half of listing views may have no dates; when dates are missing, rank by similarity and price only and show an availability hint, since hiding unavailable homes would otherwise be impossible.</li>
+<li><b>Multi-modal cold start.</b> Photo and description embeddings can seed new-listing vectors better than a mean of three neighbours, which matters when style is what drives clicks.</li>
+<li><b>Graph and two-tower upgrades.</b> PinSage-style or two-tower models inherit the metadata directly and avoid the separate cold-start job, but cost more to train and refresh; move to them when cold-start traffic grows.</li>
+<li><b>Price changes.</b> A hot-season price jump changes who a listing competes with; store price-bucket features per day for the re-ranker and cold-start path instead of using stale averages.</li>
+<li><b>Explainability.</b> A short reason such as "similar neighbourhood and price" builds trust and helps support debug complaints, and can be derived from shared attributes of the pair.</li>
+<li><b>Two-sided metrics.</b> Track host outcomes next to guest outcomes, because a carousel that sends all traffic to a few hosts raises short-term bookings and lowers supply health.</li>
+<li><b>Experiment design under interference.</b> Randomise by market where capacity is shared, and read results as market-level totals, because user-level tests in a scarce-inventory marketplace overstate lift.</li>
+<li><b>Re-use the embeddings.</b> The same vectors can power email recommendations, search-ranking features, and host tools such as pricing and calendar suggestions, so their quality compounds.</li>
+</ul>
+
+<h2 class="nonum">Check yourself</h2>
+<p class="qa-intro">Questions are tagged by the level they target. The first set checks Senior-level fundamentals and arithmetic; Staff and Principal questions probe trade-offs, operations, experimentation and organization. Try to answer aloud for two minutes before opening one.</p>
+<div class="qa-bar" data-qa></div>
+<details class="ans" data-lvl="sr"><summary>1. Why sample negatives from the same market as the centre listing?</summary>Because positives are nearly always in the same market, random global negatives are nearly always from other markets. The model can drive its loss down by learning market identity alone and never learns to separate, say, a villa from a studio in the same city. In-market negatives are hard cases that force it to encode type, price, and style within the market, which is exactly what a carousel needs. Random negatives are still useful as cheap regularisation.</details>
+<details class="ans" data-lvl="sr"><summary>2. A session has 9 clicks, the last of which is the booking, and the window is m = 3. How many positive pair terms does it generate?</summary>Count ordered neighbours inside the window. For n = 9 and m = 3, the pair count is 2 x [(n - 1) + (n - 2) + (n - 3)] = 2 x (8 + 7 + 6) = 42. The booked listing is the 9th click, so each of the other 8 clicks also predicts it as global context: 8 extra terms, 50 in total. Note that some of those 8 already have the booked listing in their window, so the extra term reweights them rather than adding new information. Long sessions dominate, so cap length.</details>
+<details class="ans" data-lvl="sr"><summary>3. How much memory do vectors for 8 million listings take at 64 dimensions in fp16, and why is memory not the bottleneck?</summary>8,000,000 x 64 x 2 bytes = 1,024,000,000 bytes, about 1.0 GB. Even with a top-100 neighbour cache (8,000,000 x 100 x 6 bytes = 4.8 GB), the data fits in memory on one machine. The real limits are request throughput, which needs replication, and the freshness of live availability, which cannot be cached.</details>
+<details class="ans" data-lvl="st"><summary>4. A host adds a listing at 10 a.m. and wants traffic today. What do you do?</summary>The daily training job will not include it, so a new-listing job runs frequently (for example every hour) and builds a provisional vector: the mean of the 3 nearest listings in the same market, room type, and price bucket (within about 10 miles, as in the Airbnb paper). Publish it into the embedding store, make the listing eligible as a candidate, and after enough sessions let the daily run replace it with its own vector. To avoid starving new listings, track new-listing exposure as a guardrail. If the market has fewer than 3 neighbours, widen the radius or fall back to the nearest market.</details>
+<details class="ans" data-lvl="st"><summary>5. Your A/B test shows +4 percent carousel bookings but flat total bookings. How do you interpret it?</summary>The carousel may be cannibalising bookings that would have happened through search, or treatment guests may be taking inventory that control guests would have booked (interference). Check total bookings per visitor in both arms, rerun with market-level randomisation, and compare total booked nights per market. A real improvement shows up in totals; a shifted-attribution improvement does not.</details>
+<details class="ans" data-lvl="sr"><summary>6. When would you replace in-market brute force with an ANN index, and which one?</summary>When shard size or query rate makes exact scoring too slow, for example a cross-market "similar to this style anywhere" feature over millions of listings. HNSW gives the best speed and recall trade-off when the corpus is stable. For heavily filtered, rapidly updated inventory, an inverted-file index (IVF) may be better, as Airbnb found for its search retrieval. Start from the latency math: at 2 ms per exact query, brute force within a market is hard to beat.</details>
+<details class="ans" data-lvl="st"><summary>Bookings are rare and clicks are noisy. How do you choose the weight of the booked-listing context, and verify it helps?</summary><p>Treat the weight as a hyperparameter with a principled check. The booked listing is the strongest signal of what the guest actually wanted, so it is added as a context for every click in the session (the idea used in listing-embedding work at Airbnb, Grbovic and Cheng, KDD 2018), but too much weight makes the space collapse toward popular, bookable homes.</p><p>Evaluate offline with a task that matches the product: given the clicked listings in held-out sessions, rank the eventually booked listing among candidates in the same market and compare hit rate and mean rank across weights. Then confirm online with carousel bookings and the guardrails (click-through, unavailable-click rate). Check slices: new listings and low-supply markets, where bookings are scarcest.</p><p class="probe"><b>Likely follow-ups:</b> What does the embedding look like if the booked weight is too high? &middot; How would you handle markets with almost no bookings?</p><p class="signal"><b>What makes this Staff-level:</b> You tie a modeling knob to a held-out task that mirrors the product and to slices where it can fail.</p></details>
+<details class="ans" data-lvl="st"><summary>Guests see similar listings that are booked for their dates or three times the price. How do you make availability and price first-class?</summary><p>Apply hard constraints before ranking, not after. Maintain per-listing availability bitmaps for the search window (updated from the calendar service) and filter the candidate set with them before the nearest-neighbor search or in the same step. Constrain price to a band around the anchor listing (for example a bounded log-price ratio) and keep it in the same market and capacity class.</p><p>Ensure freshness: calendar changes must propagate within minutes, with a safety recheck at render time. If filtering leaves too few results, widen the radius or price band in steps and label the result as a relaxed match. Track unavailable-click rate and empty-carousel rate as product metrics and alert on them.</p><p class="probe"><b>Likely follow-ups:</b> What happens to latency when the filter removes 95 percent of candidates? &middot; How do you keep the bitmap current at millions of updates per hour?</p><p class="signal"><b>What makes this Staff-level:</b> You put constraints where they save the most work and you monitor the user-visible failure.</p></details>
+<details class="ans" data-lvl="pr"><summary>The company is expanding to new markets with sparse supply and a new product category (experiences). What transfers, and what does not?</summary><p>What transfers: the session-based embedding recipe, the evaluation harness, the cold-start fallback from metadata, and the operating playbook. What does not: market-specific co-click structure (a ski town and a city behave differently), the definition of "similar" (experiences are matched by time and activity, not by bedrooms), and the inventory constraints.</p><p>Plan it as a template: shared infrastructure and training code, market-level evaluation sets and negatives, metadata encoders that can start working with no history, and a launch checklist with exit criteria (calibration, coverage, empty-result rate). Staff it with a small platform group that owns the template and local owners for each market or category.</p><p class="probe"><b>Likely follow-ups:</b> How would you decide to train a global model versus per-market models? &middot; What is your minimum data threshold to turn the model on?</p><p class="signal"><b>What makes this Principal-level:</b> You separate what to standardize from what to localize, and you turn expansion into a repeatable process.</p></details>
+<details class="ans" data-lvl="st"><summary>New hosts rarely appear in the carousel. Is the model creating a rich-get-richer loop, and what do you do?</summary><p>Check with data: impression share by listing age and by host tenure, the Gini coefficient of impressions, and how much of the exposure disparity remains after controlling for quality (reviews, price, photos). Co-click training favors listings that already have clicks, and popularity-proportional negative sampling reinforces it.</p><p>Mitigations: sample negatives with a flattened popularity distribution, give metadata-based embeddings for new listings, reserve a small exploration share of slots with a quality threshold, and cap how much any listing's exposure can be boosted. Measure the cost in near-term bookings and the benefit in supply health (host retention, time to first booking), then choose the exploration share on that trade-off.</p><p class="probe"><b>Likely follow-ups:</b> What is your guardrail so boosts do not show poor listings? &middot; How do you measure supply-side benefit in an A/B test?</p><p class="signal"><b>What makes this Staff-level:</b> You measure the loop and the marketplace-level benefit, not only guest-side conversion.</p></details>
+
+<h2 class="nonum">References</h2>
+<ol class="refs">
+<li>Grbovic, M. and Cheng, H. <a href="https://dl.acm.org/doi/10.1145/3219819.3219885">Real-time Personalization using Embeddings for Search Ranking at Airbnb.</a> KDD 2018.</li>
+<li>Grbovic, M. <a href="https://medium.com/airbnb-engineering/listing-embeddings-for-similar-listing-recommendations-and-real-time-personalization-in-search-601172f7603e">Listing Embeddings for Similar Listing Recommendations and Real-time Personalization in Search.</a> Airbnb Engineering blog, 2018.</li>
+<li>Mikolov, T., Chen, K., Corrado, G., and Dean, J. <a href="https://arxiv.org/abs/1301.3781">Efficient Estimation of Word Representations in Vector Space.</a> 2013.</li>
+<li>Mikolov, T., Sutskever, I., Chen, K., Corrado, G., and Dean, J. <a href="https://arxiv.org/abs/1310.4546">Distributed Representations of Words and Phrases and their Compositionality.</a> 2013.</li>
+<li>Barkan, O. and Koenigstein, N. <a href="https://arxiv.org/abs/1603.04259">Item2Vec: Neural Item Embedding for Collaborative Filtering.</a> 2016.</li>
+<li>Malkov, Y. and Yashunin, D. <a href="https://arxiv.org/abs/1603.09320">Efficient and Robust Approximate Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs.</a> 2016.</li>
+<li>Ying, R. et al. <a href="https://arxiv.org/abs/1806.01973">Graph Convolutional Neural Networks for Web-Scale Recommender Systems (PinSage).</a> KDD 2018.</li>
+<li>Hamilton, W., Ying, R., and Leskovec, J. <a href="https://arxiv.org/abs/1706.02216">Inductive Representation Learning on Large Graphs (GraphSAGE).</a> NeurIPS 2017.</li>
+<li>Haldar, M. et al. <a href="https://arxiv.org/abs/1810.09591">Applying Deep Learning to Airbnb Search.</a> KDD 2019.</li>
+<li>Haldar, M. et al. <a href="https://arxiv.org/abs/2002.05515">Improving Deep Learning for Airbnb Search.</a> KDD 2020.</li>
+<li>Abdool, M. et al. <a href="https://arxiv.org/abs/2004.02621">Managing Diversity in Airbnb Search.</a> KDD 2020.</li>
+<li>Airbnb. <a href="https://arxiv.org/abs/2601.06873">Applying Embedding-Based Retrieval to Airbnb Search.</a> 2026.</li>
+<li>Johari, R., Li, H., Liskovich, I., and Weintraub, G. <a href="https://arxiv.org/abs/2002.05670">Experimental Design in Two-Sided Platforms: An Analysis of Bias.</a> 2020.</li>
+<li>Johnson, J., Douze, M., and Jegou, H. <a href="https://arxiv.org/abs/1702.08734">Billion-scale similarity search with GPUs (Faiss).</a> 2017.</li>
+</ol>
+</main></div>
+<script src="assets/dg.js"></script>
+<script src="assets/nav.js"></script>
+<script src="assets/qa.js"></script>
+</body>
+</html>

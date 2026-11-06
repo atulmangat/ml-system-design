@@ -1,0 +1,555 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>YouTube Video Search</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-slug="youtube-video-search">
+<div class="topbar"><a href="index.html">&larr; ML System Design Study Guide</a><span style="color:var(--muted)">Chapter 4 of 11</span></div>
+<div class="layout"><aside class="toc" id="toc"></aside>
+<main>
+<div class="kicker">Chapter 4</div>
+<h1>YouTube Video Search</h1>
+<p class="lead">A user types a few words and expects the right video in the first screen of results, out of roughly ten billion. The query is text but the answer is video, so the system has to bridge two modalities while also exploiting the rich text that already surrounds every video. The core idea is a hybrid: a lexical retriever for exact words and names, a cross-modal embedding retriever for what is actually shown, and a learned ranker that fuses them under a few hundred milliseconds.</p>
+
+<h2>Clarifying Requirements</h2>
+<p>Search is a deceptively open problem: autocomplete, voice, personalization, ads, and safety all hide inside the word "search". Spend the first few minutes pinning down the slice you are asked to build, because every answer below changes an architectural decision.</p>
+<div class="dlg">
+<div class="turn c"><span>Candidate</span><p>Is the input always a typed text query, or do we also take voice, an image, or a video clip?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Typed text only. No voice, no image queries.</p></div>
+<div class="turn c"><span>Candidate</span><p>Which languages must we support?</p></div>
+<div class="turn i"><span>Interviewer</span><p>English only, both for queries and for the videos you index.</p></div>
+<div class="turn c"><span>Candidate</span><p>How large is the catalog, and what do we know about each video?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Around ten billion videos, from a few seconds to several hours. Each has a title, description and tags, and many have auto-generated captions.</p></div>
+<div class="turn c"><span>Candidate</span><p>May the model look at the video content itself, or only at the text metadata?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Both. Using the visual content is part of the point of the exercise.</p></div>
+<div class="turn c"><span>Candidate</span><p>Is the ranking personalized?</p></div>
+<div class="turn i"><span>Interviewer</span><p>No. Two users typing the same query get the same list. That also makes caching straightforward.</p></div>
+<div class="turn c"><span>Candidate</span><p>What supervision exists? Click logs, watch time, human relevance labels?</p></div>
+<div class="turn i"><span>Interviewer</span><p>You have search logs with impressions, clicks and watch time, and a modest human-rated set meant for evaluation, not training.</p></div>
+<div class="turn c"><span>Candidate</span><p>What are the latency and traffic targets?</p></div>
+<div class="turn i"><span>Interviewer</span><p>A few hundred milliseconds end to end. For traffic, assume about a billion searches a day.</p></div>
+<div class="turn c"><span>Candidate</span><p>How fresh must the index be? If someone uploads a video, when must it be findable?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Metadata search within minutes; content-based search can lag somewhat. Trending news events are the hard case.</p></div>
+<div class="turn c"><span>Candidate</span><p>What is out of scope: autocomplete, ads, safety, searching inside a video?</p></div>
+<div class="turn i"><span>Interviewer</span><p>All out. Assume a separate policy system hands you a "blocked" flag per video. Focus on retrieval and ranking.</p></div>
+</div>
+<div class="summary"><p>Build a video search system. The input is an English text query and the output is a ranked list of videos from a catalog of about ten billion. There is no personalization. Training signals are click and watch logs; a small human-rated set is for evaluation. Titles, descriptions, tags, captions and the video content are all usable, and results must arrive within a few hundred milliseconds at about a billion searches per day.</p></div>
+<script type="application/json" class="dg" data-cap="The product as a black box: a text query goes in, ranked videos come out, and the clicks and watch behavior that follow become next month's training data">
+{"type":"graph","cols":3,
+ "nodes":[
+  {"id":"q","t":"Text query","s":"sourdough starter","c":0,"r":0,"k":"io"},
+  {"id":"sys","t":"Video search system","s":"about 10B videos, no personalization","c":1,"r":0,"k":"model"},
+  {"id":"res","t":"Ranked videos","s":"10 to 20 per page","c":2,"r":0,"k":"io"},
+  {"id":"logs","t":"Click and watch logs","s":"impressions, position, watch time","c":1,"r":1,"k":"data"}],
+ "edges":[["q","sys"],["sys","res","ranked",{"hl":1}],["res","logs","user actions",{"sa":"b","sb":"r"}],["logs","sys","training signal",{"d":1,"sa":"t","sb":"b"}]]}
+</script>
+
+<h2>Frame the Problem as an ML Task</h2>
+<h3>ML objective</h3>
+<p>"Show relevant videos" can be turned into several different trainable objectives. Each one defines what the model is rewarded for, so the choice deserves a short comparison in an interview.</p>
+<table>
+<caption>Candidate objectives for video search</caption>
+<tr><th>Objective</th><th>What it optimizes</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Predict P(click | query, video)</td><td>Probability the user clicks a result</td><td>Huge volume; trivial to log</td><td>Rewards clickbait titles and thumbnails; heavily position-biased</td></tr>
+<tr><td>Predict P(qualified watch | query, video)</td><td>Probability of a click followed by meaningful viewing</td><td>Much cleaner relevance proxy; punishes bounce</td><td>Favors long and autoplay-friendly videos; delayed signal</td></tr>
+<tr><td>Predict human relevance grade</td><td>Graded 0 to 3 judgement from raters</td><td>Closest to true relevance; also usable for any metric</td><td>Small and expensive; cannot cover the tail of queries</td></tr>
+<tr><td>Similarity of query and video in a shared space</td><td>Cosine of a text vector and a video vector</td><td>Indexable with ANN; works at 10B scale; no metadata needed</td><td>Fuzzy for exact names; needs video-text pairs to train</td></tr>
+</table>
+<div class="callout key"><p>Decision: the system's objective is to rank videos by relevance to the query. We operationalize it in two layers. Retrieval learns a shared text-video similarity from engagement pairs (click plus qualified watch). The final ranker learns a graded relevance score from the same logs, and the human-rated set audits both.</p></div>
+
+<h3>Input and output</h3>
+<p>The input is a short string, typically two to five words. The output is an ordered list of video IDs. Internally we run two retrievers whose candidate lists are merged, because they succeed and fail on different queries.</p>
+<script type="application/json" class="dg" data-cap="Two retrievers receive the same preprocessed query: lexical matching on text fields and cross-modal matching against video content; a fusion stage merges the two candidate lists">
+{"type":"graph","cols":5,
+ "nodes":[
+  {"id":"q","t":"Text query","c":0,"r":1,"k":"io"},
+  {"id":"prep","t":"Query preprocessing","s":"spell, normalize","c":1,"r":1},
+  {"id":"txt","t":"Text search","s":"inverted index, BM25","c":2,"r":0},
+  {"id":"xm","t":"Cross-modal search","s":"text encoder + ANN","c":2,"r":2,"k":"model"},
+  {"id":"fuse","t":"Fusion and ranking","s":"merge, then learned ranker","c":3,"r":1,"k":"model"},
+  {"id":"res","t":"Ranked videos","c":4,"r":1,"k":"io"}],
+ "edges":[["q","prep"],["prep","txt","terms"],["prep","xm","token ids"],["txt","fuse","top 300"],["xm","fuse","top 300"],["fuse","res",{"hl":1}]]}
+</script>
+
+<h3>ML category</h3>
+<p>Several model families can score a (query, video) pair. They differ mostly in whether the video side can be precomputed, which decides whether they can touch all ten billion items.</p>
+<table>
+<caption>Model families for scoring query-video relevance</caption>
+<tr><th>Family</th><th>How it scores</th><th>Precompute video side?</th><th>Best use here</th></tr>
+<tr><td>Lexical (BM25)</td><td>Term matching with frequency and length statistics over metadata and captions</td><td>Yes (inverted index)</td><td>Retriever for exact words, names, titles</td></tr>
+<tr><td>Dual encoder (two towers)</td><td>Cosine of independently computed text and video embeddings</td><td>Yes (vector index)</td><td>Retriever for meaning and visual content</td></tr>
+<tr><td>Cross-encoder</td><td>One transformer attends over query and video jointly</td><td>No</td><td>Optional re-scorer of the top 20 to 50</td></tr>
+<tr><td>Learning-to-rank trees</td><td>Boosted trees over many hand-built features</td><td>Partly (features cached)</td><td>Final ranker over the merged candidates</td></tr>
+</table>
+<p>We choose a dual encoder for the neural retriever. Both towers map into one embedding space where a query vector sits near the vectors of videos that answer it, so retrieval is a nearest-neighbor lookup over precomputed video vectors.</p>
+<script type="application/json" class="dg" data-cap="Illustrative embedding space: query-text vectors (circles) and video vectors (squares) of the same topic land together, so the nearest videos to a query vector are the right ones">
+{"type":"embed","h":330,"seed":7,"nn":3,"xl":"embedding dimension 1","yl":"dimension 2",
+ "legend":[{"t":"Text query","c":0,"m":"c"},{"t":"Video","c":0,"m":"s"}],
+ "clusters":[
+  {"n":"Baking","x":150,"y":115,"r":26,"k":7,"c":0,"m":"c"},
+  {"n":"","x":162,"y":122,"r":26,"k":9,"c":0,"m":"s"},
+  {"n":"Running","x":420,"y":95,"r":26,"k":7,"c":1,"m":"c"},
+  {"n":"","x":430,"y":104,"r":26,"k":9,"c":1,"m":"s"},
+  {"n":"Guitar","x":620,"y":215,"r":26,"k":7,"c":2,"m":"c"},
+  {"n":"","x":610,"y":224,"r":26,"k":9,"c":2,"m":"s"},
+  {"n":"Yoga","x":320,"y":245,"r":24,"k":6,"c":3,"m":"c"},
+  {"n":"","x":330,"y":240,"r":24,"k":8,"c":3,"m":"s"}],
+ "query":{"x":180,"y":135,"t":"sourdough starter"}}
+</script>
+<div class="callout tip"><p>Say why you want both retrievers before drawing boxes: "BM25 is unbeatable when the user types the exact title or a rare name; embeddings win when the vocabulary differs or the metadata is thin. Their failures are mostly uncorrelated, so a union plus a learned ranker beats either alone." Interviewers listen for the uncorrelated-errors argument.</p></div>
+<table>
+<caption>Where each retriever fails: this is the case for a hybrid</caption>
+<tr><th>Failure case</th><th>Text search</th><th>Cross-modal search</th></tr>
+<tr><td>Vocabulary mismatch ("stop bike chain slipping" vs a title "fixing skipping gears")</td><td>Misses: no shared terms</td><td>Finds: both mean the same thing</td></tr>
+<tr><td>Rare names and exact titles ("MKBHD S24 review")</td><td>Finds: rare token has huge IDF</td><td>Weak: rare entities are poorly embedded</td></tr>
+<tr><td>Thin or missing metadata (a raw lecture titled "Video 17")</td><td>Misses unless ASR captions exist</td><td>Finds from the frames</td></tr>
+<tr><td>Static-visual content (podcast over one image, music with lyrics)</td><td>Finds through title and captions</td><td>Weak: every frame looks the same</td></tr>
+<tr><td>Keyword stuffing, SEO spam tags</td><td>Fooled: the words are there</td><td>Resistant: content must match</td></tr>
+<tr><td>Numbers, negation, counting ("not under 10 minutes")</td><td>Handled by filters or ignored</td><td>Poor: embeddings blur these</td></tr>
+</table>
+
+<h2>Data Preparation</h2>
+<h3>Data engineering</h3>
+<p>Three data sources feed the system: the video catalog with its metadata, the search logs, and the human-rated evaluation set.</p>
+<table>
+<caption>Video catalog (about 10B rows; metadata plus pointers to stored media and ASR output)</caption>
+<tr><th>video_id</th><th>title</th><th>tags</th><th>length_s</th><th>upload_ts</th><th>asr_transcript</th></tr>
+<tr><td>v1</td><td>How to bake sourdough bread</td><td>bread, baking</td><td>612</td><td>2026-03-02</td><td>today we feed the starter...</td></tr>
+<tr><td>v2</td><td>Sourdough starter tips</td><td>sourdough, starter</td><td>340</td><td>2026-05-19</td><td>keep it at room temperature...</td></tr>
+<tr><td>v3</td><td>Marathon training week 3</td><td>running</td><td>845</td><td>2026-07-11</td><td>this week we add a long run...</td></tr>
+</table>
+<table>
+<caption>Search logs (one row per impression; about 10 results shown per search)</caption>
+<tr><th>ts</th><th>query</th><th>video_id</th><th>position</th><th>clicked</th><th>watch_s</th></tr>
+<tr><td>09:14:02</td><td>sourdough starter</td><td>v2</td><td>1</td><td>1</td><td>310</td></tr>
+<tr><td>09:14:02</td><td>sourdough starter</td><td>v1</td><td>2</td><td>1</td><td>12</td></tr>
+<tr><td>09:14:02</td><td>sourdough starter</td><td>v3</td><td>3</td><td>0</td><td>0</td></tr>
+</table>
+<table>
+<caption>Human-rated evaluation set (graded relevance, three raters per pair, aggregated)</caption>
+<tr><th>query</th><th>video_id</th><th>grade</th><th>meaning</th></tr>
+<tr><td>sourdough starter</td><td>v2</td><td>3</td><td>exactly what the query asks for</td></tr>
+<tr><td>sourdough starter</td><td>v1</td><td>2</td><td>relevant, but broader</td></tr>
+<tr><td>sourdough starter</td><td>v3</td><td>0</td><td>unrelated</td></tr>
+</table>
+<p>Scale, stated as assumptions: one billion searches a day times ten results is about 10 billion impression rows a day, roughly 0.5 TB per day compressed at about 50 bytes a row. Logs must record the <em>position</em> and the full list shown, not only clicks, because position bias correction and negative mining both need them. The human set is about 50,000 queries times 20 videos, about one million judgements, refreshed quarterly and sampled to include head, torso and tail queries.</p>
+
+<h3>Feature engineering</h3>
+<p>Features split by entity. The retrieval model consumes only raw text and frames; the final ranker consumes many engineered features built from the entities below.</p>
+<table>
+<caption>Features by entity and how each is encoded</caption>
+<tr><th>Entity</th><th>Features</th><th>Encoding</th></tr>
+<tr><td>Query</td><td>Text, token count, intent class (navigational, how-to, topical), spell-corrected flag</td><td>Subword ids for the encoder; intent one-hot; length bucketed</td></tr>
+<tr><td>Video text</td><td>Title, tags, description, ASR transcript, channel name</td><td>Analyzed per field for the inverted index; subword ids for the encoder</td></tr>
+<tr><td>Video content</td><td>16 sampled frames; optionally audio track</td><td>Resize to 224 by 224, normalize; encoder output cached as a vector</td></tr>
+<tr><td>Video quality and stats</td><td>Age, duration, views, like ratio, qualified-watch rate, channel authority</td><td>Log-transform then quantile bucket; smoothed rates for new videos</td></tr>
+<tr><td>Query-video match</td><td>BM25 per field, cosine similarity, fraction of query terms in title, exact-phrase flag, historical qualified-watch rate for the pair</td><td>Raw floats; pair rate Bayesian-smoothed toward the video prior</td></tr>
+</table>
+<p><b>Text preprocessing.</b> Raw queries are messy: casing, accents, stray punctuation, typos. The same normalization is applied to indexed text so that both sides agree. After that the two branches diverge: the lexical branch wants whole-word tokens that can be stemmed, and the neural branch wants subword pieces that map to ids.</p>
+<script type="application/json" class="dg" data-cap="Text preprocessing: one normalization step, then a word-token branch for the inverted index and a subword branch for the neural text encoder">
+{"type":"graph","cols":5,
+ "nodes":[
+  {"id":"raw","t":"Raw query","s":"Sourdogh Starter?!","c":0,"r":0,"k":"io"},
+  {"id":"norm","t":"Normalize","s":"case, accents, spaces","c":1,"r":0},
+  {"id":"tok","t":"Word tokens","s":"sourdough, starter","c":2,"r":0},
+  {"id":"sub","t":"Subword pieces","s":"sour, ##dough, ...","c":3,"r":0},
+  {"id":"ids","t":"Token ids","s":"[101, 2061, ...]","c":4,"r":0,"k":"vec"},
+  {"id":"stem","t":"Stem, synonyms","s":"starter, starters","c":2,"r":1},
+  {"id":"lex","t":"Index lookup","s":"lexical branch","c":3,"r":1,"k":"store"},
+  {"id":"enc","t":"Text encoder","s":"neural branch","c":4,"r":1,"k":"model"}],
+ "edges":[["raw","norm"],["norm","tok"],["tok","sub","also"],["sub","ids"],["tok","stem","lexical",{"sa":"b","sb":"t"}],["stem","lex"],["ids","enc"]]}
+</script>
+<table>
+<caption>Tokenization options for the neural branch</caption>
+<tr><th>Scheme</th><th>Vocabulary</th><th>Typos and new words</th><th>Cost</th></tr>
+<tr><td>Word-level</td><td>Hundreds of thousands, still misses names</td><td>Unknown word becomes an out-of-vocabulary token</td><td>Short sequences, huge embedding table</td></tr>
+<tr><td>Character-level</td><td>Under 200</td><td>Always representable</td><td>Long sequences, weak word-level semantics</td></tr>
+<tr><td>Subword (BPE, WordPiece, SentencePiece)</td><td>Typically 30K to 50K</td><td>A typo decomposes into known pieces and stays close to the correct form</td><td>Slightly longer sequences than words</td></tr>
+</table>
+<p>Subword wins: a misspelling such as "sourdogh" splits into a few known pieces and still lands near "sourdough", while a pure word vocabulary would map it to an unknown token. The lexical branch stays word-based because posting lists are keyed by whole terms, and misspellings are fixed earlier by the spelling corrector (see Serving).</p>
+<p><b>Video preprocessing.</b> A 10-minute video at 30 fps has 18,000 frames. Encoding all of them is wasteful because neighboring frames are nearly identical. The standard approach is to decode, sample a small fixed number of frames, resize and normalize them, and stack them into a tensor. In parallel, the audio track goes through ASR to produce a transcript that becomes one more indexed text field.</p>
+<script type="application/json" class="dg" data-cap="Video preprocessing: decode, sample 16 frames, normalize into a tensor; the audio branch runs ASR and feeds the text index">
+{"type":"graph","cols":5,
+ "nodes":[
+  {"id":"v","t":"Video file","s":"10 min, 30 fps, 18,000 frames","c":0,"r":0,"k":"io"},
+  {"id":"dec","t":"Decode","s":"keyframes first","c":1,"r":0},
+  {"id":"smp","t":"Uniform sampling","s":"16 frames","c":2,"r":0},
+  {"id":"rs","t":"Resize, normalize","s":"224 by 224","c":3,"r":0},
+  {"id":"tn","t":"Frame tensor","s":"16 x 3 x 224 x 224","c":4,"r":0,"k":"vec"},
+  {"id":"au","t":"Audio track","c":1,"r":1,"k":"data"},
+  {"id":"asr","t":"ASR","s":"speech to text","c":2,"r":1,"k":"model"},
+  {"id":"tr","t":"Transcript","s":"indexed text field","c":3,"r":1,"k":"data"}],
+ "edges":[["v","dec"],["dec","smp"],["smp","rs"],["rs","tn"],["v","au","audio",{"sa":"b","sb":"l"}],["au","asr"],["asr","tr"]]}
+</script>
+<p>Sampling choices matter more than they look. Uniform sampling (16 frames spread evenly) is the cheap default, but it can miss short events, and it treats a 30-second clip and a 3-hour stream identically. Better options are scene-change-aware sampling (take one frame per shot) and, for long videos, indexing several segment vectors per video, for example one per few minutes up to a cap, and taking the best segment score at query time. The capacity math below assumes one vector per video; segment vectors multiply that cost.</p>
+<div class="callout warn"><p>Do not sample frames at a fixed rate such as one per second without a cap. A 3-hour livestream would yield 10,800 frames to encode, and one pathological upload can dominate your indexing cluster for hours. Always cap frames per video and per segment.</p></div>
+
+<h3>Labels</h3>
+<p>The supervision for both the retriever and the ranker comes from logs. The table compares the available sources.</p>
+<table>
+<caption>Label sources compared</caption>
+<tr><th>Source</th><th>Pros</th><th>Cons</th><th>Use</th></tr>
+<tr><td>Click</td><td>Plentiful; immediate</td><td>Clickbait inflates it; strongly position-biased; says nothing about satisfaction</td><td>Weak positive only</td></tr>
+<tr><td>Click plus qualified watch</td><td>Cleaner relevance proxy; filters bounces</td><td>Biased toward long videos; delayed; noisy for background-listening</td><td>Main training positive</td></tr>
+<tr><td>Human ratings</td><td>Highest quality; graded</td><td>Small, expensive, stale</td><td>Evaluation and calibration, not bulk training</td></tr>
+</table>
+<p>We define a <b>qualified watch</b> as a click followed by watch time of at least min(30 s, 50% of the video length). The min() keeps short videos from being impossible to qualify and long videos from needing a huge watch. Examples from the log above: the click on v2 with 310 s of a 340 s video is a qualified watch; the click on v1 with 12 s of a 612 s video is a bounce.</p>
+<script type="application/json" class="dg" data-cap="Turning an impression into a training label: qualified watch becomes the positive, bounces become weak labels (or are dropped) and skipped-but-seen results become negatives, and unseen results get no label">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"imp","t":"Result shown","s":"query, video, position","c":0,"r":0,"k":"io"},
+  {"id":"clk","t":"Clicked?","c":1,"r":0},
+  {"id":"wat","t":"Qualified watch?","s":"at least min(30 s, 50%)","c":2,"r":0},
+  {"id":"pos","t":"Positive","s":"weight by 1 / propensity","c":3,"r":0,"k":"io"},
+  {"id":"uns","t":"Ignored","s":"below the fold, no label","c":0,"r":1,"k":"data"},
+  {"id":"neg","t":"Negative","s":"seen but skipped","c":1,"r":1,"k":"data"},
+  {"id":"bnc","t":"Weak label or drop","s":"bounce after a click","c":2,"r":1,"k":"data"}],
+ "edges":[["imp","clk"],["clk","wat","yes"],["wat","pos","yes",{"hl":1}],["imp","uns","not viewed",{"d":1,"sa":"b","sb":"t"}],["clk","neg","no",{"sa":"b","sb":"t"}],["wat","bnc","no",{"sa":"b","sb":"t"}]]}
+</script>
+<p><b>Position bias.</b> Users click rank 1 far more than rank 5 even when rank 5 is equally good. A click at a low position is therefore stronger evidence than a click at the top. Inverse propensity weighting corrects for it by weighting each positive by one over the probability that its position was examined. Propensities are estimated from a small randomization experiment (for example swapping adjacent results in a fraction of traffic), as in the unbiased learning-to-rank literature.</p>
+<div class="callout math"><p>If the examination probability at position 1 is 1.0 and at position 5 is 0.35, a positive at position 5 gets weight 1 / 0.35 = 2.86 while one at position 1 keeps weight 1.0. Weights are clipped (for example at 10) to prevent a few rare clicks from dominating the gradient.</p></div>
+<p><b>Noise and delay.</b> Clickbait survives the qualified-watch filter when the video itself is also engaging, so add a text-video agreement check: drop positives whose title has low similarity to the query under a small baseline model. Watch time arrives late (the video must be watched), so the training window ends a day or two before the data cutoff. <b>Selection bias</b> also bites: we only see logs for videos the current system showed, so a new model never learns about good videos the old one ranked low. Reserve a small exploration slice (for example 0.5% of traffic gets one randomized slot) to gather unbiased data.</p>
+
+<h2>Model Development</h2>
+<h3>Text retriever: inverted index and BM25</h3>
+<p>The lexical retriever is a mature, training-free component. An inverted index maps each term to a posting list of the videos that contain it, with per-document term frequency. At query time we fetch the posting lists of the query terms, combine them, and score with BM25. BM25 rewards a term that is frequent in the document (with saturation), rare in the corpus (high IDF), and discounts long documents, using two knobs usually set to k1 around 1.2 and b around 0.75.</p>
+<script type="application/json" class="dg" data-cap="Inverted index lookup for the query sourdough starter: terms map to posting lists of video ids with term frequency; the scorer unions them and v2, which matches both terms, ranks first">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"t1","t":"sourdough","s":"query term","c":0,"r":0,"k":"data"},
+  {"id":"t2","t":"starter","s":"query term","c":0,"r":1,"k":"data"},
+  {"id":"p1","t":"Posting list","s":"v1:1, v2:1","c":1,"r":0,"k":"store"},
+  {"id":"p2","t":"Posting list","s":"v2:1","c":1,"r":1,"k":"store"},
+  {"id":"sc","t":"BM25 scorer","s":"union, score, sort","c":2,"r":0},
+  {"id":"fw","t":"Document stats","s":"lengths, field weights","c":2,"r":1,"k":"store"},
+  {"id":"out","t":"Top candidates","s":"v2, then v1","c":3,"r":0,"k":"io"}],
+ "edges":[["t1","p1"],["t2","p2"],["p1","sc"],["p2","sc"],["fw","sc","length norm",{"d":1,"sa":"t","sb":"b"}],["sc","out",{"hl":1}]]}
+</script>
+<p><b>Multi-field text.</b> A video has several text fields with very different reliability. Weight them instead of concatenating: a match in the title is stronger evidence of relevance than a match in a 2,000-word description full of links and boilerplate.</p>
+<table>
+<caption>Field weighting for the lexical retriever (starting weights, tuned later by the ranker)</caption>
+<tr><th>Field</th><th>Starting weight</th><th>Why</th><th>Risk</th></tr>
+<tr><td>Title</td><td>3.0</td><td>Short, curated, most precise</td><td>Clickbait wording</td></tr>
+<tr><td>Tags</td><td>2.0</td><td>Uploader intent, concise</td><td>Keyword stuffing</td></tr>
+<tr><td>Channel name</td><td>1.5</td><td>Navigational queries ("mkbhd review")</td><td>Common words in names</td></tr>
+<tr><td>Description</td><td>1.0</td><td>Long and informative</td><td>Boilerplate, links, promos</td></tr>
+<tr><td>ASR transcript</td><td>0.5</td><td>Covers what is actually said, even when metadata is thin</td><td>Recognition errors, filler talk</td></tr>
+</table>
+<p>The ASR field matters more than its low weight suggests: it is often the only text describing the content of a lecture or tutorial titled "Part 2". Speech models trained on large amounts of weakly supervised audio, such as Whisper, give usable transcripts for English at scale.</p>
+
+<h3>Cross-modal retriever: two towers</h3>
+<p>We follow the CLIP recipe: one encoder per modality, both projecting into the same space, trained so that matching pairs score higher than non-matching ones. The video tower reuses an image encoder per frame and then pools across time.</p>
+<script type="application/json" class="dg" data-cap="Text tower and video tower produce L2-normalized 256-d vectors; their cosine similarity is the retrieval score">
+{"type":"stack","cols":[
+ {"t":"Text tower","layers":[{"t":"Query text","s":"lowercased, at most 32 tokens"},{"t":"Subword tokenizer","s":"WordPiece ids, 30K vocabulary"},{"t":"Text transformer","s":"6 layers, pooled"},{"t":"Projection to 256-d","s":"text embedding","k":"model"}]},
+ {"t":"Video tower","layers":[{"t":"Sampled frames","s":"16 by 224 by 224"},{"t":"Frame encoder","s":"ViT-B/16, shared across frames"},{"t":"Temporal pooling","s":"mean, or small transformer"},{"t":"Projection to 256-d","s":"video embedding","k":"model"}]}],
+ "join":{"t":"Cosine similarity","s":"scaled by 1 / temperature"}}
+</script>
+<table>
+<caption>Options for the video tower</caption>
+<tr><th>Option</th><th>Idea</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Frame encoder plus mean pooling</td><td>Encode each frame with an image model; average the vectors</td><td>Cheap; reuses pretrained image-text models; simple to scale</td><td>Ignores order; cannot tell "sit down" from "stand up"</td></tr>
+<tr><td>Frame encoder plus temporal transformer</td><td>A small transformer over the frame vectors</td><td>Models order and importance of frames</td><td>More parameters and training data needed</td></tr>
+<tr><td>Video-native space-time attention</td><td>Attention across both space and time inside the encoder (Frozen in Time style)</td><td>Strongest temporal modelling; trains on images and videos together</td><td>Highest compute per video</td></tr>
+<tr><td>Cross-encoder over query and frames</td><td>Joint attention between words and frames</td><td>Most accurate scoring</td><td>No precompute, so unusable beyond a few dozen candidates</td></tr>
+</table>
+<p><b>Decision.</b> Frame encoder plus temporal pooling, initialized from a pretrained image-text model and fine-tuned on our pairs. Published comparisons such as CLIP4Clip contrast parameter-free mean pooling with sequential and cross-attention heads and show that a strong image-text backbone with simple pooling is a very competitive baseline, so add temporal modelling only where an ablation on your own long-video queries says it pays. Frozen in Time shows the other path: train a space-time encoder on images (as one-frame videos) and videos jointly. A cross-encoder can optionally re-score the top 20 to 50 if latency allows.</p>
+
+<h3>Training data and loss</h3>
+<p>Each training example is a (query, video) positive from the label rule above. The key trick is to get negatives for free from the batch. In a batch of N positive pairs, the video paired with query j is a negative for query i whenever i differs from j. That yields an N-by-N similarity matrix whose diagonal holds the true pairs.</p>
+<script type="application/json" class="dg" data-cap="Similarity matrix for a batch of 5 query-video pairs: the diagonal (outlined) should be the highest in each row and column; the off-diagonal cells are free negatives">
+{"type":"matrix","rl":"Text queries","cl":"Videos in the batch","rows":["sourdough","marathon","guitar","tiling","yoga"],"cols":["v1","v2","v3","v4","v5"],
+ "v":[[0.9,0.2,0.1,0.1,0.2],[0.2,0.8,0.1,0.2,0.4],[0.1,0.1,0.9,0.1,0.1],[0.2,0.2,0.1,0.7,0.1],[0.2,0.4,0.1,0.1,0.85]],"hl":"diag"}
+</script>
+<p>The loss is a symmetric softmax cross-entropy: for each query, treat the N videos as classes and ask the model to pick the right one, then do the same from each video over the queries, and average. A learned temperature scales the similarities so the softmax is sharp enough to learn from.</p>
+<div class="callout math"><p>One query against three videos, temperature 0.1. Similarities [0.62, 0.30, 0.10] become logits [6.2, 3.0, 1.0]. The exponentials are 492.8, 20.1 and 2.7 (sum 515.6), so the correct video gets probability 492.8 / 515.6 = 0.956 and the loss is -ln 0.956 = 0.045. If the model had ranked the true video second (similarities [0.30, 0.62, 0.10], the true video being the first), the true video's probability drops to 20.1 / 515.6 = 0.039 and the loss jumps to -ln 0.039 = 3.24. Larger batches mean more negatives per example and a harder task, which is why CLIP-style training uses very large batches.</p></div>
+<p>In-batch negatives are mostly easy ("tiling" vs a yoga video). Better models need <b>hard negatives</b>: videos shown for the query that users skipped, and near-misses the lexical retriever ranks high but that were not clicked. Hard negatives bring a risk: a video that users skipped may still be relevant (they never saw it, or a duplicate got the click). Filter candidates using the human-rated set and a high-confidence relevance model before treating them as negatives.</p>
+<script type="application/json" class="dg" data-cap="Negative sampling: the positive pair, free in-batch negatives and filtered hard negatives all pass through the shared encoders into one contrastive loss">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"pos","t":"Positive pair","s":"query + qualified-watch video","c":0,"r":0,"k":"data"},
+  {"id":"inb","t":"In-batch negatives","s":"other videos in the batch","c":0,"r":1,"k":"data"},
+  {"id":"hard","t":"Hard negatives","s":"skipped, or BM25 near-misses","c":0,"r":2,"k":"data"},
+  {"id":"fil","t":"False-negative filter","s":"drop likely relevant","c":1,"r":2},
+  {"id":"enc","t":"Dual encoders","s":"shared training step","c":1,"r":1,"k":"model"},
+  {"id":"sim","t":"Similarity logits","s":"N by N and extras","c":2,"r":1,"k":"vec"},
+  {"id":"loss","t":"Contrastive loss","s":"softmax cross-entropy","c":3,"r":1}],
+ "edges":[["pos","enc"],["inb","enc"],["hard","fil"],["fil","enc"],["enc","sim"],["sim","loss",{"hl":1}]]}
+</script>
+<div class="callout warn"><p>Beware false negatives inside the batch. If "sourdough bread" and "sourdough starter" queries land in the same batch, each one's positive video is a perfectly good answer to the other, yet the loss pushes them apart. Deduplicate near-identical queries per batch, or group similar queries so they never co-occur.</p></div>
+
+<h3>Fusion layer and final ranking</h3>
+<p>Each retriever returns about 300 candidates. Their raw scores are not comparable: BM25 is unbounded (for example 14.2) while cosine lives in [-1, 1] (for example 0.31). The recall gain from merging them is large because each retriever surfaces videos the other misses.</p>
+<script type="application/json" class="dg" data-cap="Illustrative recall@k: the union of the two retrievers' top-k lists reaches higher recall than either alone, for every k">
+{"type":"curve","xl":"k (candidates taken from each retriever)","yl":"Recall@k","xmax":500,"ymax":1,"ticks":5,
+ "series":[
+  {"n":"Hybrid (union)","c":0,"lp":4,"pts":[[0,0],[10,0.36],[50,0.65],[100,0.79],[300,0.86],[500,0.89]]},
+  {"n":"Text only","c":1,"lp":4,"pts":[[0,0],[10,0.30],[50,0.52],[100,0.61],[300,0.69],[500,0.72]]},
+  {"n":"Cross-modal only","c":2,"d":1,"lp":2,"pts":[[0,0],[10,0.22],[50,0.46],[100,0.57],[300,0.69],[500,0.74]]}],
+ "marks":[{"x":100,"y":0.79,"t":"hybrid at k=100"}]}
+</script>
+<table>
+<caption>Ways to fuse the two candidate lists</caption>
+<tr><th>Method</th><th>How</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Weighted score sum</td><td>w1 * BM25 + w2 * cosine</td><td>Simple</td><td>Scores on different scales; weights drift when models change</td></tr>
+<tr><td>Reciprocal rank fusion (RRF)</td><td>Sum of 1 / (k + rank) across lists</td><td>No score calibration; robust; no training</td><td>Ignores score margins; treats retrievers equally</td></tr>
+<tr><td>Cascade</td><td>Text filter, then semantic rerank (or the reverse)</td><td>Cheap</td><td>The first stage caps recall of the second</td></tr>
+<tr><td>Learning to rank</td><td>Model over many features, including both scores and the RRF rank</td><td>Best quality; can use freshness, quality, match features</td><td>Needs labels and monitoring</td></tr>
+</table>
+<p>RRF scores each video as the sum, over the lists in which it appears, of 1 / (k + rank), with k = 60 as the commonly used constant from the original paper. A video near the top of both lists beats a video that tops only one, and nobody needs to compare BM25 with cosine.</p>
+<script type="application/json" class="dg" data-cap="RRF worked example with k=60, scores multiplied by 1000: video A (rank 1 text, rank 2 cross-modal) wins narrowly over C (rank 3 text, rank 1 cross-modal); single-list videos trail">
+{"type":"bars","horiz":true,"labels":["A: text 1, cross 2","C: text 3, cross 1","B: text 2 only","E: cross 3 only","D: text 4 only","F: cross 5 only"],
+ "series":[{"n":"RRF score x 1000","v":[32.5,32.3,16.1,15.9,15.6,15.4]}],"max":40}
+</script>
+<div class="callout math"><p>Text list: A, B, C, D (ranks 1 to 4). Cross-modal list: C, A, E, F (C at 1, A at 2, E at 3, F at 5 after a duplicate at rank 4 was filtered out). With k = 60: A = 1/61 + 1/62 = 0.01639 + 0.01613 = 0.03252. C = 1/63 + 1/61 = 0.01587 + 0.01639 = 0.03227. B = 1/62 = 0.01613. E = 1/63 = 0.01587. D = 1/64 = 0.01563. F = 1/65 = 0.01538. Merged order: A, C, B, E, D, F. Larger k flattens the differences between ranks; smaller k makes the top ranks dominate.</p></div>
+<p><b>Decision.</b> Use RRF as the baseline merger and as the fallback when the ranker is unavailable, and a learning-to-rank model as the final ranker. LambdaMART (boosted trees trained with a ranking objective) is the practical default: it handles heterogeneous features, trains on lists grouped by query, and its gradients are scaled by how much swapping two results would change nDCG, so mistakes near the top cost more than mistakes lower down.</p>
+<script type="application/json" class="dg" data-cap="The learning-to-rank stage consumes retrieval scores, match features, video quality and query features, scores about 600 candidates, and a policy and diversity pass produces the page">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"f1","t":"Retrieval scores","s":"BM25 per field, cosine, RRF rank","c":0,"r":0,"k":"data"},
+  {"id":"f2","t":"Match features","s":"term overlap, exact phrase","c":0,"r":1,"k":"data"},
+  {"id":"f3","t":"Video quality","s":"qualified-watch rate, age, likes","c":0,"r":2,"k":"data"},
+  {"id":"f4","t":"Query features","s":"length, intent, head or tail","c":0,"r":3,"k":"data"},
+  {"id":"asm","t":"Feature assembly","s":"cache lookup, joins","c":1,"r":1},
+  {"id":"ltr","t":"LambdaMART ranker","s":"scores each candidate","c":2,"r":1,"k":"model"},
+  {"id":"pol","t":"Policy and diversity","s":"blocked flag, dedupe, channel cap","c":3,"r":1},
+  {"id":"top","t":"Top 20 videos","c":3,"r":2,"k":"io"}],
+ "edges":[["f1","asm"],["f2","asm"],["f3","asm"],["f4","asm"],["asm","ltr"],["ltr","pol",{"hl":1}],["pol","top"]]}
+</script>
+<p>Training labels for the ranker are graded from the logs: 3 for a qualified watch, 1 for a click without a qualified watch (a weak signal that still beats no click), 0 for a seen but skipped result, with propensity weights for position. The human-rated set is not used to train; it checks that the learned ranker does not drift from true relevance.</p>
+
+<h2>Evaluation</h2>
+<h3>Offline metrics</h3>
+<p>Use different metrics for the two stages. Retrieval needs a recall-style metric over a large cutoff; the final ranking needs order-sensitive metrics at the top of the page. For each metric the table gives the definition, a hand-checkable example, the flaw, and the decision.</p>
+<table>
+<caption>Offline metrics: definition, example, flaw, decision</caption>
+<tr><th>Metric</th><th>Definition</th><th>Example</th><th>Flaw</th><th>Decision</th></tr>
+<tr><td>Precision@k</td><td>Relevant results in the top k, divided by k</td><td>3 relevant in top 5: 3/5 = 0.6</td><td>Ignores order inside the top k; needs binary labels</td><td>Report as a sanity check only</td></tr>
+<tr><td>Recall@k</td><td>Relevant videos found in the top k, divided by all relevant videos</td><td>4 relevant exist; 3 are in the top 100: 0.75</td><td>Needs the full set of relevant items, which the rated pool only approximates</td><td>Use for each retriever and the fused candidate list (k about 100 to 500)</td></tr>
+<tr><td>MRR</td><td>Mean over queries of 1 / rank of the first relevant result</td><td>First hits at ranks 1, 3, 2: (1 + 0.333 + 0.5) / 3 = 0.611</td><td>Looks only at the first hit; ignores the rest of the list</td><td>Use for navigational queries where one video is the answer</td></tr>
+<tr><td>mAP</td><td>Mean over queries of average precision at each relevant hit</td><td>Relevant at ranks 1 and 3, two relevant total: (1/1 + 2/3) / 2 = 0.833</td><td>Binary relevance only; rewards completeness the page cannot show</td><td>Do not use as primary; helpful for diagnosing recall</td></tr>
+<tr><td>nDCG@k</td><td>Discounted gain of the ranking divided by the best possible ordering</td><td>See worked example: 0.957</td><td>Needs graded labels; sensitive to the grading scale</td><td>Primary ranking metric, at k = 10</td></tr>
+</table>
+<div class="callout math"><p>nDCG@5 by hand. The five results have grades [3, 2, 3, 0, 1]. Gain of a grade g is 2^g - 1 and the position discount is 1 / log2(i + 1). DCG = 7/1 + 3/1.585 + 7/2 + 0/2.322 + 1/2.585 = 7 + 1.893 + 3.5 + 0 + 0.387 = 12.780. The ideal order of the same five videos is [3, 3, 2, 1, 0]: IDCG = 7 + 7/1.585 + 3/2 + 1/2.322 + 0 = 7 + 4.417 + 1.5 + 0.431 = 13.347. nDCG@5 = 12.780 / 13.347 = 0.957. The loss comes almost entirely from placing the grade-2 video ahead of a grade-3 one.</p></div>
+<script type="application/json" class="dg" data-cap="Illustrative offline comparison of three systems on the human-rated set: the hybrid with a learned ranker wins on retrieval recall and on both ranking metrics">
+{"type":"bars","labels":["Recall@100","MRR","nDCG@10"],
+ "series":[{"n":"Text only","v":[0.61,0.41,0.52]},{"n":"Cross-modal only","v":[0.57,0.36,0.47]},{"n":"Hybrid + LTR","v":[0.79,0.55,0.66]}],"max":1}
+</script>
+<p><b>Slices matter.</b> Report every metric by query class (head, torso, tail; navigational versus how-to), because a gain on head queries can hide a regression on rare ones. The lexical retriever usually dominates the head and the embedding retriever the tail.</p>
+
+<h3>Online metrics</h3>
+<table>
+<caption>Online and guardrail metrics</caption>
+<tr><th>Metric</th><th>Definition</th><th>What it tells you</th><th>Watch out for</th></tr>
+<tr><td>Click-through rate</td><td>Searches with at least one click, divided by searches</td><td>Whether results look relevant</td><td>Clickbait raises it while hurting satisfaction</td></tr>
+<tr><td>Qualified-watch rate</td><td>Searches followed by a qualified watch, divided by searches</td><td>Primary success metric</td><td>Favors long videos; track watch time separately</td></tr>
+<tr><td>Reformulation rate</td><td>Searches followed by another query within a minute</td><td>User did not find the answer</td><td>Some reformulation is healthy exploration</td></tr>
+<tr><td>Abandonment rate</td><td>Searches with no click and no follow-up</td><td>Total failure</td><td>Also happens when the snippet already answered</td></tr>
+<tr><td>Time to first qualified watch</td><td>Seconds from results shown to start of qualified watch</td><td>Speed of success</td><td>Biased by page layout changes</td></tr>
+<tr><td>Guardrails: p50/p99 latency, zero-result rate, report rate</td><td>Operational and trust measures</td><td>Does the win cost latency or trust</td><td>A p99 regression kills mobile users first</td></tr>
+</table>
+<script type="application/json" class="dg" data-cap="Illustrative online funnel per 1,000 searches: impression, click, then qualified watch (the success event we optimize)">
+{"type":"funnel","stages":[
+ {"t":"Searches with results shown","s":"impression","n":"1,000","m":"100%"},
+ {"t":"At least one click","s":"result looked relevant","n":"650","m":"65%"},
+ {"t":"Qualified watch","s":"at least min(30 s, 50% of video)","n":"380","m":"38%"}]}
+</script>
+<div class="callout tip"><p>Interviewers like the "offline-online mismatch" answer. Offline nDCG is measured against raters who judge topical relevance; users also care about quality, recency and watchability. A model can improve nDCG by two points and leave qualified-watch flat, or lift CTR by promoting clickbait and hurt completions. Say that you gate launches on online metrics and use offline metrics for fast iteration and as a regression test.</p></div>
+<p><b>A/B test pitfalls.</b> Randomize by user, not by query, so each user has a consistent experience. Key every cache by experiment arm, otherwise the control arm's cached results leak into the treatment arm. Run at least one to two weeks to cover weekly seasonality and the novelty effect. Check the ratio of users in each arm (sample ratio mismatch). Interleaving experiments, which mix results from two rankers into one list and credit the clicks, detect ranking differences with far fewer queries and make a good first online stage before a full A/B.</p>
+
+<h2>Serving</h2>
+<p>The assumptions behind the numbers in this section are collected in one table so they can be challenged.</p>
+<table>
+<caption>Capacity assumptions and estimates</caption>
+<tr><th>Quantity</th><th>Assumption or arithmetic</th><th>Result</th></tr>
+<tr><td>Videos</td><td>Given</td><td>10 billion</td></tr>
+<tr><td>Searches per day, average QPS, peak QPS</td><td>1B / 86,400 s; peak 3 times average</td><td>11.6K avg; about 35K peak</td></tr>
+<tr><td>Raw embeddings</td><td>10B x 256 dims x 2 bytes (fp16)</td><td>5.12 TB</td></tr>
+<tr><td>ANN index (product quantized)</td><td>10B x (64-byte code + 8-byte id)</td><td>720 GB, 100 shards of 7.2 GB</td></tr>
+<tr><td>Text for the inverted index</td><td>10B x about 6.5 KB (metadata plus ASR); index about 40% of raw</td><td>65 TB raw, about 26 TB indexed</td></tr>
+<tr><td>Query vectors computed online</td><td>One short text through a 6-layer transformer on CPU</td><td>About 8 ms</td></tr>
+</table>
+<h3>Prediction pipeline</h3>
+<script type="application/json" class="dg" data-cap="Online request path: query understanding, two parallel retrievers, then fusion and ranking; index stores are built offline and read-only here">
+{"type":"graph","cols":5,
+ "groups":[{"t":"Online request path","c0":0,"c1":4,"r0":1,"r1":2}],
+ "nodes":[
+  {"id":"inv","t":"Inverted index","s":"sharded by video id","c":2,"r":0,"k":"store"},
+  {"id":"q","t":"Text query","c":0,"r":1,"k":"io"},
+  {"id":"qu","t":"Query understanding","s":"spell, language, intent","c":1,"r":1},
+  {"id":"txt","t":"Text search","s":"BM25, top 300","c":2,"r":1},
+  {"id":"fuse","t":"Fusion + ranker","s":"RRF then LambdaMART","c":3,"r":1,"k":"model"},
+  {"id":"res","t":"Ranked videos","c":4,"r":1,"k":"io"},
+  {"id":"ann","t":"Embedding + ANN","s":"encode query, top 300","c":2,"r":2,"k":"model"},
+  {"id":"ais","t":"ANN index","s":"100 shards","c":2,"r":3,"k":"store"}],
+ "edges":[["q","qu"],["qu","txt"],["qu","ann"],["txt","fuse"],["ann","fuse"],["fuse","res",{"hl":1}],["inv","txt","reads",{"d":1}],["ais","ann","reads",{"d":1}]]}
+</script>
+<p>The two retrievers run in parallel, so the critical path is the slower of the two, not the sum.</p>
+<table>
+<caption>Latency budget on the critical path (illustrative, p50)</caption>
+<tr><th>Step</th><th>Budget</th><th>Notes</th></tr>
+<tr><td>Edge, routing, query understanding</td><td>20 ms</td><td>Cached dictionaries for spelling</td></tr>
+<tr><td>Retrieval (parallel): text 40 ms, or encode 8 ms + ANN 40 ms</td><td>48 ms</td><td>Slower branch wins; fan-out to shards</td></tr>
+<tr><td>Fusion (RRF)</td><td>5 ms</td><td>Merge about 600 ids</td></tr>
+<tr><td>Feature fetch</td><td>15 ms</td><td>Batched key-value lookup</td></tr>
+<tr><td>LambdaMART scoring</td><td>25 ms</td><td>About 600 candidates, a few hundred trees</td></tr>
+<tr><td>Policy filter, snippet and thumbnail hydration</td><td>30 ms</td><td>Mostly cache reads</td></tr>
+<tr><td>Network overhead</td><td>20 ms</td><td></td></tr>
+<tr><td><b>Total (sum of 20 + 48 + 5 + 15 + 25 + 30 + 20)</b></td><td><b>163 ms</b></td><td>p99 target 400 ms using hedged requests</td></tr>
+</table>
+<h3>Query understanding</h3>
+<p>Before retrieval, the raw string goes through a short pipeline. Spelling correction uses the query log: candidate corrections within a small edit distance are ranked by how often they are typed, so "sourdogh starter" becomes "sourdough starter" when the corrected form is far more frequent. Auto-correct only above a confidence threshold, and otherwise show "Did you mean". Language detection routes non-English queries to a fallback. An intent classifier distinguishes navigational queries (a channel or a specific title) from topical and how-to ones, which changes the ranker's feature weights, and entity tagging boosts channel and name matches.</p>
+<script type="application/json" class="dg" data-cap="Query understanding: spell correction backed by the query log, language check, intent classification with trend signals, producing a rewritten query plus flags for the retrievers and ranker">
+{"type":"graph","cols":5,
+ "nodes":[
+  {"id":"raw","t":"Raw query","c":0,"r":0,"k":"io"},
+  {"id":"sp","t":"Spell correction","s":"edit distance, frequency","c":1,"r":0},
+  {"id":"lg","t":"Language check","s":"English or fallback","c":2,"r":0},
+  {"id":"it","t":"Intent classifier","s":"navigational, how-to, topical","c":3,"r":0,"k":"model"},
+  {"id":"out","t":"Rewritten query","s":"plus flags","c":4,"r":0,"k":"io"},
+  {"id":"ql","t":"Query log","s":"term frequencies","c":1,"r":1,"k":"store"},
+  {"id":"tr","t":"Trend signals","s":"rising queries","c":3,"r":1,"k":"store"}],
+ "edges":[["raw","sp"],["sp","lg"],["lg","it"],["it","out",{"hl":1}],["ql","sp",{"d":1}],["tr","it",{"d":1}]]}
+</script>
+<h3>Indexing pipelines</h3>
+<p>Both indexes are built offline, as a streaming job per upload. The video path decodes and samples frames, runs the video tower, stores the vector in an embedding store, and appends it to the ANN index. The text path runs ASR on the audio, merges the transcript with the metadata, analyzes each field (normalize, tokenize, stem), and writes to the inverted index.</p>
+<script type="application/json" class="dg" data-cap="Offline indexing: a video pipeline (frames, encoder, ANN index) and a text pipeline (ASR and metadata into the inverted index) run independently on each new upload">
+{"type":"graph","cols":5,
+ "groups":[{"t":"Video indexing pipeline","c0":0,"c1":4,"r0":0,"r1":0},{"t":"Text indexing pipeline","c0":0,"c1":4,"r0":1,"r1":1}],
+ "nodes":[
+  {"id":"up","t":"New upload","s":"event stream","c":0,"r":0,"k":"io"},
+  {"id":"fr","t":"Frame sampler","s":"16 frames","c":1,"r":0},
+  {"id":"ve","t":"Video encoder","s":"GPU batch inference","c":2,"r":0,"k":"model"},
+  {"id":"es","t":"Embedding store","s":"id to 256-d vector","c":3,"r":0,"k":"store"},
+  {"id":"ai","t":"ANN index","s":"delta, then merge","c":4,"r":0,"k":"store"},
+  {"id":"as","t":"ASR","s":"audio to transcript","c":0,"r":1,"k":"model"},
+  {"id":"md","t":"Text fields","s":"metadata + transcript","c":1,"r":1,"k":"data"},
+  {"id":"an","t":"Analyzer","s":"normalize, stem","c":2,"r":1},
+  {"id":"iw","t":"Index writer","s":"near real time","c":3,"r":1},
+  {"id":"ii","t":"Inverted index","s":"segments","c":4,"r":1,"k":"store"}],
+ "edges":[["up","fr"],["fr","ve"],["ve","es"],["es","ai"],["up","as","audio",{"sa":"b","sb":"t"}],["up","md","metadata",{"sa":"b","sb":"t"}],["as","md","text"],["md","an"],["an","iw"],["iw","ii"]]}
+</script>
+<p><b>Index update latency.</b> Metadata reaches the inverted index within about a minute, so a new video is findable by its title almost immediately. Frame encoding waits for transcoding and is assumed to take a few minutes, and ASR plus its text indexing perhaps ten to fifteen minutes, so content-only matches lag. New vectors go into a small delta index searched together with the big one and merged during a nightly compaction.</p>
+<h3>ANN sharding</h3>
+<p>A 720 GB quantized index does not fit on one machine, so it is partitioned. The simplest scheme is random (hash) sharding: every shard holds an equal slice, a broker fans out each query to all 100 shards, each returns its local top-k, and the broker merges. Cluster-based sharding routes a query to only the nearest 10 to 20 shards, cutting compute, but creates hot shards and complicates rebalancing, and recall depends on the router. Within each shard, an IVF or graph index (for example HNSW) with product quantization gives milliseconds per query at the cost of a small recall loss.</p>
+<script type="application/json" class="dg" data-cap="ANN sharding: a broker fans the query vector out to every shard (hash-partitioned), each shard returns its local top-k, and the broker merges the lists into the global top 300">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"qv","t":"Query vector","s":"256-d","c":0,"r":1,"k":"vec"},
+  {"id":"br","t":"Broker","s":"fan-out, hedged requests","c":1,"r":1},
+  {"id":"s1","t":"Shard 1","s":"IVF-PQ, 100M vectors","c":2,"r":0,"k":"store"},
+  {"id":"s2","t":"Shard 2","s":"IVF-PQ, 100M vectors","c":2,"r":1,"k":"store"},
+  {"id":"s3","t":"Shard 100","s":"IVF-PQ, 100M vectors","c":2,"r":2,"k":"store"},
+  {"id":"mg","t":"Merge top-k","s":"global top 300","c":3,"r":1,"k":"io"}],
+ "edges":[["qv","br"],["br","s1","query"],["br","s2"],["br","s3"],["s1","mg","local top-k"],["s2","mg"],["s3","mg"]]}
+</script>
+<div class="callout math"><p>Compute for the vector side. Peak 35K QPS with a 40% cache hit rate sends 21K QPS to retrieval. Fan-out to all 100 shards makes 2.1 million shard-queries per second. At an assumed 5 ms of CPU each, that is 10,500 core-seconds per second, so about 10,500 cores before replication and headroom. Cluster-based routing to 15 shards would cut this to about 1,600 cores, at the price of router-recall loss and hot spots.</p></div>
+<h3>Caching popular queries</h3>
+<p>Because results are not personalized, they can be cached. A result cache keyed by the normalized query plus region and safe-search flags stores the final ranked ids, with a short TTL for trending queries (minutes) and a longer one for stable ones (an hour or more) plus invalidation on policy takedowns. A second, cheap cache stores query embeddings so the encoder is skipped for repeats. The hit rate follows the heavy tail of search traffic: a small number of head queries account for a large share of volume, but there is always a tail. Search engines have publicly said that a sizeable fraction of daily queries, on the order of 15%, have never been seen before.</p>
+<script type="application/json" class="dg" data-cap="Illustrative result-cache hit rate versus number of cached queries: gains slow down sharply because of the long tail of rare queries">
+{"type":"bars","horiz":true,"labels":["100K queries","1M queries","10M queries","100M queries"],
+ "series":[{"n":"Hit rate (%)","v":[15,27,40,51]}],"max":60}
+</script>
+<div class="callout math"><p>Effect of the cache at a 40% hit rate (10M entries). Backend load drops to (1 - 0.40) x 35K = 21K QPS. Mean latency with a 5 ms hit and a 163 ms miss is 0.40 x 5 + 0.60 x 163 = 2 + 97.8 = about 100 ms, down from 163 ms. Raising the hit rate to 50% would reduce the backend to 17.5K QPS and the mean to 84 ms, but only by caching far more of the tail, with diminishing returns.</p></div>
+<h3>Freshness and trending</h3>
+<p>Nightly rebuilds are too slow for breaking news. A fast path indexes new uploads and recent signals into a small real-time index that is searched together with the main index and merged at query time. Queries whose volume spikes are detected from the log stream; for them, cache TTLs shrink and a recency feature is boosted in the ranker. The main index absorbs these videos at the next compaction.</p>
+<script type="application/json" class="dg" data-cap="Freshness path: new uploads stream into a small real-time index that is queried together with the big batch index; compaction later folds them into the batch index">
+{"type":"graph","cols":5,
+ "nodes":[
+  {"id":"up","t":"New upload","c":0,"r":0,"k":"io"},
+  {"id":"st","t":"Event stream","s":"minutes","c":1,"r":0},
+  {"id":"fi","t":"Fast indexer","s":"metadata first","c":2,"r":0},
+  {"id":"rt","t":"Real-time index","s":"hours of data, in memory","c":3,"r":0,"k":"store"},
+  {"id":"mg","t":"Merge at query time","s":"plus recency boost","c":4,"r":0,"k":"model"},
+  {"id":"bi","t":"Batch index","s":"nightly compaction","c":3,"r":1,"k":"store"}],
+ "edges":[["up","st"],["st","fi"],["fi","rt"],["rt","mg"],["bi","mg"],["rt","bi","compaction",{"d":1,"sa":"b","sb":"t"}]]}
+</script>
+<h3>Failure modes and fallbacks</h3>
+<p>Each dependency gets a deadline and a circuit breaker, and the service returns the best answer it can instead of an error.</p>
+<script type="application/json" class="dg" data-cap="Graceful degradation ladder: each step trades quality for availability when a dependency exceeds its deadline">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"l0","t":"Full hybrid + LTR","s":"normal path","c":0,"r":0,"k":"model"},
+  {"id":"l1","t":"Hybrid + RRF","s":"no learned ranker","c":1,"r":0},
+  {"id":"l2","t":"One retriever","s":"text or ANN alone","c":2,"r":0},
+  {"id":"l3","t":"Cached or popular","s":"stale but available","c":3,"r":0,"k":"store"},
+  {"id":"hr","t":"Hedged requests","s":"second replica after p95","c":1,"r":1,"k":"data"},
+  {"id":"cb","t":"Circuit breakers","s":"per dependency","c":2,"r":1,"k":"data"}],
+ "edges":[["l0","l1","ranker slow"],["l1","l2","one side down"],["l2","l3","all slow"],["hr","l1",{"d":1}],["cb","l2",{"d":1}]]}
+</script>
+<table>
+<caption>Failure mode and response</caption>
+<tr><th>Failure</th><th>Response</th><th>Quality impact</th></tr>
+<tr><td>Ranker or feature store slow</td><td>Serve RRF order</td><td>Moderate loss in order quality</td></tr>
+<tr><td>ANN shards partly down</td><td>Merge available shards, mark partial</td><td>Small recall loss</td></tr>
+<tr><td>Text search down</td><td>Embedding-only results</td><td>Weaker on exact names</td></tr>
+<tr><td>Both retrievers slow</td><td>Cached results for the normalized query, else popular videos</td><td>Large, but a page is shown</td></tr>
+<tr><td>Spell correction wrong</td><td>Show the original query's results and a "Did you mean" link</td><td>Low</td></tr>
+</table>
+<h3>Model refresh, re-embedding and monitoring</h3>
+<p>The ranker retrains weekly on the latest logs; the two-tower model retrains monthly or when offline gates say so. An encoder upgrade changes the embedding space, so query vectors from the new model cannot search an index built by the old one. The safe pattern is blue-green: build a complete new index in the background, run the new query encoder against it in shadow traffic, then switch both together. Re-embedding cost, as an assumption: 10B videos x 16 frames = 160B frame passes; at 2,000 frames per GPU-second that is 8 x 10^7 GPU-seconds, about 22,200 GPU-hours, or roughly 22 hours on 1,000 GPUs, plus the often larger cost of decoding video. Training the new model to stay aligned with the old space (so old vectors remain usable) avoids a full rebuild but constrains quality.</p>
+<p>Monitor: recall of ANN versus exact search on a sampled set (index health), score and embedding distribution drift, zero-result and reformulation rates, cache hit rate, and index freshness (age of the newest searchable upload). Re-run the human-rated set after each model or index change as a regression gate.</p>
+<table>
+<caption>Challenges and mitigations</caption>
+<tr><th>Challenge</th><th>Why it is hard</th><th>Mitigation</th></tr>
+<tr><td>Cold start for new videos</td><td>No watch history; stats are empty</td><td>Rely on content and text relevance; smoothed priors; small exploration boost</td></tr>
+<tr><td>Speed at 10B</td><td>Brute-force is impossible</td><td>Precomputed vectors, sharded ANN, parallel retrievers, caching</td></tr>
+<tr><td>Diversity</td><td>Near-duplicate re-uploads fill the page</td><td>Duplicate detection by embedding, per-channel caps</td></tr>
+<tr><td>Fairness to small creators</td><td>Popularity features entrench winners</td><td>Weight relevance over popularity; cap popularity features; audit by channel size</td></tr>
+<tr><td>Spam and clickbait</td><td>Gaming text fields and thumbnails</td><td>Content-based retriever, field caps, watch-based labels</td></tr>
+<tr><td>Privacy</td><td>Logs reveal queries and viewing habits</td><td>Anonymize and aggregate, retention limits, no personal features in training</td></tr>
+</table>
+
+<h2>Other Talking Points</h2>
+<ul>
+<li>Moment-level retrieval: search for a segment inside a long video using per-segment vectors and ASR timestamps, so a result can start at the right second; it matters because many queries are really "where in this video".</li>
+<li>Multilingual search: use a multilingual text encoder and transliteration, so queries in another language still map into the same video space.</li>
+<li>Personalization: add a user tower or user features in the ranker only, and keep retrieval shared; it matters because personalization defeats result caching.</li>
+<li>Autocomplete and "did you mean": a separate system trained on query logs, but its suggestions shape the distribution of queries the search sees.</li>
+<li>On-screen text (OCR) and audio events as extra fields; it matters for videos with slides, code or signage that no transcript captures.</li>
+<li>Debiasing the click logs with counterfactual learning and exploration traffic; it matters because the training data comes from the old ranker's choices.</li>
+<li>Safety and policy filters applied after ranking and in the cache; a takedown must also purge cached pages quickly.</li>
+<li>Distillation of the video encoder and the use of int8 or product-quantized embeddings; it matters because index memory and re-embedding cost scale with ten billion items.</li>
+<li>Query-level evaluation with interleaving, which needs far fewer impressions than a full A/B to detect a ranker improvement.</li>
+</ul>
+
+<h2 class="nonum">Check yourself</h2>
+<p class="qa-intro">Questions are tagged by the level they target. The first set checks Senior-level fundamentals and arithmetic; Staff and Principal questions probe trade-offs, operations, experimentation and organization. Try to answer aloud for two minutes before opening one.</p>
+<div class="qa-bar" data-qa></div>
+<details class="ans" data-lvl="sr"><summary>Why combine text search and embedding search instead of picking the better one?</summary>Their errors are mostly uncorrelated. Text search is precise on exact words and names and resistant to visually ambiguous content, but fails on vocabulary mismatch and on videos with thin metadata. The embedding retriever matches meaning and visual content but is fuzzy on rare entities and on videos that look static. The union reaches higher recall than either list, and the ranker uses features from both to order the merged set.</details>
+<details class="ans" data-lvl="sr"><summary>Compute the RRF score (k = 60) for a video at rank 2 in the text list and rank 5 in the cross-modal list, and compare it to a video at rank 1 in the text list only.</summary>The first video scores 1/62 + 1/65 = 0.01613 + 0.01538 = 0.03151. The second scores 1/61 = 0.01639. The video found by both retrievers wins even though it ranks lower in each list, which is the agreement effect RRF is designed to produce.</details>
+<details class="ans" data-lvl="sr"><summary>A ranking has grades [2, 3, 0] for its top three results. What is nDCG@3?</summary>DCG = (2^2 - 1)/1 + (2^3 - 1)/log2(3) + 0 = 3 + 7/1.585 = 3 + 4.417 = 7.417. The ideal order is [3, 2, 0]: IDCG = 7 + 3/1.585 = 7 + 1.893 = 8.893. nDCG@3 = 7.417 / 8.893 = 0.834. Swapping the top two results costs about 17% of the metric.</details>
+<details class="ans" data-lvl="sr"><summary>At 40K peak QPS, a cache with a 50% hit rate has a 4 ms hit and 160 ms miss. What are the backend load and the mean latency?</summary>Backend load is 0.5 x 40K = 20K QPS. Mean latency is 0.5 x 4 + 0.5 x 160 = 2 + 80 = 82 ms. Also state that p99 is dominated by misses, so the cache helps the mean and load far more than tail latency; hedged requests and degradation handle the tail.</details>
+<details class="ans" data-lvl="st"><summary>The new model improves offline nDCG@10 by 2 points but qualified-watch rate is flat in the A/B test. What could explain this and what would you do?</summary>Raters judge topical relevance; users also respond to freshness, video quality, length and watchability that the offline set does not measure. The offline set may also miss the slices where the model changed (for example tail queries), or position bias in logs inflated the offline signal. Check metrics by query slice, compare the human grades of the results that changed, inspect clickbait and duration shifts, and add features or labels that capture the missing aspect before shipping.</details>
+<details class="ans" data-lvl="st"><summary>You ship a better text-video encoder. How do you roll it out without downtime, and what does it cost?</summary>Query vectors from the new model live in a different space than the old index, so you rebuild the entire ANN index (blue-green): re-encode every video with the new video tower, build the new index in the background, test with shadow traffic and the human-rated regression set, then switch the query encoder and the index together. Under the stated assumptions the encode pass is about 160B frame passes, around 22,000 GPU-hours (decoding extra). A compatible-training approach that keeps the new space aligned to the old one avoids the rebuild at some cost in quality.</details>
+<details class="ans" data-lvl="st"><summary>The new model improves tail queries but regresses the head. Product wants one launch decision. How do you decide?</summary><p>Break results by query frequency and intent. Head queries are often navigational (a channel name, a famous video) and are served by caches and exact match, so a small regression there hits many users. Tail queries are where embeddings help most and where the aggregate metric hides little. Report an impact-weighted metric (by traffic) and a tail-equity metric (average over queries, so tail counts equally) and decide with a rule that was written before the test.</p><p>Do not accept a single blended number if slices move in opposite directions (the Simpson's paradox trap). Fix the regression: route by query class (keep lexical retrieval dominant for navigational queries), use class-aware fusion weights, or ship the model only for the tail class first. Validate with a stratified A/B test, then expand.</p><p class="probe"><b>Likely follow-ups:</b> How do you classify a query as head or navigational? &middot; What if the head regression is only in one language?</p><p class="signal"><b>What makes this Staff-level:</b> You make the decision rule explicit and use slices and routing to avoid an all-or-nothing launch.</p></details>
+<details class="ans" data-lvl="st"><summary>A user types "jaguar". How does the system handle ambiguity, and how do you evaluate it?</summary><p>Estimate an intent distribution for the query from logs (animal, car, band, a game) and retrieve for several intents instead of one. At re-rank, diversify when intent entropy is high (maximal marginal relevance or intent-aware methods), with personalization as a tie-breaker, not the main driver, so the same query behaves predictably. For low-entropy queries, skip diversification.</p><p>Evaluate with intent-aware metrics (alpha-nDCG or expected reciprocal rank with intents) on a judged set that includes ambiguous queries, plus online signals: reformulation rate, abandonment, and time to first qualified watch. Watch that diversification does not hurt clear queries.</p><p class="probe"><b>Likely follow-ups:</b> How would you build the intent distribution for a brand-new query? &middot; What is your guardrail against over-diversifying?</p><p class="signal"><b>What makes this Staff-level:</b> You treat ambiguity as a modeled quantity with its own metric, not a corner case.</p></details>
+<details class="ans" data-lvl="st"><summary>How would you use LLMs in this system without breaking latency or cost budgets?</summary><p>Offline first. Use an LLM to produce graded relevance labels for query-video pairs, calibrated against a human gold set (report agreement and known biases such as length preference), to generate synthetic queries for tail training, and to produce summaries and topics from transcripts for indexing. The online model stays small and fast; the LLM's knowledge is distilled into it.</p><p>Online only where the budget allows: rewrite rare queries with a cached LLM call (cache by normalized query), and re-rank the top 20 with a distilled cross-encoder if the latency math works. Keep a non-LLM fallback and a hard timeout. Evaluate with a human-checked sample, since an LLM judge can drift or agree with itself.</p><p class="probe"><b>Likely follow-ups:</b> What is the cache hit rate you need for the rewrite step to pay for itself? &middot; How do you detect that the LLM judge has drifted?</p><p class="signal"><b>What makes this Staff-level:</b> You place the expensive model where it is amortized and measured, and you keep a safe fallback.</p></details>
+<details class="ans" data-lvl="pr"><summary>Search and recommendation teams both build video embeddings. A reorg asks you to unify them. Argue for or against.</summary><p>For: one representation means lower training and serving cost, shared infrastructure (feature store, ANN service), consistent semantics, and transfer from the larger recommendation data to search's tail. Against: the objectives differ (query-conditioned relevance versus personalized satisfaction), release cadences differ, and a shared model couples launches and slows both teams.</p><p>A defensible position: share the video tower and the infrastructure, keep separate query or user towers, ranking heads and guardrails. Decide with evidence: an ablation of joint versus separate training measured on both products, the coordination cost in blocked launches, and a compatibility policy for embedding versions. Review it every six months and name the signal that would make you split.</p><p class="probe"><b>Likely follow-ups:</b> What would the interface between the two teams look like? &middot; How do you handle a launch that helps search and hurts recommendation?</p><p class="signal"><b>What makes this Principal-level:</b> You state a recommendation, support it with an experiment, and define what would change your mind.</p></details>
+
+<h2 class="nonum">References</h2>
+<ol class="refs">
+<li>Radford et al. Learning Transferable Visual Models From Natural Language Supervision (CLIP). arXiv:2103.00020. <a href="https://arxiv.org/abs/2103.00020">arxiv.org</a></li>
+<li>Bain, Nagrani, Varol, Zisserman. Frozen in Time: A Joint Video and Image Encoder for End-to-End Retrieval. arXiv:2104.00650. <a href="https://arxiv.org/abs/2104.00650">arxiv.org</a></li>
+<li>Luo et al. CLIP4Clip: An Empirical Study of CLIP for End to End Video Clip Retrieval. arXiv:2104.08860. <a href="https://arxiv.org/abs/2104.08860">arxiv.org</a></li>
+<li>Robertson and Zaragoza. The Probabilistic Relevance Framework: BM25 and Beyond. <a href="https://www.staff.city.ac.uk/~sbrp622/papers/foundations_bm25_review.pdf">paper</a></li>
+<li>Elastic. Practical BM25, part 2: the BM25 algorithm and its variables. <a href="https://www.elastic.co/blog/practical-bm25-part-2-the-bm25-algorithm-and-its-variables">elastic.co</a></li>
+<li>Cormack, Clarke, Buettcher. Reciprocal Rank Fusion outperforms Condorcet and individual rank learning methods. SIGIR 2009. <a href="https://cormack.uwaterloo.ca/cormacksigir09-rrf.pdf">paper</a></li>
+<li>Burges. From RankNet to LambdaRank to LambdaMART: An Overview. Microsoft Research TR-2010-82. <a href="https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/MSR-TR-2010-82.pdf">microsoft.com</a></li>
+<li>Covington, Adams, Sargin. Deep Neural Networks for YouTube Recommendations. RecSys 2016. <a href="https://research.google/pubs/deep-neural-networks-for-youtube-recommendations/">research.google</a></li>
+<li>Karpukhin et al. Dense Passage Retrieval for Open-Domain Question Answering. arXiv:2004.04906. <a href="https://arxiv.org/abs/2004.04906">arxiv.org</a></li>
+<li>Radford et al. Robust Speech Recognition via Large-Scale Weak Supervision (Whisper). arXiv:2212.04356. <a href="https://arxiv.org/abs/2212.04356">arxiv.org</a></li>
+<li>Sennrich, Haddow, Birch. Neural Machine Translation of Rare Words with Subword Units (BPE). arXiv:1508.07909. <a href="https://arxiv.org/abs/1508.07909">arxiv.org</a></li>
+<li>Joachims, Swaminathan, Schnabel. Unbiased Learning-to-Rank with Biased Feedback. arXiv:1608.04468. <a href="https://arxiv.org/abs/1608.04468">arxiv.org</a></li>
+<li>Malkov and Yashunin. Efficient and Robust Approximate Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs. arXiv:1603.09320. <a href="https://arxiv.org/abs/1603.09320">arxiv.org</a></li>
+<li>Johnson, Douze, Jegou. Billion-scale Similarity Search with GPUs (FAISS). arXiv:1702.08734. <a href="https://arxiv.org/abs/1702.08734">arxiv.org</a></li>
+</ol>
+</main></div>
+<script src="assets/dg.js"></script>
+<script src="assets/nav.js"></script>
+<script src="assets/qa.js"></script>
+</body>
+</html>

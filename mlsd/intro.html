@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Introduction and Framework</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-slug="intro">
+<div class="topbar"><a href="index.html">&larr; ML System Design Study Guide</a><span style="color:var(--muted)">Chapter 1 of 11</span></div>
+<div class="layout"><aside class="toc" id="toc"></aside>
+<main>
+<div class="kicker">Chapter 1</div>
+<h1>Introduction and Framework</h1>
+<p class="lead">An ML system design interview gives you one open-ended sentence ("design a video recommendation system") and about 45 minutes. Nobody is checking whether you memorized an architecture. The interviewer wants to see whether you can turn a vague product goal into a measurable ML problem, choose sensible data and models, and reason about what happens in production. A repeatable framework keeps you in control. Every chapter in this guide follows the same seven steps.</p>
+
+<h2>What the interviewer is judging</h2>
+<div class="tbl"><table>
+<tr><th>Signal</th><th>What strong looks like</th><th>What weak looks like</th></tr>
+<tr><td>Problem navigation</td><td>Asks sharp questions, states assumptions, narrows scope, frames a measurable objective</td><td>Starts naming models in the first minute</td></tr>
+<tr><td>Data and labels</td><td>Knows where labels come from and how they are biased; designs features by entity</td><td>"We have labeled data" without saying how</td></tr>
+<tr><td>Model design</td><td>Compares options, explains trade-offs, picks one with reasons, states the loss</td><td>One model, no alternatives, buzzwords</td></tr>
+<tr><td>Evaluation</td><td>Offline plus online plus guardrail metrics; understands each metric's flaw</td><td>"We will use accuracy"</td></tr>
+<tr><td>Production sense</td><td>Latency and scale numbers, retrieval vs ranking, cold start, monitoring, drift</td><td>Notebook-only thinking</td></tr>
+<tr><td>Communication</td><td>Structured, checks in with the interviewer, adapts to hints</td><td>Monologue, rambling, or silence</td></tr>
+</table></div>
+
+<h2>The seven-step framework</h2>
+<script type="application/json" class="dg" data-cap="The seven steps of an ML system design answer, in the order you present them">
+{"type":"graph","cols":4,"nodes":[
+ {"id":"s1","t":"1. Clarify","s":"scope, scale, constraints","c":0,"r":0,"k":"io"},
+ {"id":"s2","t":"2. Frame as ML","s":"objective, I/O, category","c":1,"r":0,"k":"svc"},
+ {"id":"s3","t":"3. Data","s":"sources, features, labels","c":2,"r":0,"k":"data"},
+ {"id":"s4","t":"4. Model","s":"options, architecture, loss","c":3,"r":0,"k":"model"},
+ {"id":"s5","t":"5. Evaluate","s":"offline, online, guardrails","c":3,"r":1,"k":"svc"},
+ {"id":"s6","t":"6. Serve","s":"pipelines, scale, monitoring","c":2,"r":1,"k":"store"},
+ {"id":"s7","t":"7. Talking points","s":"bias, drift, extensions","c":1,"r":1,"k":"io"}],
+ "edges":[["s1","s2"],["s2","s3"],["s3","s4"],["s4","s5"],["s5","s6"],["s6","s7"]]}
+</script>
+<div class="callout key"><p>You are not filling in a template. You are telling a story: what are we building, how do we know it works, and how does it run. The steps are the spine of that story.</p></div>
+
+<h3>1. Clarify requirements</h3>
+<p>Spend three to five minutes asking questions until the problem is small enough to solve. Good questions cover five areas:</p>
+<script type="application/json" class="dg" data-cap="Five areas to probe before designing anything">
+{"type":"graph","cols":5,"nodes":[
+ {"id":"p","t":"Problem","s":"business goal, success metric","c":0,"r":0,"k":"io"},
+ {"id":"s","t":"Scope","s":"inputs, surfaces, out of scope","c":1,"r":0,"k":"svc"},
+ {"id":"c","t":"Scale","s":"users, items, QPS, latency","c":2,"r":0,"k":"svc"},
+ {"id":"d","t":"Data","s":"logs, labels, delay, privacy","c":3,"r":0,"k":"data"},
+ {"id":"k","t":"Constraints","s":"cold start, fairness, cost","c":4,"r":0,"k":"svc"}],
+ "edges":[["p","s"],["s","c"],["c","d"],["d","k"]]}
+</script>
+<div class="callout tip"><p>End the clarification with a two-sentence problem summary and say it out loud. It locks the scope, and the interviewer can correct you before you build on a wrong assumption.</p></div>
+
+<h3>2. Frame the problem as an ML task</h3>
+<p>Write three things: a measurable <b>objective</b>, the system's <b>input and output</b>, and the <b>ML category</b>. The category follows from the product question:</p>
+<div class="tbl"><table>
+<tr><th>Product question</th><th>Typical framing</th><th>Output</th></tr>
+<tr><td>"Show the most relevant items"</td><td>Ranking, usually retrieval followed by a ranker</td><td>Ordered list</td></tr>
+<tr><td>"Is this post harmful?"</td><td>Classification, binary or multi-label</td><td>Probability per class</td></tr>
+<tr><td>"Will the user click this ad?"</td><td>Binary classification, calibrated</td><td>P(click)</td></tr>
+<tr><td>"Where are the faces in this photo?"</td><td>Object detection</td><td>Boxes and classes</td></tr>
+<tr><td>"How long will they watch?"</td><td>Regression</td><td>A number</td></tr>
+<tr><td>"Who might you know?"</td><td>Link prediction on a graph</td><td>Scores for user pairs</td></tr>
+</table></div>
+<p>When several objectives are plausible, list them with pros and cons and then choose. For a recommender, "maximize clicks" rewards clickbait, "maximize watch time" favors long videos, and a blend of signals is usually the answer.</p>
+
+<h3>3. Data preparation</h3>
+<p><b>Data engineering</b> means naming the raw tables (users, items, interactions) and what a row looks like. <b>Feature engineering</b> groups features by the entity they describe and says how each is encoded:</p>
+<script type="application/json" class="dg" data-cap="Features are grouped by entity, then encoded for the model">
+{"type":"graph","cols":4,"nodes":[
+ {"id":"u","t":"User","s":"demographics, history","c":0,"r":0,"k":"user"},
+ {"id":"i","t":"Item","s":"content, stats, age","c":0,"r":1,"k":"data"},
+ {"id":"x","t":"Context","s":"device, time, location","c":0,"r":2,"k":"io"},
+ {"id":"enc","t":"Encoders","s":"scale, one-hot/hash, embeddings, pretrained","c":1,"r":1,"k":"svc","cs":2},
+ {"id":"fv","t":"Feature vector","c":3,"r":1,"k":"vec"}],
+ "edges":[["u","enc"],["i","enc"],["x","enc"],["enc","fv"]]}
+</script>
+<p>Most answers fail on <b>labels</b>. Compare the usual sources:</p>
+<div class="tbl"><table>
+<tr><th>Source</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Human annotation</td><td>Accurate, policy-aware</td><td>Slow, expensive, annotators disagree</td></tr>
+<tr><td>User behavior (clicks, watches, hides)</td><td>Free and plentiful</td><td>Noisy; biased by position and by what was shown</td></tr>
+<tr><td>Self-supervision / weak labels</td><td>Cheap, unlimited</td><td>May not match the real task</td></tr>
+</table></div>
+
+<h3>4. Model development</h3>
+<p>Start simple and justify each upgrade: heuristic baseline, then logistic regression or gradient-boosted trees, then deep models. Always state the loss and what a training example looks like, including how you pick negatives. Large systems that must score millions of items per request split the job into stages:</p>
+<script type="application/json" class="dg" data-cap="The standard funnel for large catalogs (illustrative counts)">
+{"type":"funnel","stages":[
+ {"t":"Retrieval","s":"cheap model, embeddings + ANN","n":"~1,000","m":"millions of items"},
+ {"t":"Ranking","s":"heavy model, rich features","n":"~100"},
+ {"t":"Re-ranking","s":"diversity, safety, business rules","n":"~20"}]}
+</script>
+<div class="callout key"><p>The funnel exists because compute per request is bounded. A cheap model can afford to look at everything; an expensive model can only afford to look at a shortlist.</p></div>
+
+<h3>5. Evaluation</h3>
+<p>Give <b>offline</b> metrics (computed on held-out data before launch), <b>online</b> metrics (measured in an A/B test), and at least one <b>guardrail</b> that must not get worse. Choose metrics that match the framing:</p>
+<div class="tbl"><table>
+<tr><th>Task</th><th>Offline metrics</th><th>Watch out for</th></tr>
+<tr><td>Ranking / retrieval</td><td>Precision@k, Recall@k, MRR, mAP, nDCG</td><td>MRR sees only the first hit; mAP needs binary relevance; nDCG needs graded labels</td></tr>
+<tr><td>Classification</td><td>Precision, recall, F1, PR-AUC, ROC-AUC</td><td>With rare positives prefer PR-AUC; ROC-AUC looks good even when precision is poor</td></tr>
+<tr><td>Probability prediction</td><td>Log loss, calibration, normalized entropy</td><td>Ranking quality alone is not enough when the probability is multiplied by a bid</td></tr>
+<tr><td>Detection</td><td>IoU, average precision at an IoU threshold</td><td>Pick the IoU threshold from the real requirement</td></tr>
+<tr><td>Regression</td><td>MAE, RMSE</td><td>Outliers dominate RMSE</td></tr>
+</table></div>
+<script type="application/json" class="dg" data-cap="From offline metric to full rollout: each gate must pass before the next">
+{"type":"graph","cols":5,"nodes":[
+ {"id":"o","t":"Offline eval","s":"held-out, time split","c":0,"r":0,"k":"data"},
+ {"id":"sh","t":"Shadow mode","s":"score, do not show","c":1,"r":0,"k":"svc"},
+ {"id":"ab","t":"A/B test","s":"small traffic slice","c":2,"r":0,"k":"model"},
+ {"id":"ra","t":"Ramp up","s":"watch guardrails","c":3,"r":0,"k":"svc"},
+ {"id":"fu","t":"Full launch","s":"monitor drift","c":4,"r":0,"k":"io"}],
+ "edges":[["o","sh"],["sh","ab"],["ab","ra"],["ra","fu"]]}
+</script>
+<div class="callout math"><p><b>Why PR-AUC for rare positives.</b> Suppose 100 million posts per day and 0.1% are harmful (100,000). A model with a 1% false positive rate flags 1% of the 99.9 million clean posts, about 999,000 wrongly flagged, against at most 100,000 true positives. Precision is under 10% even if recall is perfect, yet ROC-AUC can still look excellent. PR-AUC exposes this.</p></div>
+
+<h3>6. Serving and monitoring</h3>
+<p>Describe an <b>online path</b> (what happens when a request arrives) and an <b>offline path</b> (training, indexing, feature computation), then latency, caching, scale, and what you monitor after launch.</p>
+<script type="application/json" class="dg" data-cap="A generic ML serving architecture: online request path on top, offline pipelines below">
+{"type":"graph","cols":5,"groups":[
+ {"t":"Online: request path","c0":0,"c1":4,"r0":0,"r1":0},
+ {"t":"Offline: training and indexing","c0":0,"c1":4,"r0":1,"r1":1}],
+ "nodes":[
+ {"id":"rq","t":"Request","c":0,"r":0,"k":"io"},
+ {"id":"fs","t":"Feature store","s":"low-latency reads","c":1,"r":0,"k":"store"},
+ {"id":"rt","t":"Retrieval","s":"candidates","c":2,"r":0,"k":"svc"},
+ {"id":"rk","t":"Ranker","s":"model server","c":3,"r":0,"k":"model"},
+ {"id":"rs","t":"Response","c":4,"r":0,"k":"io"},
+ {"id":"lg","t":"Logs","s":"impressions, labels","c":0,"r":1,"k":"data"},
+ {"id":"fp","t":"Feature pipelines","c":1,"r":1,"k":"svc"},
+ {"id":"tr","t":"Training","s":"scheduled","c":2,"r":1,"k":"model"},
+ {"id":"mr","t":"Model registry","s":"versioned","c":3,"r":1,"k":"store"}],
+ "edges":[["rq","fs"],["fs","rt"],["rt","rk"],["rk","rs"],["lg","fp"],["fp","tr"],["tr","mr"],["mr","rk","deploy",{"d":1,"sa":"t","sb":"b"}],["fp","fs","features",{"d":1,"sa":"t","sb":"b"}]]}
+</script>
+<p>After launch, monitor three kinds of drift: <b>data drift</b> (input distributions change), <b>label drift</b> (what users do changes), and <b>model staleness</b> (the world moved on). Alert on guardrail metrics, not only on model loss.</p>
+
+<h3>7. Talking points</h3>
+<p>If time remains, show breadth: position and selection bias, feedback loops, fairness, privacy, cold start, extending to a new modality, retraining cadence, and how you would debug a sudden metric drop.</p>
+
+<h2>Raising the Bar: Senior, Staff and Principal</h2>
+<p>The framework is the same at every level; what changes is the depth, the ownership and the judgment you show. Levels and titles vary by company (roughly Google L5 to L7, Meta E5 to E7, Amazon L6 to L8, Apple ICT4 to ICT5), so treat the table as a guide to what interviewers listen for, not a rulebook.</p>
+<div class="tbl"><table>
+<tr><th>Level</th><th>You are expected to</th><th>Typical evidence in an answer</th></tr>
+<tr><td>Senior</td><td>Deliver a complete, correct design and defend it</td><td>Options with trade-offs, right metrics, correct arithmetic, sensible serving design, named failure modes</td></tr>
+<tr><td>Staff</td><td>Drive ambiguity and own outcomes beyond the model</td><td>Business-tied success metrics, cost and operability, rollout and rollback, experimentation pitfalls, kill criteria, what you would not build</td></tr>
+<tr><td>Principal</td><td>Set direction across teams and years</td><td>Platform and build-versus-buy bets, governance, sequencing across quarters, organizational risks, how the system evolves</td></tr>
+</table></div>
+<div class="tbl"><table>
+<tr><th>Company</th><th>Tendencies you may notice</th><th>How to prepare</th></tr>
+<tr><td>Google</td><td>Depth on fundamentals, scale, and correctness; follow-ups probe the math and the trade-offs</td><td>Work the numeric questions; know retrieval, ranking and evaluation internals</td></tr>
+<tr><td>Meta</td><td>Product sense and metrics for large ranking and recommendation systems; experimentation and speed of iteration</td><td>Practice objective choice, multi-task blending, interference in A/B tests</td></tr>
+<tr><td>Amazon</td><td>Operational ownership and customer outcomes; behavioral principles woven into design questions</td><td>Prepare failure, monitoring and cost stories; quantify customer impact</td></tr>
+<tr><td>Apple</td><td>Privacy, on-device constraints and end-to-end quality</td><td>Discuss data minimization, on-device inference and latency or battery limits</td></tr>
+<tr><td>Netflix</td><td>Judgment, personalization and rigorous experimentation with a high bar for ownership</td><td>Explain how you would decide with incomplete data and what you would measure long term</td></tr>
+</table></div>
+<div class="callout tip"><p>Loops differ by team and interviewer; these are tendencies observed in public interview guidance, not guarantees. Ask your recruiter which rounds map to ML design, and prepare each chapter's Staff and Principal questions even for a Senior loop, because follow-ups often go there.</p></div>
+<h3>Self-assessment scorecard</h3>
+<p>Rate yourself from 1 to 5 on each axis using the descriptors that appear beside each slider. A 3 is the Senior bar and a 4 is the Staff bar. The tool saves your ratings in this browser only.</p>
+<div data-scorecard></div>
+
+<h2>Spending 45 minutes</h2>
+<script type="application/json" class="dg" data-cap="A suggested time budget in minutes">
+{"type":"bars","horiz":true,"labels":["Clarify requirements","Frame as ML task","Data and features","Model and training","Evaluation","Serving and monitoring","Talking points"],"series":[{"n":"minutes","v":[4,4,8,10,6,8,5]}],"max":12,"fmt":null}
+</script>
+
+<h2>Common traps</h2>
+<div class="callout warn"><p><b>Jumping to a model.</b> Spend the first minutes on requirements and framing. A perfect model for the wrong problem scores zero.</p></div>
+<div class="callout warn"><p><b>Offering one option.</b> Always present alternatives and trade-offs, then decide. The decision matters less than the reasoning.</p></div>
+<div class="callout warn"><p><b>No label plan.</b> If you cannot say where training labels come from, the rest of the design floats.</p></div>
+<div class="callout warn"><p><b>Only offline metrics.</b> Interviewers expect online metrics and guardrails, and an explanation of why offline and online can disagree.</p></div>
+<div class="callout warn"><p><b>Ignoring scale.</b> With billions of items you cannot score everything online. Retrieval, indexing, and caching are part of the model design.</p></div>
+<div class="callout warn"><p><b>Forgetting feedback loops.</b> A model trained on what it previously showed learns its own bias. Mention exploration and debiasing.</p></div>
+
+<h2 class="nonum">Check yourself</h2>
+<p class="qa-intro">Questions are tagged by the level they target. The first set checks Senior-level fundamentals and arithmetic; Staff and Principal questions probe trade-offs, operations, experimentation and organization. Try to answer aloud for two minutes before opening one.</p>
+<div class="qa-bar" data-qa></div>
+<details class="ans" data-lvl="sr"><summary>Why split a recommender into retrieval and ranking?</summary>You cannot run a heavy model over millions of items per request. Retrieval uses a cheap model (often embeddings and approximate nearest neighbor search) to shortlist, and ranking spends compute only on the shortlist.</details>
+<details class="ans" data-lvl="sr"><summary>When is PR-AUC better than ROC-AUC?</summary>When positives are rare. ROC-AUC includes the huge pool of true negatives, so a small false positive rate can still produce many wrong flags. PR-AUC tracks how precise the positive predictions are.</details>
+<details class="ans" data-lvl="sr"><summary>Name two problems with using clicks as labels.</summary>Clicks are noisy (accidental or clickbait) and biased by position and by what the previous system chose to show. Missing clicks are not always real negatives.</details>
+<details class="ans" data-lvl="sr"><summary>An offline metric improved 5% but the A/B test is flat. Why might that happen?</summary>Possible causes: the offline set differs from live traffic; offline labels are biased by the old system; the metric does not measure what users value; novelty effects; or the improvement is real but below the test's detectable effect. Check data skew first, then the metric definition, then test power.</details>
+<details class="ans" data-lvl="sr"><summary>You have 45 minutes. How do you spend them, and what do you cut when the interviewer pulls you off the plan?</summary><p>A workable split (the chart above): 4 minutes clarifying and scoping, 4 framing the ML task and metric, 8 on data and labels, 10 on modeling, 6 on evaluation, 8 on serving, 5 for talking points and a summary (4+4+8+10+6+8+5 = 45). Say the plan out loud in the first two minutes so the interviewer can redirect you early, which is a strength, not a loss of control.</p><p>When pulled off plan, keep a visible stack of what you postponed ("parking lot: cold start, fairness") and return to it. Cut breadth before depth: a design with one fully reasoned decision per section beats a tour of every technique. If the interviewer digs into one area for fifteen minutes, that is the area they are scoring; go as deep as you can there and compress the rest to one sentence each.</p><p class="probe"><b>Likely follow-ups:</b> What would you cut first if you only had 30 minutes? &middot; How do you decide when to stop discussing one topic?</p><p class="signal"><b>What makes this Senior-level:</b> You manage the clock and the interviewer's attention, and you state trade-offs for what you skip instead of silently dropping it.</p></details>
+<details class="ans" data-lvl="st"><summary>The interviewer says: "Why not just use an LLM for this?" How do you respond?</summary><p>Treat it as a legitimate option and evaluate it on the same axes as any other: quality on the actual task, latency, cost per request, evaluability, controllability, and failure modes. An LLM is often the right tool for offline work (labeling, synthetic data, text understanding, query rewriting for tail queries) and the wrong tool for the hot path of a system that scores hundreds of items in tens of milliseconds at hundreds of thousands of QPS.</p><p>A good answer proposes a baseline first, then a staged role for the LLM: use it as a teacher or labeler (distill into a small model), as a feature generator whose outputs are cached, or as a re-ranker on the top 10 to 20 only if the latency and cost math works. Then name how you would measure it: a human-labeled gold set, agreement of LLM-judge labels with humans, and an A/B test on the real objective.</p><p class="probe"><b>Likely follow-ups:</b> What is the per-request cost at your QPS and how would you cap it? &middot; How do you evaluate an LLM judge, and what biases does it have?</p><p class="signal"><b>What makes this Staff-level:</b> You neither dismiss nor worship the new tool; you decide by quantified trade-offs and keep a cheaper fallback.</p></details>
+<details class="ans" data-lvl="st"><summary>What separates a Senior answer from a Staff answer in an ML system design interview?</summary><p>Senior: a complete, correct design. You cover requirements, data, model, evaluation and serving, justify each choice against alternatives, and get the math right. Staff: you drive the ambiguity. You define success in business terms before touching models, choose where to spend depth, anticipate failure and operations (what breaks at 3 a.m., how you roll back, how you detect drift), and think about cost, team structure and sequencing. Principal: you reason across systems and years: platform bets, build-versus-buy, what the organization should standardize, and which risks to retire first.</p><p>Concretely, Staff answers contain sentences like "I would ship the simple model first because the feature pipeline is the long pole", "here is the kill criterion for this investment", and "this metric can be gamed by X, so I would add guardrail Y".</p><p class="probe"><b>Likely follow-ups:</b> Tell me about a decision you would reverse after six months in production. &middot; How would you staff and sequence this over four quarters?</p><p class="signal"><b>What makes this Staff-level:</b> Your answer contains decisions with owners, costs, kill criteria and sequencing, not only components.</p></details>
+<details class="ans" data-lvl="st"><summary>How do you raise fairness, privacy and safety without sounding like you are reciting a checklist?</summary><p>Pick the one or two risks that are specific to this product and attach each to a design decision, a metric and a launch gate. For a feed, that is amplification of harmful content: a demotion multiplier at re-rank time, a guardrail on report rate, and a pre-launch audit slice. For a face blurring system, it is slice recall across lighting and demographics with a minimum floor per slice, not only the average.</p><p>Quantify when you can ("recall must stay above 99.5 percent in every slice") and say who can block a launch. A generic list of risks with no mechanism scores worse than silence; a specific risk with a mechanism, a metric and an owner scores as senior judgment.</p><p class="probe"><b>Likely follow-ups:</b> Which slice would you worry about most, and how would you find it? &middot; Who has the authority to stop the launch?</p><p class="signal"><b>What makes this Staff-level:</b> Risks are tied to mechanisms, metrics and owners, and you can say what you would trade away to honor them.</p></details>
+<details class="ans" data-lvl="pr"><summary>You designed the system. Describe how an eight-person team would operate it safely for the next two years.</summary><p>Name the operating model, not only the architecture: an owner per component (data, features, models, serving), an on-call rota with runbooks, service-level objectives for latency, freshness and quality, and an error budget that can pause launches. Quality is protected by a versioned evaluation harness (golden sets, slice reports, calibration), shadow scoring of every candidate model, a staged rollout (shadow, one percent, ten percent, full) with automatic rollback on guardrail breach, and a model registry that records code, data and feature versions.</p><p>Plan for decay: scheduled retraining with drift alarms, quarterly label audits, a deprecation policy for features and models, data contracts with upstream producers so schema changes fail loudly, and documentation (model cards, decision records) so the design survives staff turnover. Close with the two or three metrics you would put on the team dashboard.</p><p class="probe"><b>Likely follow-ups:</b> What is your rollback story when the model is fine but a feature pipeline is stale? &middot; Which piece would you buy instead of build, and why?</p><p class="signal"><b>What makes this Principal-level:</b> You think in terms of operability, ownership and decay, which is what distinguishes someone who has run systems in production.</p></details>
+
+<h2 class="nonum">References</h2>
+<ol class="refs">
+<li>Covington, Adams, Sargin. Deep Neural Networks for YouTube Recommendations. RecSys 2016. <a href="https://research.google/pubs/deep-neural-networks-for-youtube-recommendations/">research.google</a></li>
+<li>Hello Interview. ML System Design in a Hurry: introduction and delivery framework. <a href="https://www.hellointerview.com/learn/ml-system-design/in-a-hurry/introduction">hellointerview.com</a></li>
+<li>Sculley et al. Hidden Technical Debt in Machine Learning Systems. NeurIPS 2015. <a href="https://papers.nips.cc/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html">nips.cc</a></li>
+<li>Davis and Goadrich. The Relationship Between Precision-Recall and ROC Curves. ICML 2006. <a href="https://dl.acm.org/doi/10.1145/1143844.1143874">acm.org</a></li>
+</ol>
+</main></div>
+<script src="assets/dg.js"></script>
+<script src="assets/nav.js"></script>
+<script src="assets/qa.js"></script>
+</body>
+</html>

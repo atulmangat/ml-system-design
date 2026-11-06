@@ -1,0 +1,748 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Street View Blurring System</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-slug="street-view-blurring">
+<div class="topbar"><a href="index.html">&larr; ML System Design Study Guide</a><span style="color:var(--muted)">Chapter 3 of 11</span></div>
+<div class="layout"><aside class="toc" id="toc"></aside>
+<main>
+<div class="kicker">Chapter 3</div>
+<h1>Street View Blurring System</h1>
+<p class="lead">A street-level mapping product photographs whoever happens to be on the sidewalk and every car at the curb. Before any frame goes public, the platform must find each identifiable face and license plate and make it unrecognizable. The ML core is object detection, but the real design problem is the operating point: the system is tuned for recall, because one missed face is a privacy incident while one unnecessary blur is a cosmetic flaw, and it must hold that recall across billions of images and be re-run whenever the model improves.</p>
+
+<h2>Clarifying Requirements</h2>
+<p>Start by pinning down what "blurred" means, what a miss costs, and how big the archive is. The answers below are the ones this chapter designs against.</p>
+<div class="dlg">
+<div class="turn c"><span>Candidate</span><p>Which objects must be hidden?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Human faces and vehicle license plates. Other personal data, such as house numbers or text on screens, is out of scope for the first version.</p></div>
+<div class="turn c"><span>Candidate</span><p>What do the input images look like?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Frames from multi-camera rigs on vehicles. Assume a frame is about 9 megapixels, and several frames are captured at every position along the route.</p></div>
+<div class="turn c"><span>Candidate</span><p>What labeled data do we have?</p></div>
+<div class="turn i"><span>Interviewer</span><p>About one million images with human-drawn boxes around faces and plates. Treat the labels as mostly clean but not perfect.</p></div>
+<div class="turn c"><span>Candidate</span><p>Is this real time or batch?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Batch. Frames are processed after upload and before publication. There is no per-image latency target, but the backlog must clear in days, and the whole archive must be re-runnable when a better model ships.</p></div>
+<div class="turn c"><span>Candidate</span><p>How large is the archive?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Billions of images. Plan with one billion frames for a full pass, and assume 0.4 faces and 0.3 plates per frame on average.</p></div>
+<div class="turn c"><span>Candidate</span><p>What matters more, catching everything or avoiding over-blurring?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Catching everything. A visible face is a privacy incident. But blurring half the street is not acceptable either, so propose a recall target and show how you would measure it.</p></div>
+<div class="turn c"><span>Candidate</span><p>How do we learn about misses after launch?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Users can report an unblurred face, car or home. Reports are reviewed, and an approved blur is permanent. Design the data path, not the report button.</p></div>
+<div class="turn c"><span>Candidate</span><p>What happens when we launch in a new country with different plate formats?</p></div>
+<div class="turn i"><span>Interviewer</span><p>That happens regularly. The system should degrade gracefully and the new region should not publish before it passes an audit.</p></div>
+<div class="turn c"><span>Candidate</span><p>Any constraints on cost or on handling the raw imagery?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Raw frames contain exposed faces, so access is restricted and retention is limited. GPU capacity is large but not free, so show a cost estimate.</p></div>
+<div class="turn c"><span>Candidate</span><p>What is explicitly out of scope?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Video, identifying who a person is, and the report UI. Fairness across skin tone, age and region is in scope.</p></div>
+</div>
+<div class="summary"><p>Build a batch system that takes street-level frames, detects every identifiable face and license plate with recall near 99%, blurs them irreversibly, and publishes only frames that passed. Train on about 1M box-labeled images, run on billions of frames, support full re-runs when the model improves, and close the loop with audits and user reports.</p></div>
+
+<script type="application/json" class="dg" data-cap="The product as a black box: frames go in; blurred frames and box metadata come out; user reports are an extra input that adds blurs">
+{"type":"graph","cols":3,
+ "nodes":[
+  {"id":"rep","t":"User reports","s":"unblurred face, car or home","c":1,"r":0,"k":"user"},
+  {"id":"raw","t":"Street-level frames","s":"multi-camera, about 9 MP each","c":0,"r":1,"k":"img"},
+  {"id":"sys","t":"Blurring system","s":"detect, then redact","c":1,"r":1,"k":"model"},
+  {"id":"pub","t":"Blurred frames","s":"published to maps","c":2,"r":1,"k":"img"},
+  {"id":"meta","t":"Box metadata","s":"class, box, score, model version","c":1,"r":2,"k":"data"}],
+ "edges":[["raw","sys","pixels"],["sys","pub","redacted copy",{"hl":1}],["rep","sys","extra blurs",{"d":1}],["sys","meta","boxes + scores"]]}
+</script>
+
+<div class="callout tip"><p>Say the asymmetry out loud in the first minute: a false negative is a privacy leak, a false positive is a slightly uglier picture. That one sentence justifies the metric (recall at a fixed false-alarm budget), the low score threshold, and the audit machinery that follows.</p></div>
+
+<h2>Frame the Problem as an ML Task</h2>
+
+<h3>ML objective</h3>
+<p>The business goal is "no identifiable face or plate in published imagery." Several ML formulations could serve it.</p>
+<table>
+<caption>Candidate formulations</caption>
+<tr><th>Formulation</th><th>Model predicts</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Image classification</td><td>"contains a face or plate" per frame</td><td>Cheap, simple labels</td><td>Says nothing about where; most city frames contain something, so it filters nothing</td></tr>
+<tr><td>Object detection</td><td>class, box and score per object</td><td>Our labels are boxes; the renderer needs boxes; mature tooling</td><td>Boxes include background; tightness varies between annotators</td></tr>
+<tr><td>Segmentation</td><td>a per-pixel mask</td><td>Blurs exactly the object pixels</td><td>Polygon labels cost several times more; slower; little privacy benefit over a box with a margin</td></tr>
+<tr><td>Detection plus verifier</td><td>candidates from a recall-tuned detector, rescored by a cheap second stage</td><td>Recovers precision lost by running at a low threshold</td><td>One more component to version and monitor; worth it only if false blurs hurt</td></tr>
+</table>
+<div class="callout key"><p>Train a detector for two classes (face, plate) and choose its score threshold from the precision-recall curve so that recall meets the target. The renderer blurs every box above that threshold. Everything else in this chapter is about making that one decision safe and affordable.</p></div>
+<div class="callout warn"><p>Do not select models by mAP alone. mAP averages precision over the entire recall range, but production runs at a single extreme point (recall near 99%) where two models with equal mAP can differ a lot in false alarms.</p></div>
+
+<h3>Input and output</h3>
+<p>The model input is a square tile of RGB pixels cut from a frame at native resolution (we justify tiling below), optionally with context such as the camera index and the tile's position. The output is a list of zero or more detections, each with a class (face or plate), a box (x1, y1, x2, y2) and a confidence score. Thresholding happens after the model, so the same network can serve different operating points per region or per class.</p>
+<script type="application/json" class="dg" data-cap="Schematic street scene showing what the detector must produce: boxes on faces and plates, and the three ways it can be wrong or harmless" data-tpl="t-scene">
+{"type":"svg","tpl":"t-scene"}
+</script>
+<template id="t-scene">
+<svg class="fig" viewBox="0 0 760 376" role="img" aria-label="Schematic street scene with detected face and plate boxes, a missed far face and a poster false alarm">
+<text class="ns" x="14" y="22">Schematic, not real imagery</text>
+<rect class="nd n-io" x="14" y="40" width="236" height="172" rx="4"/>
+<rect class="nd n-svc" x="34" y="58" width="36" height="42" style="stroke-width:1"/>
+<rect class="nd n-svc" x="178" y="58" width="36" height="42" style="stroke-width:1"/>
+<rect class="nd n-io" x="262" y="30" width="210" height="182" rx="4"/>
+<rect class="nd n-svc" x="284" y="50" width="36" height="42" style="stroke-width:1"/>
+<rect class="nd n-svc" x="414" y="50" width="36" height="42" style="stroke-width:1"/>
+<rect class="nd n-io" x="484" y="60" width="262" height="152" rx="4"/>
+<rect class="nd n-svc" x="504" y="76" width="36" height="42" style="stroke-width:1"/>
+<rect x="0" y="212" width="760" height="34" style="fill:var(--line)"/>
+<rect x="0" y="246" width="760" height="130" style="fill:var(--card)"/>
+<line x1="0" y1="352" x2="760" y2="352" style="stroke:var(--io-s);stroke-width:2;stroke-dasharray:24 16"/>
+<!-- near pedestrian -->
+<circle class="nd n-img" cx="120" cy="146" r="15"/>
+<rect class="nd n-svc" x="103" y="163" width="34" height="50" rx="12"/>
+<rect x="100" y="128" width="40" height="36" rx="3" style="fill:none;stroke:var(--accent);stroke-width:2.5"/>
+<text class="nt" x="100" y="120">face 0.97</text>
+<!-- mid pedestrian -->
+<circle class="nd n-img" cx="330" cy="168" r="10"/>
+<rect class="nd n-svc" x="321" y="179" width="18" height="34" rx="8"/>
+<rect x="318" y="156" width="24" height="24" rx="2" style="fill:none;stroke:var(--accent);stroke-width:2.5"/>
+<text class="nt" x="296" y="148">face 0.88</text>
+<!-- far pedestrian, missed -->
+<circle class="nd n-img" cx="640" cy="188" r="4.5"/>
+<rect class="nd n-svc" x="636" y="193" width="9" height="20" rx="3"/>
+<rect x="633" y="181" width="14" height="14" style="fill:none;stroke:var(--bad);stroke-width:2;stroke-dasharray:3 2"/>
+<text class="nt" x="626" y="174" text-anchor="end" style="fill:var(--bad)">11 px face: missed</text>
+<!-- car with plate -->
+<rect class="nd n-svc" x="400" y="266" width="190" height="38" rx="10"/>
+<path class="nd n-svc" d="M424 266 L446 240 H546 L570 266 Z"/>
+<circle cx="438" cy="306" r="13" style="fill:var(--io-s)"/>
+<circle cx="552" cy="306" r="13" style="fill:var(--io-s)"/>
+<rect class="nd n-data" x="466" y="280" width="58" height="14" rx="2"/>
+<text class="ns" x="495" y="290.5" text-anchor="middle" style="font-size:9px">AB 12 CDE</text>
+<rect x="461" y="274" width="68" height="26" rx="2" style="fill:none;stroke:var(--c1);stroke-width:2.5"/>
+<text class="nt" x="495" y="336" text-anchor="middle">plate 0.94</text>
+<line x1="495" y1="302" x2="495" y2="324" style="stroke:var(--c1);stroke-width:1.2"/>
+<!-- poster -->
+<rect class="nd n-img" x="674" y="84" width="40" height="54"/>
+<circle cx="694" cy="106" r="11" style="fill:var(--img-s);opacity:.5"/>
+<rect x="671" y="81" width="46" height="60" rx="2" style="fill:none;stroke:var(--warn);stroke-width:2;stroke-dasharray:5 3"/>
+<text class="ns" x="694" y="156" text-anchor="middle">poster: false</text>
+<text class="ns" x="694" y="169" text-anchor="middle">alarm, harmless</text>
+<!-- legend -->
+<rect x="20" y="360" width="14" height="10" style="fill:none;stroke:var(--accent);stroke-width:2.5"/><text class="ns" x="40" y="369">face found</text>
+<rect x="150" y="360" width="14" height="10" style="fill:none;stroke:var(--c1);stroke-width:2.5"/><text class="ns" x="170" y="369">plate found</text>
+<rect x="290" y="360" width="14" height="10" style="fill:none;stroke:var(--bad);stroke-width:2;stroke-dasharray:3 2"/><text class="ns" x="310" y="369">missed: the costly error</text>
+<rect x="500" y="360" width="14" height="10" style="fill:none;stroke:var(--warn);stroke-width:2;stroke-dasharray:5 3"/><text class="ns" x="520" y="369">false alarm: cosmetic only</text>
+</svg>
+</template>
+
+<h3>ML category</h3>
+<p>Object detection splits into a few families. All of them can be trained with the box labels we have.</p>
+<table>
+<caption>Detector families</caption>
+<tr><th>Family</th><th>How it works</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Two-stage (Faster R-CNN)</td><td>A region proposal network suggests candidate boxes; a second head classifies and refines each one</td><td>Strong on small objects; refinement gives tight boxes</td><td>Slowest; per-region work grows with the number of candidates</td></tr>
+<tr><td>One-stage, anchor-based (RetinaNet, SSD, YOLO)</td><td>Predict a class and a box offset for every anchor on a feature pyramid in one pass</td><td>Fast and simple to batch; focal loss closes most of the accuracy gap</td><td>Needs anchor design; heavy class imbalance during training</td></tr>
+<tr><td>One-stage, anchor-free (FCOS, CenterNet)</td><td>Predict object centers or per-pixel distances to box edges</td><td>Fewer hyperparameters</td><td>Similar cost; recall on tiny objects depends on assignment rules</td></tr>
+<tr><td>Transformer detectors (DETR family)</td><td>Set prediction with learned object queries</td><td>No NMS; elegant</td><td>Slow to train; weaker on tiny objects; over-engineered for this job</td></tr>
+</table>
+<p>A candidate may choose a two-stage detector for accuracy. Here the archive is billions of frames and the hard cases are tiny faces, so a one-stage detector on a high-resolution feature pyramid (RetinaNet-style, stride-8 features for small faces) gives the best cost per recall point, and face-specific one-stage detectors such as RetinaFace show the approach reaches state-of-the-art face detection. Keep a two-stage model as the offline "teacher" for pre-labeling and audits.</p>
+<script type="application/json" class="dg" data-cap="Two-stage detectors spend extra work per candidate region; one-stage detectors predict everything in a single dense pass">
+{"type":"graph","cols":5,
+ "groups":[{"t":"Two-stage (Faster R-CNN family)","c0":0,"c1":4,"r0":0,"r1":0},{"t":"One-stage (RetinaNet, SSD, YOLO)","c0":0,"c1":4,"r0":1,"r1":1}],
+ "nodes":[
+  {"id":"i1","t":"Image tile","c":0,"r":0,"k":"img"},
+  {"id":"b1","t":"Backbone","s":"CNN features","c":1,"r":0},
+  {"id":"rpn","t":"Region proposals","s":"about 1,000 boxes","c":2,"r":0},
+  {"id":"roi","t":"Per-region head","s":"classify + refine","c":3,"r":0,"k":"model"},
+  {"id":"o1","t":"Detections","c":4,"r":0,"k":"io"},
+  {"id":"i2","t":"Image tile","c":0,"r":1,"k":"img"},
+  {"id":"b2","t":"Backbone + FPN","s":"multi-scale maps","c":1,"r":1},
+  {"id":"dh","t":"Dense head","s":"score + box per anchor","c":2,"r":1,"k":"model"},
+  {"id":"th","t":"Threshold","s":"keep low scores","c":3,"r":1},
+  {"id":"o2","t":"Detections","c":4,"r":1,"k":"io"}],
+ "edges":[["i1","b1"],["b1","rpn"],["rpn","roi","crops"],["roi","o1"],["i2","b2"],["b2","dh"],["dh","th","boxes"],["th","o2"]]}
+</script>
+
+<h2>Data Preparation</h2>
+
+<h3>Data engineering</h3>
+<p>Imagery comes from vehicle-mounted rigs. A rig typically carries several synchronized cameras arranged around the car, and the frames from one capture instant can later be stitched into a panorama. The public paper on Google's system describes a rosette of eight horizontal cameras at 5 megapixels each, and its detectors ran on the individual camera images before stitching. We assume a similar rig with about 9 MP frames.</p>
+<table>
+<caption>Frame metadata table (sample rows; one row per frame)</caption>
+<tr><th>frame_id</th><th>captured_at</th><th>country</th><th>camera</th><th>resolution</th><th>size</th><th>lighting</th></tr>
+<tr><td>f_88120</td><td>2026-03-14 09:12</td><td>DE</td><td>cam3</td><td>3584 x 2432</td><td>3.9 MB</td><td>day</td></tr>
+<tr><td>f_88121</td><td>2026-03-14 09:12</td><td>DE</td><td>cam4</td><td>3584 x 2432</td><td>4.2 MB</td><td>day</td></tr>
+<tr><td>f_91007</td><td>2026-04-02 21:40</td><td>JP</td><td>cam1</td><td>3584 x 2432</td><td>3.1 MB</td><td>night</td></tr>
+</table>
+<table>
+<caption>Annotation table (sample rows; one row per labeled object, pixel coordinates)</caption>
+<tr><th>image_id</th><th>class</th><th>x1</th><th>y1</th><th>x2</th><th>y2</th><th>annotator</th><th>qa_status</th></tr>
+<tr><td>f_88120</td><td>face</td><td>1204</td><td>880</td><td>1241</td><td>925</td><td>a_17</td><td>agreed</td></tr>
+<tr><td>f_88120</td><td>plate</td><td>2210</td><td>1502</td><td>2290</td><td>1540</td><td>a_17</td><td>agreed</td></tr>
+<tr><td>f_91007</td><td>face</td><td>402</td><td>1310</td><td>415</td><td>1325</td><td>a_42</td><td>adjudicated</td></tr>
+</table>
+<p>Sizes under our assumptions: 1B frames at about 4 MB is 4 PB of raw imagery; the 1M labeled frames are about 4 TB; each detector run also logs boxes (class, coordinates, score, model version) down to a low score floor, roughly 5 candidate boxes per frame at 32 bytes each, about 160 GB for a full pass. Keep the raw store, the label store and the detection log in separate access domains, because only the raw store contains exposed faces.</p>
+<script type="application/json" class="dg" data-cap="Data pipeline from capture to training: raw frames stay in a restricted store, labels are versioned, and splits are built by location">
+{"type":"graph","cols":5,
+ "groups":[{"t":"Collect and sample","c0":0,"c1":4,"r0":0,"r1":0},{"t":"Label and build datasets","c0":0,"c1":4,"r0":1,"r1":1}],
+ "nodes":[
+  {"id":"cap","t":"Vehicle capture","s":"cameras + GPS","c":0,"r":0,"k":"img"},
+  {"id":"ing","t":"Secure ingest","s":"checksum, ACL","c":1,"r":0},
+  {"id":"raw","t":"Raw frame store","s":"encrypted","c":2,"r":0,"k":"store"},
+  {"id":"smp","t":"Stratified sampler","s":"region, light, size","c":3,"r":0},
+  {"id":"q","t":"Annotation queue","s":"tasks","c":4,"r":0,"k":"data"},
+  {"id":"tool","t":"Labeling tool","s":"boxes + QA","c":0,"r":1,"k":"user"},
+  {"id":"lab","t":"Label store","s":"versioned","c":1,"r":1,"k":"store"},
+  {"id":"bld","t":"Dataset builder","s":"split by location","c":2,"r":1},
+  {"id":"ds","t":"Train / val / test","s":"frozen snapshots","c":3,"r":1,"k":"data"},
+  {"id":"trn","t":"Training job","c":4,"r":1,"k":"model"}],
+ "edges":[["cap","ing"],["ing","raw"],["raw","smp"],["smp","q"],["q","tool","work items",{"sa":"b","sb":"t"}],["tool","lab"],["lab","bld"],["bld","ds"],["ds","trn"]]}
+</script>
+<div class="callout warn"><p>Split by location, never by frame. Frames a few meters apart show the same pedestrians and the same parked cars, so a random split leaks near-duplicates into validation and inflates recall. Hold out whole routes or whole cities, and keep at least one unseen country in the test set.</p></div>
+
+<h3>Feature engineering</h3>
+<p>A detector learns its features from pixels, so "feature engineering" here means choosing the input representation. The decisive choice is resolution. A face is identifiable down to roughly 12 pixels wide (the Google paper surveyed colleagues to arrive at that figure). If we downscaled a 3,584-pixel-wide frame to a typical 640-pixel network input, a 12-pixel face would shrink to 12 x 640 / 3584 = 2.1 pixels and vanish. So the pipeline cuts each frame into overlapping tiles at native resolution, plus one downscaled global pass for faces too large to fit in a tile seam.</p>
+<script type="application/json" class="dg" data-cap="Overlapping tiles at native resolution; the overlap is at least as wide as the largest face a tile pass must catch, and a global low-resolution pass covers the rest" data-tpl="t-tiles">
+{"type":"svg","tpl":"t-tiles"}
+</script>
+<template id="t-tiles">
+<svg class="fig" viewBox="0 0 760 372" role="img" aria-label="A frame cut into six overlapping tiles with faces on seams">
+<rect x="169.76" y="30" width="16.64" height="316.16" style="fill:var(--accent);opacity:.2"/>
+<rect x="319.52" y="30" width="16.64" height="316.16" style="fill:var(--accent);opacity:.2"/>
+<rect x="20" y="179.76" width="465.92" height="16.64" style="fill:var(--accent);opacity:.2"/>
+<rect x="20" y="30" width="465.92" height="316.16" style="fill:none;stroke:var(--svc-s);stroke-width:1.5"/>
+<rect x="20" y="30" width="166.4" height="166.4" style="fill:none;stroke:var(--c0);stroke-width:1.6"/>
+<rect x="169.76" y="30" width="166.4" height="166.4" style="fill:none;stroke:var(--c1);stroke-width:1.6"/>
+<rect x="319.52" y="30" width="166.4" height="166.4" style="fill:none;stroke:var(--c2);stroke-width:1.6"/>
+<rect x="20" y="179.76" width="166.4" height="166.4" style="fill:none;stroke:var(--c3);stroke-width:1.6"/>
+<rect x="169.76" y="179.76" width="166.4" height="166.4" style="fill:none;stroke:var(--c4);stroke-width:1.6"/>
+<rect x="319.52" y="179.76" width="166.4" height="166.4" style="fill:none;stroke:var(--c5);stroke-width:1.6"/>
+<text class="ns" x="26" y="46">T1</text><text class="ns" x="192" y="46">T2</text><text class="ns" x="342" y="46">T3</text>
+<text class="ns" x="26" y="212">T4</text><text class="ns" x="192" y="212">T5</text><text class="ns" x="342" y="212">T6</text>
+<rect class="nd n-img" x="172" y="94" width="12" height="12" rx="2"/>
+<rect class="nd n-img" x="321" y="181" width="14" height="14" rx="2"/>
+<rect x="308" y="60" width="40" height="44" rx="3" style="fill:var(--img-f);stroke:var(--warn);stroke-width:2;stroke-dasharray:5 3"/>
+<text class="gl" x="510" y="44">How the frame is cut</text>
+<text class="ns" x="510" y="68">Frame 3,584 x 2,432 (8.7 MP)</text>
+<text class="ns" x="510" y="86">Tiles 1,280 x 1,280, overlap 128 px</text>
+<text class="ns" x="510" y="104">6 native-resolution tiles</text>
+<text class="ns" x="510" y="122">+ 1 global pass at 1/3 scale</text>
+<text class="ns" x="510" y="140">(1,195 x 811 px, one input)</text>
+<rect class="nd n-img" x="510" y="164" width="12" height="12" rx="2"/>
+<text class="ns" x="530" y="174">Seam face, 92 px wide:</text>
+<text class="ns" x="530" y="190">whole inside T1 and T2</text>
+<rect class="nd n-img" x="510" y="208" width="12" height="12" rx="2"/>
+<text class="ns" x="530" y="218">Corner face, 108 px wide:</text>
+<text class="ns" x="530" y="234">whole inside T2, T3, T5, T6</text>
+<rect x="510" y="252" width="12" height="12" rx="2" style="fill:var(--img-f);stroke:var(--warn);stroke-width:2;stroke-dasharray:3 2"/>
+<text class="ns" x="530" y="262">Large face, about 300 px:</text>
+<text class="ns" x="530" y="278">cut by every tile; the global</text>
+<text class="ns" x="530" y="294">pass sees it whole</text>
+<text class="ns" x="510" y="322">Rule: overlap at least as wide</text>
+<text class="ns" x="510" y="338">as the largest face tiles must own</text>
+</svg>
+</template>
+<table>
+<caption>Inputs and features by entity</caption>
+<tr><th>Entity</th><th>Feature</th><th>Encoding</th><th>Why</th></tr>
+<tr><td>Pixels</td><td>RGB tile, 1,280 x 1,280</td><td>Per-channel mean and std normalization; group norm in the network</td><td>Native resolution keeps 12-pixel faces visible</td></tr>
+<tr><td>Geometry</td><td>Camera index, tile row and column</td><td>One-hot, concatenated to the head (optional)</td><td>Cameras see sky, road and sidewalk at consistent heights; a face-sized blob in the sky is rarely real</td></tr>
+<tr><td>Region</td><td>Country code (plates only)</td><td>Embedding, or implicit from pixels</td><td>Plate shape, color and font differ by country; helps cold start only if enough data exists</td></tr>
+<tr><td>Training augmentation</td><td>Scale jitter, brightness and gamma, synthetic night, motion blur, JPEG, mosaic</td><td>Randomized per sample</td><td>Covers night, speed and compression that the clean labels under-represent</td></tr>
+</table>
+<p>Horizontal flips are safe for faces; for plates they mirror the characters, so apply them with low probability. Do not use augmentations that move a box out of the crop without clipping the label.</p>
+
+<h3>Labels</h3>
+<table>
+<caption>Where boxes come from</caption>
+<tr><th>Source</th><th>Quality</th><th>Cost</th><th>Role</th></tr>
+<tr><td>Human-drawn boxes (the 1M set)</td><td>High, with QA</td><td>High per image</td><td>Core training and all evaluation sets</td></tr>
+<tr><td>Model-assisted labels (humans correct a model's proposals)</td><td>High once reviewed</td><td>Several times cheaper</td><td>Scale up training data and cover new regions</td></tr>
+<tr><td>Audit findings and user reports</td><td>Very high (a real miss), but sparse and delayed</td><td>Almost free</td><td>Hard positives for training and for a permanent regression set</td></tr>
+<tr><td>Synthetic (pasted faces or plates onto scenes)</td><td>Controllable, but unrealistic texture</td><td>Low</td><td>Rare cases such as unusual plate formats; never the only evidence</td></tr>
+</table>
+<p>The decision: train on human boxes, expand with model-assisted labeling (a strong offline detector proposes, annotators fix), and treat audits and reports as the highest-value labels because each one is a case the production model got wrong. Write the labeling rule down. For example, label every face of a real person that a reasonable viewer could identify, including profiles, faces behind glass and partially occluded faces, but not faces on billboards, which go into an "ignore" region so the loss neither rewards nor punishes them.</p>
+<script type="application/json" class="dg" data-cap="Annotation with a quality loop: model proposals are corrected, independently reviewed, compared, and adjudicated on disagreement; gold tasks monitor labeler accuracy">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"pre","t":"Pre-annotation","s":"current model proposes boxes","c":0,"r":0,"k":"model"},
+  {"id":"an","t":"Annotator","s":"fix, add, delete boxes","c":1,"r":0,"k":"user"},
+  {"id":"rv","t":"Blind reviewer","s":"independent second pass","c":2,"r":0,"k":"user"},
+  {"id":"ag","t":"Agreement check","s":"class and IoU match","c":3,"r":0},
+  {"id":"gold","t":"Gold tasks","s":"known answers seeded in","c":1,"r":1,"k":"data"},
+  {"id":"adj","t":"Adjudicator","s":"senior labeler decides","c":2,"r":1,"k":"user"},
+  {"id":"st","t":"Label store","s":"versioned, with QA status","c":3,"r":1,"k":"store"}],
+ "edges":[["pre","an"],["an","rv"],["rv","ag"],["ag","st","agree"],["ag","adj","disagree",{"sa":"b","sb":"t"}],["adj","st","resolved"],["gold","an","seeded checks",{"d":1}]]}
+</script>
+<p><b>Class imbalance.</b> A detector scores a huge number of candidate locations per tile and almost all of them are background.</p>
+<div class="callout math"><p>With a RetinaNet-style head on pyramid strides 8, 16, 32, 64 and 128, a 1,280 x 1,280 tile has 160<sup>2</sup> + 80<sup>2</sup> + 40<sup>2</sup> + 20<sup>2</sup> + 10<sup>2</sup> = 25,600 + 6,400 + 1,600 + 400 + 100 = 34,100 locations. With 9 anchors per location that is 306,900 anchors. A tile with one face has about 10 positive anchors (those that overlap it by IoU 0.5 or more), so negatives outnumber positives by about 306,890 : 10, roughly 30,000 to 1. A naive loss is dominated by background.</p></div>
+<p>Three tools fight this: focal loss (Model Development), hard negative mining, and sampling. Faces are not spread evenly over size either. The chart shows an illustrative pattern: tiny faces are a small share of the dataset but, at the production threshold, most of the misses, so the training pool deliberately over-samples them.</p>
+<script type="application/json" class="dg" data-cap="Illustrative: faces under 16 px are 12% of faces but account for about half of the misses at the 99%-recall operating point, so they deserve extra training weight">
+{"type":"bars","labels":["Under 16 px","16-32 px","32-64 px","64-128 px","Over 128 px"],"series":[{"n":"Share of faces (%)","v":[12,20,28,25,15]},{"n":"Share of misses (%)","v":[53,33,10,3,1]}]}
+</script>
+<p><b>Hard negative mining.</b> Run the current model over frames known to contain no face or plate and collect its highest-scoring detections. These are posters, mannequins, statues, reflections and shop signs. Annotators confirm that they are true negatives, and the confirmed boxes are mixed into later batches.</p>
+<script type="application/json" class="dg" data-cap="Hard negative mining: the model's own false alarms become the next round's most informative negatives">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"det","t":"Detector v(n)","s":"trained so far","c":0,"r":0,"k":"model"},
+  {"id":"mine","t":"Mine negative pools","s":"frames with no face or plate","c":1,"r":0},
+  {"id":"fp","t":"High-score false alarms","s":"posters, mannequins, signs","c":2,"r":0,"k":"data"},
+  {"id":"ver","t":"Human verification","s":"is it really a non-face?","c":3,"r":0,"k":"user"},
+  {"id":"hn","t":"Hard-negative set","s":"mixed into each batch","c":3,"r":1,"k":"store"},
+  {"id":"re","t":"Retrain","s":"detector v(n+1)","c":0,"r":1,"k":"model"}],
+ "edges":[["det","mine","scores"],["mine","fp","top scores"],["fp","ver"],["ver","hn","confirmed"],["hn","re","1 : 3 mix"],["re","det","next round"]]}
+</script>
+<p><b>Noise, ambiguity, delay and bias.</b> "Identifiable" is a continuum, and labelers disagree most on tiny, blurred or partly hidden faces. Mark such objects "uncertain" and exclude them from the negative loss instead of forcing a yes or no. Reports arrive weeks after capture, so build the training set from a snapshot and fold late findings into the next one. Label bias is a fairness risk: if annotators work mostly on imagery from a few cities, rare skin tones, ages, head coverings and plate formats will be under-labeled, so sample the annotation queue by region and report coverage per slice.</p>
+
+<h2>Model Development</h2>
+
+<h3>Model options</h3>
+<table>
+<caption>Concrete options. Throughput numbers are planning assumptions on one mid-range inference GPU (FP16, batched); replace them with your own benchmark</caption>
+<tr><th>Option</th><th>Throughput (assumed)</th><th>Strength</th><th>Weakness</th></tr>
+<tr><td>A. Sliding-window detector plus small neural post-processor (the 2009 Google design)</td><td>CPU: 7-10 s per 5 MP image</td><td>Cheap features; the paper reported 89% of faces and 94-96% of plates sufficiently blurred</td><td>Hand-built features; low ceiling on hard faces; superseded by deep detectors</td></tr>
+<tr><td>B. Two-stage, ResNet-101 FPN, cascade</td><td>about 8 passes/s</td><td>Best small-object accuracy and tight boxes</td><td>Highest GPU cost</td></tr>
+<tr><td>C. One-stage RetinaNet-style, ResNet-50 FPN, focal loss</td><td>about 25 passes/s</td><td>Good accuracy at a fraction of B's cost</td><td>Needs careful small-object tuning</td></tr>
+<tr><td>D. Small one-stage (ResNet-18 or YOLO-small class)</td><td>about 80 passes/s</td><td>Cheapest</td><td>Misses the tiny and dark faces that dominate the error budget</td></tr>
+</table>
+<script type="application/json" class="dg" data-cap="Cost of one full pass over 1B frames at 7 detector passes per frame (assumed throughputs): model choice moves the bill by 10x">
+{"type":"bars","horiz":true,"labels":["Small one-stage","RetinaNet R50-FPN","Two-stage R101 cascade"],"series":[{"n":"Thousand GPU-hours per full pass","v":[24.3,77.8,243.1]}]}
+</script>
+<p>Decision: ship option C. Use B offline as the teacher that pre-labels data and audits tricky frames, and revisit D only if the cost of C becomes the bottleneck and a per-slice audit shows no recall loss. The arithmetic: at 7 passes per frame, 1B frames need 7 x 10<sup>9</sup> passes. At 80, 25 and 8 passes per second per GPU that is 24,306, 77,778 and 243,056 GPU-hours, which at an assumed $0.80 per GPU-hour is about $19k, $62k and $194k per full pass.</p>
+
+<h3>Training data construction</h3>
+<p>Every anchor is labeled by its overlap (IoU) with ground-truth boxes. Intersection over union is the area two boxes share divided by the area they cover together. The standard rule: IoU of at least 0.5 with a ground-truth box makes an anchor a positive for that box, below 0.4 makes it a negative, and in between it is ignored.</p>
+<script type="application/json" class="dg" data-cap="IoU worked example: a prediction shifted by (20, 10) px scores 0.5625; the same absolute error on a 12 px face scores 0.39 to 0.60" data-tpl="t-iou">
+{"type":"svg","tpl":"t-iou"}
+</script>
+<template id="t-iou">
+<svg class="fig" viewBox="0 0 760 330" role="img" aria-label="Two overlapping boxes with the IoU computation">
+<rect x="104" y="62" width="176" height="198" style="fill:var(--accent);opacity:.3"/>
+<rect x="60" y="40" width="220" height="220" rx="2" style="fill:none;stroke:var(--c0);stroke-width:3"/>
+<rect x="104" y="62" width="220" height="220" rx="2" style="fill:none;stroke:var(--c1);stroke-width:3;stroke-dasharray:7 4"/>
+<text class="nt" x="60" y="30" style="fill:var(--c0)">A: ground truth, 100 x 100</text>
+<text class="nt" x="104" y="304" style="fill:var(--c1)">B: prediction, shifted (20, 10)</text>
+<text class="nt" x="192" y="166" text-anchor="middle">I = 80 x 90</text>
+<text class="gl" x="420" y="40">Worked example</text>
+<text class="nt" x="420" y="68">Intersection I = 80 x 90 = 7,200</text>
+<text class="nt" x="420" y="92">Union U = A + B - I</text>
+<text class="nt" x="420" y="112">  = 10,000 + 10,000 - 7,200 = 12,800</text>
+<text class="nt" x="420" y="140" style="fill:var(--accent)">IoU = I / U = 7,200 / 12,800 = 0.5625</text>
+<line x1="420" y1="164" x2="740" y2="164" style="stroke:var(--line);stroke-width:1"/>
+<text class="gl" x="420" y="188">Tiny boxes are fragile</text>
+<text class="ns" x="420" y="210">12 x 12 face box, prediction 3 px off:</text>
+<text class="ns" x="420" y="230">right only: overlap 108, union 180, IoU 0.60</text>
+<text class="ns" x="420" y="250">right and down: overlap 81, union 207, IoU 0.39</text>
+<text class="ns" x="420" y="276">A 3-pixel slip fails a 0.5 test, so IoU is a</text>
+<text class="ns" x="420" y="292">poor yardstick for the faces that matter most.</text>
+</svg>
+</template>
+<p>The batch is not sampled uniformly from tiles. A sampling plan oversamples the cases that drive misses:</p>
+<table>
+<caption>Tile pools for one training batch (planning values)</caption>
+<tr><th>Pool</th><th>Share of batch</th><th>Why</th></tr>
+<tr><td>Random tiles</td><td>40%</td><td>Keeps the prior realistic; most tiles hold nothing</td></tr>
+<tr><td>Tiles with objects under 24 px</td><td>20%</td><td>Tiny faces dominate the miss budget</td></tr>
+<tr><td>Night and low-light tiles</td><td>10%</td><td>Recall drops fastest in the dark</td></tr>
+<tr><td>Hard-negative tiles</td><td>15%</td><td>Teaches the model what a poster or mannequin is</td></tr>
+<tr><td>New-region tiles</td><td>15%</td><td>Plate formats and clothing the model has seen least</td></tr>
+</table>
+
+<h3>Architecture</h3>
+<p>The backbone (ResNet-50) produces feature maps at several resolutions, and a feature pyramid network (FPN) merges them so every level carries both fine detail and context. Two small convolutional heads, shared across levels, predict a class score and a box offset for every anchor. The final-layer bias for the class branch is initialized so that every anchor starts with a low foreground probability (about 0.01), which keeps early training stable under the extreme imbalance.</p>
+<script type="application/json" class="dg" data-cap="RetinaNet-style heads: two parallel branches on every pyramid level, one for class scores and one for box offsets (A anchors per location)">
+{"type":"stack","cols":[
+ {"t":"Classification branch","layers":[{"t":"FPN feature map","s":"256 channels, strides 8 to 128"},{"t":"4 x conv 3x3 + ReLU","s":"shared across levels"},{"t":"conv 3x3 to A x 2","s":"face / plate score per anchor","k":"model"}]},
+ {"t":"Box branch","layers":[{"t":"FPN feature map","s":"256 channels, strides 8 to 128"},{"t":"4 x conv 3x3 + ReLU","s":"shared across levels"},{"t":"conv 3x3 to A x 4","s":"offsets dx, dy, dw, dh","k":"model"}]}],
+ "join":{"t":"Per-anchor predictions","s":"threshold, map back to frame"}}
+</script>
+
+<h3>Loss function</h3>
+<p>Training minimizes a classification loss over all non-ignored anchors plus a box loss over positive anchors only, both normalized by the number of positives.</p>
+<script type="application/json" class="dg" data-cap="Loss composition: anchor matching produces targets for two loss terms that are summed and normalized by the number of positive anchors">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"cls","t":"Class scores","s":"sigmoid per anchor","c":0,"r":0,"k":"vec"},
+  {"id":"fl","t":"Focal loss","s":"classification","c":1,"r":0,"k":"model"},
+  {"id":"tgt","t":"Matched targets","s":"IoU: positive, negative, ignore","c":1,"r":1,"k":"data"},
+  {"id":"box","t":"Box offsets","s":"dx, dy, dw, dh","c":0,"r":2,"k":"vec"},
+  {"id":"gl","t":"GIoU + L1 loss","s":"positives only","c":1,"r":2,"k":"model"},
+  {"id":"tot","t":"Total loss","s":"normalized by positives","c":3,"r":1},
+  {"id":"up","t":"Gradient step","s":"backprop to all layers","c":3,"r":2}],
+ "edges":[["cls","fl"],["box","gl"],["tgt","fl","cls targets"],["tgt","gl","box targets"],["fl","tot"],["gl","tot"],["tot","up"]]}
+</script>
+<p><b>Classification: focal loss.</b> Plain cross-entropy gives every anchor a loss of -log of the probability assigned to the true class (call that p<sub>t</sub>). Focal loss multiplies it by (1 - p<sub>t</sub>)<sup>&gamma;</sup>, with &gamma; = 2 in the original paper, so well-classified background anchors contribute almost nothing and the gradient is spent on the hard ones.</p>
+<script type="application/json" class="dg" data-cap="Loss as a function of the probability of the true class: focal loss (gamma = 2) crushes easy examples while barely changing hard ones">
+{"type":"curve","xl":"p_t: probability given to the true class","yl":"loss per anchor","xmin":0,"xmax":1,"ymin":0,"ymax":3,
+ "series":[
+  {"n":"Cross-entropy","c":1,"lp":2,"pts":[[0.05,2.996],[0.1,2.303],[0.2,1.609],[0.4,0.916],[0.6,0.511],[0.8,0.223],[0.9,0.105],[1,0]]},
+  {"n":"Focal loss, gamma = 2","c":0,"lp":3,"pts":[[0.05,2.704],[0.1,1.865],[0.2,1.030],[0.4,0.330],[0.6,0.082],[0.8,0.009],[0.9,0.001],[1,0]]}],
+ "marks":[{"x":0.8,"y":0.223,"t":"easy: 25x smaller"}]}
+</script>
+<div class="callout math"><p>Take one tile with 100,000 easy background anchors, each with p<sub>t</sub> = 0.99, and 3 hard positive anchors with p<sub>t</sub> = 0.3. Cross-entropy: each easy anchor costs -ln 0.99 = 0.01005, so the easy total is 100,000 x 0.01005 = 1,005; the positives cost 3 x 1.204 = 3.61, so background outweighs the faces by about 278 to 1. Focal loss (gamma = 2, ignoring the alpha weight): each easy anchor costs 0.01<sup>2</sup> x 0.01005 = 1.005 x 10<sup>-6</sup>, so the easy total is 0.1005; each positive costs 0.7<sup>2</sup> x 1.204 = 0.590, so the positives total 1.77. Now the faces outweigh the background by about 17 to 1.</p></div>
+<p><b>Box regression.</b> Offsets are trained with smooth L1 (quadratic for small errors, linear for large) and often an overlap-aware term. The generalized IoU (GIoU) loss is 1 - GIoU, where GIoU = IoU - (area of the smallest enclosing box minus the union) / (area of the enclosing box); it gives a gradient even for non-overlapping boxes.</p>
+<div class="callout math"><p>For the boxes in the IoU figure, A = (0, 0, 100, 100) and B = (20, 10, 120, 110): the smallest enclosing box is (0, 0, 120, 110) with area 13,200. The union is 12,800, so the penalty term is (13,200 - 12,800) / 13,200 = 0.0303. GIoU = 0.5625 - 0.0303 = 0.5322, and the loss is 1 - 0.5322 = 0.4678.</p></div>
+<p>The two terms are added with a weight chosen on validation data, and the sum is divided by the number of positive anchors in the batch so tiles with many faces do not dominate. Practical training details: mixed precision, group normalization (small per-GPU batches make batch norm unreliable), multi-scale tile sampling, and a periodic refresh of the hard-negative pool.</p>
+
+<h3>Post-processing: NMS or not</h3>
+<p>A dense detector fires several overlapping boxes for one object. Non-maximum suppression (NMS) sorts boxes by score, keeps the best, and discards others whose IoU with it exceeds a threshold, then repeats. This matters for evaluation and for clean metadata. For blurring itself it is optional, and that is a design choice worth stating.</p>
+<script type="application/json" class="dg" data-cap="Non-maximum suppression at IoU 0.5 removes duplicates for evaluation; for blurring we can skip it and render the union of all boxes above the threshold" data-tpl="t-nms">
+{"type":"svg","tpl":"t-nms"}
+</script>
+<template id="t-nms">
+<svg class="fig" viewBox="0 0 760 338" role="img" aria-label="Detections before and after non-maximum suppression">
+<text class="gl" x="14" y="22">Before: 4 raw detections</text>
+<text class="gl" x="394" y="22">After NMS (IoU threshold 0.5)</text>
+<rect x="14" y="32" width="340" height="140" rx="8" style="fill:var(--bg);stroke:var(--line)"/>
+<rect x="394" y="32" width="340" height="140" rx="8" style="fill:var(--bg);stroke:var(--line)"/>
+<g transform="translate(24 40) scale(0.85)">
+<rect x="60" y="50" width="80" height="80" style="fill:none;stroke:var(--c0);stroke-width:2.5" vector-effect="non-scaling-stroke"/>
+<rect x="70" y="60" width="80" height="80" style="fill:none;stroke:var(--c1);stroke-width:2.5" vector-effect="non-scaling-stroke"/>
+<rect x="50" y="40" width="70" height="80" style="fill:none;stroke:var(--c3);stroke-width:2.5" vector-effect="non-scaling-stroke"/>
+<rect x="300" y="70" width="60" height="60" style="fill:none;stroke:var(--c2);stroke-width:2.5" vector-effect="non-scaling-stroke"/>
+</g>
+<g transform="translate(404 40) scale(0.85)">
+<rect x="60" y="50" width="80" height="80" style="fill:none;stroke:var(--c0);stroke-width:2.5" vector-effect="non-scaling-stroke"/>
+<rect x="70" y="60" width="80" height="80" style="fill:none;stroke:var(--c1);stroke-width:1.5;stroke-dasharray:4 3;opacity:.35" vector-effect="non-scaling-stroke"/>
+<rect x="50" y="40" width="70" height="80" style="fill:none;stroke:var(--c3);stroke-width:1.5;stroke-dasharray:4 3;opacity:.35" vector-effect="non-scaling-stroke"/>
+<rect x="300" y="70" width="60" height="60" style="fill:none;stroke:var(--c2);stroke-width:2.5" vector-effect="non-scaling-stroke"/>
+</g>
+<text class="ns" x="24" y="192" style="fill:var(--c0)">B1  score 0.92 (kept: highest)</text>
+<text class="ns" x="24" y="208" style="fill:var(--c1)">B2  score 0.85, IoU with B1 = 0.62: dropped</text>
+<text class="ns" x="24" y="224" style="fill:var(--c3)">B3  score 0.60, IoU with B1 = 0.54: dropped</text>
+<text class="ns" x="24" y="240" style="fill:var(--c2)">C   score 0.55, IoU with B1 = 0: kept</text>
+<text class="ns" x="404" y="192">1. Sort by score; keep B1.</text>
+<text class="ns" x="404" y="208">2. Drop boxes with IoU above 0.5 against B1.</text>
+<text class="ns" x="404" y="224">3. Repeat on the rest; C survives.</text>
+<rect class="nd n-model" x="14" y="260" width="720" height="58" rx="10"/>
+<text class="nt" x="30" y="284">For blurring, skip NMS: render the union of every box above the threshold.</text>
+<text class="ns" x="30" y="304">Duplicates cost nothing, and suppression can never hide a face standing next to another face.</text>
+</svg>
+</template>
+<div class="callout key"><p>NMS exists to make a clean list of objects, which evaluation and counting need. A blur renderer needs a mask, and the union of overlapping boxes is the same mask. Skipping NMS removes a failure mode (a real face in a crowd suppressed by its neighbor) and costs only a few redundant boxes. Keep NMS, or Soft-NMS, for the audit and mAP pipelines.</p></div>
+<p>An optional verifier can sit after the detector. In the 2009 design a second stage rescored each candidate with cheap context (camera index, box height versus vertical position, color statistics) so the first stage could run at a recall-heavy threshold. If you add one, never let it veto a very high-confidence detection, since a verifier trained on yesterday's data can overrule a rare but real face.</p>
+
+<h2>Evaluation</h2>
+
+<h3>Offline metrics</h3>
+<p>First fix the matching rule: a detection is a true positive if its class matches and its IoU with an unmatched ground-truth box is at least 0.5; otherwise it is a false positive, and an unmatched ground-truth box is a false negative. In privacy terms the cells of that table mean very different things.</p>
+<script type="application/json" class="dg" data-cap="Error taxonomy with privacy semantics: only the false negative is a leak, and the assumed 100x cost ratio sets how far down the PR curve we operate" data-tpl="t-conf">
+{"type":"svg","tpl":"t-conf"}
+</script>
+<template id="t-conf">
+<svg class="fig" viewBox="0 0 760 322" role="img" aria-label="Confusion matrix with privacy meaning for each cell">
+<text class="gl" x="214" y="22">Model output</text>
+<text class="ns" x="335" y="48" text-anchor="middle">Blurred</text>
+<text class="ns" x="593" y="48" text-anchor="middle">Not blurred</text>
+<text class="gl" x="14" y="82">Reality</text>
+<text class="ns" x="200" y="112" text-anchor="end">Identifiable face</text>
+<text class="ns" x="200" y="128" text-anchor="end">or plate present</text>
+<text class="ns" x="200" y="236" text-anchor="end">Nothing to protect</text>
+<text class="ns" x="200" y="252" text-anchor="end">(poster, tree, sign)</text>
+<rect x="210" y="58" width="250" height="108" rx="12" style="fill:var(--data-f);stroke:var(--data-s);stroke-width:2"/>
+<text class="nt" x="226" y="86">True positive: protected</text>
+<text class="ns" x="226" y="108">The goal of the system.</text>
+<text class="ns" x="226" y="126">Recall = TP / (TP + FN)</text>
+<text class="ns" x="226" y="144">Target: about 99% or better</text>
+<rect x="468" y="58" width="250" height="108" rx="12" style="fill:var(--img-f);stroke:var(--bad);stroke-width:3"/>
+<text class="nt" x="484" y="86">False negative: privacy leak</text>
+<text class="ns" x="484" y="108">A visible face or plate goes public.</text>
+<text class="ns" x="484" y="126">Cost: incident, trust, regulation.</text>
+<text class="ns" x="484" y="144">Minimize first.</text>
+<rect x="210" y="174" width="250" height="108" rx="12" style="fill:var(--store-f);stroke:var(--store-s);stroke-width:2"/>
+<text class="nt" x="226" y="202">False positive: over-blur</text>
+<text class="ns" x="226" y="224">Precision = TP / (TP + FP)</text>
+<text class="ns" x="226" y="242">Cost: a stray blur, small quality loss.</text>
+<text class="ns" x="226" y="260">Budgeted, not eliminated.</text>
+<rect x="468" y="174" width="250" height="108" rx="12" style="fill:var(--io-f);stroke:var(--io-s);stroke-width:2"/>
+<text class="nt" x="484" y="202">True negative: left alone</text>
+<text class="ns" x="484" y="224">Most pixels in most frames.</text>
+<text class="ns" x="484" y="242">Not informative on its own.</text>
+<text class="ns" x="14" y="306">Assumption: one leak is treated as at least 100x worse than one false blur.</text>
+</svg>
+</template>
+<table>
+<caption>Candidate offline metrics</caption>
+<tr><th>Metric</th><th>Definition</th><th>Mini example</th><th>Flaw</th><th>Decision</th></tr>
+<tr><td>IoU</td><td>Shared area divided by combined area of two boxes</td><td>7,200 / 12,800 = 0.5625 in the figure above</td><td>Brutal on tiny boxes; ignores which side is missing</td><td>Use only as the matching rule</td></tr>
+<tr><td>Recall</td><td>Matched ground truth divided by all ground truth</td><td>99 of 100 faces found: 0.99</td><td>Counts every face equally and hides slices; depends on matching</td><td>Primary metric, with confidence intervals and per slice</td></tr>
+<tr><td>Precision</td><td>Correct detections divided by all detections</td><td>99 correct, 91 false: 99 / 190 = 0.521</td><td>Low by design at high recall; false alarms differ in severity</td><td>Guardrail or budget, not a target</td></tr>
+<tr><td>AP / mAP</td><td>Area under the precision-recall curve, averaged over classes</td><td>Worked example below: 0.6875</td><td>Averages over operating points we never use</td><td>Screening and research comparisons only</td></tr>
+<tr><td>F1</td><td>Harmonic mean of precision and recall</td><td>P = 0.52, R = 0.99: 2 x 0.52 x 0.99 / 1.51 = 0.682</td><td>Weights precision and recall equally, the opposite of our priority</td><td>Do not use</td></tr>
+<tr><td>Recall at a false-alarm budget</td><td>Recall when false boxes per frame are held at or below a limit</td><td>At 0.37 false boxes per frame, recall is 0.99</td><td>Needs an agreed budget</td><td>Use to compare model versions</td></tr>
+<tr><td>Coverage recall and pixel FPR</td><td>Share of ground-truth objects whose area is covered (for example 70% or more) by the final blur; share of blurred pixels outside any ground-truth box</td><td>Next paragraph</td><td>Depends on conservative ground truth; coverage threshold is a judgment</td><td>Release metric, paired with human audit</td></tr>
+</table>
+<div class="callout math"><p><b>AP by hand.</b> There are 4 ground-truth faces. Ranked by score, five detections are TP, TP, FP, TP, FP. Precision and recall after each: rank 1: 1/1, 0.25; rank 2: 2/2, 0.50; rank 3: 2/3, 0.50; rank 4: 3/4, 0.75; rank 5: 3/5, 0.75. The fourth face is never found. Take the maximum precision at or beyond each recall level: 1.0 for recall up to 0.50, 0.75 for recall up to 0.75, and 0 beyond. AP = 0.25 x 1.0 + 0.25 x 1.0 + 0.25 x 0.75 + 0.25 x 0 = 0.6875.</p></div>
+<div class="callout math"><p><b>Why coverage beats IoU for privacy.</b> A ground-truth face box is 40 x 50 = 2,000 px<sup>2</sup>. The model predicts a centered 30 x 40 box (1,200 px<sup>2</sup>). IoU = 1,200 / 2,000 = 0.60, a true positive, but only 60% of the face is covered. With the 20% rendering margin (next sections) the blurred region becomes 42 x 56, which covers the whole face. The 2009 paper made the same point: a hand count of "sufficiently blurred" objects was higher than the automatic box-overlap recall, especially for plates.</p></div>
+
+<h3>Choosing the threshold</h3>
+<p>Sweep the score threshold on a held-out set and record recall and precision at each point. Illustrative numbers for a held-out set of 50,000 frames containing 20,000 faces:</p>
+<table>
+<caption>Threshold sweep (illustrative). Detections = TP / precision; false boxes = detections - TP</caption>
+<tr><th>Threshold</th><th>Recall</th><th>Precision</th><th>Missed faces</th><th>False boxes</th><th>False boxes per frame</th></tr>
+<tr><td>0.50</td><td>0.930</td><td>0.92</td><td>1,400</td><td>1,617</td><td>0.032</td></tr>
+<tr><td>0.30</td><td>0.962</td><td>0.85</td><td>760</td><td>3,395</td><td>0.068</td></tr>
+<tr><td>0.15</td><td>0.981</td><td>0.70</td><td>380</td><td>8,409</td><td>0.168</td></tr>
+<tr><td>0.08</td><td>0.990</td><td>0.52</td><td>200</td><td>18,277</td><td>0.366</td></tr>
+<tr><td>0.04</td><td>0.995</td><td>0.33</td><td>100</td><td>40,403</td><td>0.808</td></tr>
+</table>
+<script type="application/json" class="dg" data-cap="Illustrative PR curves at the high-recall end. The new model buys either fewer false boxes at the same recall or more recall at the same false boxes; the operating point sits at 99% recall">
+{"type":"curve","xl":"Recall","yl":"Precision","xmin":0.9,"xmax":1,"ymin":0.2,"ymax":1,
+ "series":[
+  {"n":"New model (v2)","c":0,"lp":2,"pts":[[0.9,0.94],[0.93,0.92],[0.962,0.85],[0.981,0.70],[0.99,0.52],[0.995,0.33],[0.997,0.22]]},
+  {"n":"Old model (v1)","c":1,"d":1,"lp":2,"pts":[[0.9,0.85],[0.93,0.78],[0.962,0.62],[0.981,0.42],[0.99,0.28],[0.995,0.20]]}],
+ "marks":[{"x":0.99,"y":0.52,"t":"t = 0.08"}]}
+</script>
+<div class="callout math"><p><b>Pick the threshold.</b> Target: recall of at least 99% with 95% confidence. At 20,000 faces the standard error of a recall near 0.99 is sqrt(0.99 x 0.01 / 20,000) = 0.0007, so a one-sided 95% bound is 1.645 x 0.0007 = 0.0012 below the estimate. A measured 0.990 is therefore not enough; we need a measured recall of about 0.9912, so we lower the threshold from 0.08 toward 0.06 (or grow the test set). At t = 0.08 the precision of 0.52 means 19,800 true boxes and 18,277 false ones: 0.37 false boxes per frame, so roughly one frame in three carries a stray blur. Cover that stray area: at about 48 x 48 px per box on a 9 MP frame it is 0.37 x 2,304 / 8.7M = 0.01% of the pixels, which is why the visual damage is small.</p></div>
+<div class="callout math"><p><b>What recall means at scale.</b> With 1B frames and 0.4 faces per frame there are 400M faces. A recall of 0.89 (the 2009 paper's hand-counted figure on its city test set) would leave 44M faces visible. At 0.99, 4M; at 0.999, 400k. For plates at 0.3 per frame, 300M plates and 99% recall leave 3M. No automatic system reaches zero, which is why audits and user reports are a designed-in second line of defense, not an afterthought.</p></div>
+<table>
+<caption>Missed faces in a 1B-frame archive (0.4 faces per frame = 400M faces)</caption>
+<tr><th>Recall</th><th>Missed faces</th><th>Comment</th></tr>
+<tr><td>0.89</td><td>44,000,000</td><td>Hand-counted result of the 2009 system on its city set (different data, different era)</td></tr>
+<tr><td>0.98</td><td>8,000,000</td><td>Roughly where a good detector lands with no tuning for recall</td></tr>
+<tr><td>0.99</td><td>4,000,000</td><td>Our target</td></tr>
+<tr><td>0.999</td><td>400,000</td><td>Needs audits, report handling and a verifier; each decimal costs far more than the last</td></tr>
+</table>
+
+<h3>Slices: size, light, fairness</h3>
+<p>The headline number hides who is missed. Report recall at the chosen threshold per size bucket, per lighting condition, per country, and per demographic slice.</p>
+<script type="application/json" class="dg" data-cap="Illustrative miss rate (%) by face size and lighting at t = 0.08. Weighted by the size mix from the data section and a 90/10 day/night split this averages to 1.0%, i.e. 99% recall">
+{"type":"bars","labels":["Under 16 px","16-32 px","32-64 px","64-128 px","Over 128 px"],"series":[{"n":"Daylight","v":[4.0,1.5,0.3,0.1,0.05]},{"n":"Night","v":[8.0,3.0,1.0,0.3,0.1]}]}
+</script>
+<script type="application/json" class="dg" data-cap="Illustrative relative miss-risk index by condition (1 = highest risk). Tiny, dark and unfamiliar cases concentrate risk, which is where to spend data and audit effort">
+{"type":"matrix","rl":"Condition","cl":"Relative miss risk","rows":["Tiny (under 16 px)","Heavy occlusion","Night or low light","Motion blur","Extreme angle","Glare or reflection"],"cols":["Face","Plate","Plate (new)"],
+ "v":[[0.9,0.6,0.8],[0.7,0.4,0.5],[0.6,0.7,0.8],[0.5,0.6,0.7],[0.6,0.5,0.6],[0.4,0.6,0.7]]}
+</script>
+<table>
+<caption>Slices that must each meet the recall target (within a small tolerance)</caption>
+<tr><th>Slice</th><th>Why it can fail</th><th>How to measure</th><th>Action if low</th></tr>
+<tr><td>Skin tone</td><td>Under-representation and lower contrast in training data; face-analysis benchmarks have documented large gaps between groups</td><td>Audit set with perceived-tone labels, stored only as aggregates</td><td>Targeted collection, loss reweighting, lower regional threshold</td></tr>
+<tr><td>Age (children, older adults)</td><td>Small faces, different proportions, strollers and wheelchairs lower the camera angle</td><td>Perceived age bucket in audits</td><td>Oversample, add pose augmentation</td></tr>
+<tr><td>Head coverings, masks, sunglasses, hoods</td><td>Missing landmarks; the paper's example faces include hats and sunglasses</td><td>Occlusion tags</td><td>Label as faces whenever identifiable; add data</td></tr>
+<tr><td>Country and plate format</td><td>Aspect ratio, color, font and mounting differ</td><td>Per-country audit sample</td><td>Fine-tune; hold publication until it passes</td></tr>
+<tr><td>Lighting and weather</td><td>Night noise, glare, rain on the lens</td><td>Exposure bucket and weather tags</td><td>Synthetic night, specialist ensemble for dark frames</td></tr>
+</table>
+<p>The release rule: the global recall bound and every slice's recall bound must meet the target, with the slice tolerance agreed in advance. The "perceived attribute" labels needed for fairness slices are themselves sensitive, so collect them only from consenting or vetted annotators, keep them out of the production path, and publish only aggregates.</p>
+
+<h3>Online metrics</h3>
+<table>
+<caption>Online and operational metrics</caption>
+<tr><th>Type</th><th>Metric</th><th>Direction</th><th>Notes</th></tr>
+<tr><td>Business</td><td>Privacy reports per million views (missed face or plate)</td><td>Down</td><td>The ground-truth outcome; rare, delayed, and biased toward visible places</td></tr>
+<tr><td>Business</td><td>Median time from report to fix</td><td>Down</td><td>Measures the safety net, not the model</td></tr>
+<tr><td>Engagement</td><td>Street View sessions and dwell per user</td><td>Flat</td><td>Over-blur would reduce usefulness; should not move</td></tr>
+<tr><td>Guardrail</td><td>Over-blur complaints per million views; pixel FPR on audit set</td><td>Flat or down</td><td>Keeps recall-first tuning honest</td></tr>
+<tr><td>Guardrail</td><td>Audited recall per slice with confidence interval</td><td>At or above target</td><td>Release gate</td></tr>
+<tr><td>Guardrail</td><td>Cost per million frames; backlog age</td><td>Flat</td><td>Throughput and budget</td></tr>
+</table>
+<div class="callout math"><p><b>Audit sample size.</b> To estimate a recall near 0.99 to within +/- 0.001 (95% interval), we need 1.96 x sqrt(0.99 x 0.01 / n) = 0.001, so n = 0.0099 / (0.001 / 1.96)<sup>2</sup>, about 38,000 faces. At 0.4 faces per frame that is roughly 95,000 audited frames per release, and more for any slice that must be measured as tightly.</p></div>
+<div class="callout warn"><p>You cannot A/B test privacy on users. Showing one cohort unblurred faces to measure the difference is unacceptable, and real incidents are too rare to detect quickly: to see a drop from 2 to 1.5 reports per million views with 80% power at the 5% level takes about (1.96 + 0.84)<sup>2</sup> x (2 + 1.5) / 0.5<sup>2</sup> = 110 million views per arm. Use shadow mode on audited samples to decide, then a staged regional rollout with a holdback region, and treat online report rates as a monitor, not a gate.</p></div>
+
+<h2>Serving</h2>
+
+<h3>Batch architecture</h3>
+<p>The system is a throughput pipeline, not a request-response service. A scheduler splits the archive into shards by region and priority; CPU workers decode and tile frames; GPU workers run the detector with large batches; detections are written to a store; and a renderer applies the blur from the stored boxes to the raw pixels, writes a published copy, and a gate decides whether it may go live.</p>
+<script type="application/json" class="dg" data-cap="Batch blurring pipeline: detection and redaction run offline on a GPU fleet; nothing is published unless the gate confirms a current-version detection exists for the frame">
+{"type":"graph","cols":5,
+ "groups":[{"t":"Detect (offline GPU batch)","c0":0,"c1":4,"r0":0,"r1":0},{"t":"Redact and publish","c0":0,"c1":4,"r0":1,"r1":1}],
+ "nodes":[
+  {"id":"raw","t":"Raw frame store","s":"encrypted, restricted","c":0,"r":0,"k":"store"},
+  {"id":"sch","t":"Work scheduler","s":"shards by region, priority","c":1,"r":0},
+  {"id":"cpu","t":"CPU workers","s":"decode, tile, downscale","c":2,"r":0},
+  {"id":"gpu","t":"GPU inference fleet","s":"batched, FP16","c":3,"r":0,"k":"model"},
+  {"id":"det","t":"Detection store","s":"boxes, scores, version","c":4,"r":0,"k":"store"},
+  {"id":"ren","t":"Blur renderer","s":"union, margin, blur","c":0,"r":1},
+  {"id":"bst","t":"Blurred store","s":"published copy","c":1,"r":1,"k":"store"},
+  {"id":"gate","t":"Publish gate","s":"fails closed","c":2,"r":1},
+  {"id":"cdn","t":"Tile serving","s":"CDN","c":3,"r":1},
+  {"id":"cl","t":"Map clients","c":4,"r":1,"k":"io"}],
+ "edges":[["raw","sch","ids"],["sch","cpu","shards"],["cpu","gpu","tiles"],["gpu","det","boxes"],["det","ren","boxes",{"sa":"b","sb":"t"}],["raw","ren","pixels",{"d":1}],["ren","bst"],["bst","gate"],["gate","cdn"],["cdn","cl"]]}
+</script>
+<table>
+<caption>Latency and scale math. Every row is an assumption or a direct calculation from earlier rows</caption>
+<tr><th>Quantity</th><th>Value</th><th>Derivation</th></tr>
+<tr><td>Frames per full pass</td><td>1,000,000,000</td><td>Assumption</td></tr>
+<tr><td>Detector passes per frame</td><td>7</td><td>6 tiles + 1 global pass</td></tr>
+<tr><td>Throughput per GPU</td><td>25 passes/s</td><td>Assumption (R50-FPN, FP16, batched)</td></tr>
+<tr><td>GPU time per frame</td><td>0.28 s</td><td>7 / 25</td></tr>
+<tr><td>GPU-hours per full pass</td><td>77,778</td><td>10<sup>9</sup> x 0.28 / 3,600</td></tr>
+<tr><td>GPU cost per full pass</td><td>about $62,000</td><td>77,778 x $0.80 (assumed batch or spot price)</td></tr>
+<tr><td>Wall clock on 2,000 GPUs</td><td>38.9 hours</td><td>77,778 / 2,000</td></tr>
+<tr><td>Raw storage read</td><td>4 PB, 28.6 GB/s sustained</td><td>4 MB per frame; 4 x 10<sup>15</sup> B / 140,000 s; about 14 MB/s per GPU</td></tr>
+<tr><td>CPU cost per full pass</td><td>55,556 core-hours, about $1,700</td><td>0.2 CPU-s per frame decode, tile and encode; $0.03 per core-hour assumed</td></tr>
+<tr><td>Steady-state capacity for new capture</td><td>about 65 GPUs busy</td><td>Assume 20M new frames per day x 0.28 s = 1,556 GPU-hours/day; / 24</td></tr>
+<tr><td>Detection metadata</td><td>about 160 GB</td><td>5 candidate boxes per frame x 32 B x 10<sup>9</sup></td></tr>
+</table>
+<p>For context, the 2009 system took 7 to 10 seconds of CPU per 5 MP image; at 8.5 s, one billion frames would be 2.4 million core-hours. The GPU design needs about 30 times fewer device-hours (77,778 versus 2.4 million), though the comparison mixes hardware types and generations. The pipeline is I/O-bound before it is compute-bound: 28.6 GB/s of sustained reads means the GPU fleet must live next to the raw store, with tile decoding done on local CPUs, and the tiles sent to the GPUs over the cluster network rather than re-read from remote storage.</p>
+
+<h3>Applying the blur</h3>
+<p>The renderer takes the union of all boxes above the threshold, expands each box by a margin, and applies an irreversible redaction to the raw pixels. The margin absorbs loose boxes, hair, ears, and plate edges. The redaction must be irreversible and visibly an obscuring effect: the 2009 paper used noise plus an aggressive Gaussian blur, alpha-blended into the surroundings starting at the box edge, and noted that low-strength blur or pixelation can be partly undone. Use a filter strength proportional to box size so a small box is not left readable.</p>
+<script type="application/json" class="dg" data-cap="Blur rendering: a tight detector box can clip hair, ears and plate edges, so the renderer grows each box by 20% per side before applying noise and a heavy blur with a feathered edge" data-tpl="t-blur">
+{"type":"svg","tpl":"t-blur"}
+</script>
+<template id="t-blur">
+<svg class="fig" viewBox="0 0 760 290" role="img" aria-label="Box expansion and blur rendering in three panels">
+<defs>
+<filter id="blf" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="8"/></filter>
+<filter id="bl2" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="3"/></filter>
+<g id="hd">
+<path d="M-46 -20 Q-46 -66 0 -66 Q46 -66 46 -20 Q30 -44 0 -44 Q-30 -44 -46 -20Z" style="fill:var(--io-s);opacity:.7"/>
+<ellipse class="nd n-img" cx="0" cy="0" rx="44" ry="56"/>
+<circle class="nd n-img" cx="-47" cy="2" r="7"/>
+<circle class="nd n-img" cx="47" cy="2" r="7"/>
+<circle cx="-15" cy="-8" r="3.5" style="fill:var(--fg)"/>
+<circle cx="15" cy="-8" r="3.5" style="fill:var(--fg)"/>
+<path d="M-14 24 Q0 34 14 24" style="fill:none;stroke:var(--fg);stroke-width:2"/>
+</g>
+</defs>
+<use href="#hd" transform="translate(130 130)"/>
+<rect x="82" y="70" width="96" height="120" style="fill:none;stroke:var(--accent);stroke-width:2.5"/>
+<text class="ns" x="130" y="46" text-anchor="middle" style="fill:var(--bad)">box clips hair and ears</text>
+<use href="#hd" transform="translate(380 130)"/>
+<rect x="332" y="70" width="96" height="120" style="fill:none;stroke:var(--accent);stroke-width:1.5;stroke-dasharray:4 3"/>
+<rect x="312.8" y="46" width="134.4" height="168" style="fill:none;stroke:var(--c1);stroke-width:2.5"/>
+<text class="ns" x="380" y="36" text-anchor="middle">expanded box covers the head</text>
+<rect x="312.8" y="46" width="134.4" height="168" rx="6" filter="url(#bl2)" style="fill:var(--io-s);opacity:.35"/>
+<g filter="url(#blf)" transform="translate(630 130)">
+<ellipse cx="0" cy="0" rx="44" ry="56" style="fill:var(--img-s);opacity:.55"/>
+<path d="M-46 -20 Q-46 -66 0 -66 Q46 -66 46 -20 Z" style="fill:var(--io-s);opacity:.6"/>
+</g>
+<text class="ns" x="630" y="36" text-anchor="middle">not recognizable, edges fade out</text>
+<text class="nt" x="130" y="244" text-anchor="middle">1. Detector box</text>
+<text class="ns" x="130" y="262" text-anchor="middle">40 x 50 px = 2,000 px</text>
+<text class="nt" x="380" y="244" text-anchor="middle">2. Margin +20% per side</text>
+<text class="ns" x="380" y="262" text-anchor="middle">56 x 70 px = 3,920 px (1.96x)</text>
+<text class="nt" x="630" y="244" text-anchor="middle">3. Noise + heavy blur</text>
+<text class="ns" x="630" y="262" text-anchor="middle">feathered alpha blend, irreversible</text>
+<text class="ns" x="14" y="282">Margin buys tolerance to loose boxes at 1.96x the blurred area per object.</text>
+</svg>
+</template>
+<p>Margin is a recall lever with a visible cost: 20% per side nearly doubles each blurred area (56 x 70 = 3,920 versus 2,000 pixels). Tune it per class on the audit set. Faces usually need more margin than plates, and the margin should be capped so a large false box does not wipe out a storefront. Face obfuscation studies on large image datasets suggest that blurring faces costs recognition models little accuracy, which supports being generous with the blur.</p>
+
+<h3>Failure modes and degradation</h3>
+<table>
+<caption>What breaks and what the design does</caption>
+<tr><th>Failure</th><th>Effect</th><th>Mitigation</th></tr>
+<tr><td>GPU preempted mid-shard</td><td>Partial detections</td><td>Idempotent shards keyed by (frame, model version); resumable; no partial publish</td></tr>
+<tr><td>Corrupt or truncated frame</td><td>Detector sees garbage, finds nothing</td><td>Decode check and dimension check; a frame that fails is not published</td></tr>
+<tr><td>Wrong threshold deployed (0.8 instead of 0.08)</td><td>Mass recall loss</td><td>Config validated against audit set before rollout; canary region; alert on blur-rate drop per frame</td></tr>
+<tr><td>Model version skew</td><td>Mixed behavior in one region</td><td>Every detection row carries the model version; the gate requires the current version</td></tr>
+<tr><td>Renderer bug writes the original pixels</td><td>Unblurred image goes public</td><td>Post-render check: re-run the detector on blurred output and flag any remaining high-score box; fail closed</td></tr>
+<tr><td>Detector outage</td><td>Backlog grows</td><td>Publishing pauses; already-published imagery is unaffected; never fall back to "no blur"</td></tr>
+</table>
+<p>The principle is to fail closed. The gate publishes a frame only when it has a detection record from an approved model version and a rendered copy that passed the post-render check. Any other state means the frame stays private, and the cost of that choice is delay, not exposure.</p>
+
+<h3>Model refresh and reprocessing</h3>
+<p>Retrain on a regular cadence (for example quarterly) or sooner when audits show drift in a region or class. A new model only helps published imagery if the old imagery is reprocessed, and a full pass costs about $62k in GPU time under our assumptions, so do it in priority order rather than uniformly.</p>
+<script type="application/json" class="dg" data-cap="Model upgrade: a release gate on every slice, then reprocessing ordered by risk and exposure, merged with sticky blurs, swapped atomically, and audited after publication">
+{"type":"graph","cols":5,
+ "groups":[{"t":"Decide","c0":0,"c1":4,"r0":0,"r1":0},{"t":"Reprocess and publish","c0":0,"c1":4,"r0":1,"r1":1}],
+ "nodes":[
+  {"id":"mdl","t":"New model","s":"v(n+1) trained","c":0,"r":0,"k":"model"},
+  {"id":"sh","t":"Shadow evaluation","s":"audit set, every slice","c":1,"r":0},
+  {"id":"gt","t":"Release gate","s":"no slice regresses","c":2,"r":0},
+  {"id":"sc","t":"Priority scorer","s":"risk x exposure x age","c":3,"r":0},
+  {"id":"qu","t":"Tiered queue","s":"tier 0 first","c":4,"r":0,"k":"store"},
+  {"id":"fl","t":"GPU fleet","s":"spot, resumable","c":0,"r":1},
+  {"id":"un","t":"Union with sticky blurs","s":"reports, manual blurs","c":1,"r":1},
+  {"id":"rv","t":"Delta report","s":"new boxes per tier","c":2,"r":1,"k":"data"},
+  {"id":"sw","t":"Atomic swap","s":"old tiles live until done","c":3,"r":1},
+  {"id":"mon","t":"Post-swap audit","s":"sample new tiles","c":4,"r":1,"k":"user"}],
+ "edges":[["mdl","sh"],["sh","gt"],["gt","sc","pass"],["sc","qu"],["qu","fl","work",{"sa":"b","sb":"t"}],["fl","un"],["un","rv"],["rv","sw"],["sw","mon"]]}
+</script>
+<table>
+<caption>Reprocessing tiers (shares are planning assumptions)</caption>
+<tr><th>Tier</th><th>What</th><th>Why first</th><th>Share of archive</th></tr>
+<tr><td>0</td><td>Areas with open reports or audited misses</td><td>Known exposure</td><td>Under 0.1%</td></tr>
+<tr><td>1</td><td>Busiest tiles by views: dense city centers, schools, hospitals, transit hubs</td><td>Most eyeballs, most pedestrians</td><td>About 5%, carrying about 60% of views (assumed heavy tail)</td></tr>
+<tr><td>2</td><td>Imagery captured with older models or in lower-scoring regions</td><td>Highest expected misses per frame</td><td>About 25%</td></tr>
+<tr><td>3</td><td>Long tail: rural, old, rarely viewed</td><td>Lowest exposure</td><td>About 70%</td></tr>
+</table>
+<p>Tier 1 costs about 5% of $62k, roughly $3,100, and removes most real-world exposure within hours. The merge step matters: manual blurs and approved user requests are sticky and are always re-applied, and the renderer always starts from raw pixels, never from an already blurred copy.</p>
+
+<h3>Audits and the feedback loop</h3>
+<p>Two loops keep the system honest. The proactive loop samples published imagery on a stratified design (region, lighting, object size, model version), has trained auditors mark every visible face and plate, and reports recall and pixel FPR with confidence intervals per slice. The reactive loop takes user reports, verifies them, applies a permanent manual blur quickly, and feeds the confirmed case into the hard-case store that seeds the next training set and the permanent regression set.</p>
+<script type="application/json" class="dg" data-cap="Audit and report-a-problem loop: sampled audits measure recall, user reports repair individual misses, and both feed the hard-case store that drives the next model">
+{"type":"graph","cols":5,
+ "groups":[{"t":"Proactive audit","c0":0,"c1":4,"r0":0,"r1":0},{"t":"Reactive reports","c0":0,"c1":4,"r0":1,"r1":1}],
+ "nodes":[
+  {"id":"pub","t":"Published imagery","s":"live on maps","c":0,"r":0,"k":"img"},
+  {"id":"smp","t":"Stratified sampler","s":"region, light, size","c":1,"r":0},
+  {"id":"aud","t":"Human auditors","s":"mark every visible face","c":2,"r":0,"k":"user"},
+  {"id":"fnd","t":"Audit findings","s":"misses, false blurs","c":3,"r":0,"k":"data"},
+  {"id":"dash","t":"Recall dashboard","s":"by slice, with intervals","c":4,"r":0},
+  {"id":"rep","t":"Report a problem","s":"user flags a miss","c":0,"r":1,"k":"user"},
+  {"id":"tri","t":"Triage queue","s":"verify, severity","c":1,"r":1},
+  {"id":"man","t":"Manual blur","s":"permanent, sticky","c":2,"r":1},
+  {"id":"hc","t":"Hard-case store","s":"confirmed misses","c":3,"r":1,"k":"store"},
+  {"id":"trn","t":"Next training set","s":"plus regression slices","c":4,"r":1,"k":"model"}],
+ "edges":[["pub","smp"],["smp","aud"],["aud","fnd"],["fnd","dash","metrics"],["fnd","hc","misses"],["rep","tri"],["tri","man"],["man","hc","confirmed"],["hc","trn"]]}
+</script>
+<p><b>On-request blurring.</b> Beyond automatic detection, people can ask to blur their home, car, or whole body. Treat this as a separate path: verify eligibility (for property, proof of address that is deleted after a short retention), store the approved blur as a geometry override keyed to the panorama, apply it in the renderer after detection and always on reprocessing, and exclude blurred imagery from downstream uses such as generative training. Such a blur is permanent.</p>
+
+<h3>Monitoring</h3>
+<ul>
+<li><b>Detection density per frame by region and camera.</b> A sudden fall in faces per frame means a broken camera, a bad threshold or a model regression, long before a human notices.</li>
+<li><b>Score distribution drift.</b> Compare histograms of detection scores per region against a baseline; shifts precede recall loss.</li>
+<li><b>Blur rate and pixel FPR proxies.</b> Share of frames with at least one blur, and total blurred area per frame.</li>
+<li><b>Audit recall per slice</b> against the release target, with its interval, every release and on a rolling basis.</li>
+<li><b>Pipeline health:</b> backlog age, GPU utilization, version coverage (what share of published frames has current-version detections), post-render check failures.</li>
+</ul>
+
+<h3>Privacy of the raw imagery</h3>
+<p>The pipeline itself handles the most sensitive artifact in the product: unblurred faces. Keep raw frames in a separate project with encryption at rest, short-lived service credentials, no human read access except logged, purpose-limited audit and labeling tools, and a retention rule. Keeping raw frames lets you re-blur with a better model, but it also keeps the exposure; a defensible compromise is a long, fixed retention window with an automated delete, plus the ability to rebuild from raw only inside the secure environment. Annotators and auditors should see tiles or crops, not whole frames, in a locked-down tool with no downloads, and their access is audited. Detection metadata is sensitive too, because it records where people were.</p>
+
+<h3>Challenges</h3>
+<table>
+<caption>Challenges and responses</caption>
+<tr><th>Challenge</th><th>Why it is hard</th><th>Response</th></tr>
+<tr><td>Cold start: new country or camera</td><td>Plate shape, color and font unseen; camera optics change tile statistics</td><td>Model-assisted labeling of a few thousand objects, region oversampling, a lower plate threshold at launch, publication held until the audit passes</td></tr>
+<tr><td>Speed and cost</td><td>Billions of frames, I/O-bound, repeated on each model upgrade</td><td>Tiering, spot GPUs, locality, TensorRT or similar optimization, skip nothing without audit evidence</td></tr>
+<tr><td>Diversity and fairness</td><td>Uneven recall across skin tone, age, headwear, geography</td><td>Slice-level release gates, targeted collection, per-slice thresholds where justified</td></tr>
+<tr><td>Privacy of data and people</td><td>Exposed faces in storage and in labeling</td><td>Isolation, minimal exposure tooling, retention limits, audited access</td></tr>
+<tr><td>Ambiguous ground truth</td><td>"Identifiable" is subjective</td><td>Written guidelines, adjudication, reporting of multiple identifiability thresholds</td></tr>
+<tr><td>Odd contexts</td><td>Reflections, screens, mannequins, tapestries</td><td>Explicit policy; ignore regions in training; cheap false alarms are accepted</td></tr>
+</table>
+
+<h2>Other Talking Points</h2>
+<ul>
+<li><b>Propagate detections across neighboring frames.</b> Adjacent capture positions show the same person; a face detected in one frame can raise the prior (or lower the threshold) in the next, recovering misses without more compute.</li>
+<li><b>Use active learning for the labeling budget.</b> Send frames whose top score sits in the uncertain band (say 0.02 to 0.3) to annotators, because they are the cheapest way to teach the model where its boundary is.</li>
+<li><b>Blur before stitching, or handle seams.</b> Redacting individual camera images avoids blurring across panorama seams, where a single face may be stretched over two cameras.</li>
+<li><b>Distill the offline teacher.</b> A big two-stage ensemble can pre-label and audit, and a student can be trained on its soft outputs, which narrows the cost-accuracy gap.</li>
+<li><b>Treat plates by region, not as one class.</b> Per-country aspect ratio and character set drive detection quality; a plate head with a region embedding is often cheaper than separate models.</li>
+<li><b>Handle regional law.</b> Different jurisdictions require different strengths or object categories (house numbers, whole bodies), so the renderer and the threshold should be configurable per region.</li>
+<li><b>Know the segmentation upgrade path.</b> If boxes look crude on non-rectangular objects, instance masks or learned inpainting can reduce collateral blur, at higher label and compute cost.</li>
+<li><b>Re-check the output.</b> Running the detector again on the blurred image and alarming on any remaining high-score box is a cheap independent check on both renderer bugs and weak blur strength.</li>
+<li><b>Do not detect-and-identify.</b> The system should never output embeddings or identities; keeping the interface to boxes and classes limits what a leak could expose.</li>
+<li><b>Plan for video and user-contributed photos.</b> Different resolutions and motion blur may need their own thresholds and audits before reuse of the same model.</li>
+</ul>
+
+<h2 class="nonum">Check yourself</h2>
+<p class="qa-intro">Questions are tagged by the level they target. The first set checks Senior-level fundamentals and arithmetic; Staff and Principal questions probe trade-offs, operations, experimentation and organization. Try to answer aloud for two minutes before opening one.</p>
+<div class="qa-bar" data-qa></div>
+<details class="ans" data-lvl="sr"><summary>1. Why can the blurring system skip non-maximum suppression, and where would you still keep it?</summary>A blur needs a mask, and the union of overlapping boxes equals the mask that NMS would produce plus a few redundant pixels. NMS can only hurt recall, because a true face next to another face (IoU above the NMS threshold) gets suppressed. Keep NMS for mAP evaluation, for counting objects, and for compact stored metadata; Soft-NMS is an option when ranking quality matters.</details>
+<details class="ans" data-lvl="sr"><summary>2. Going from 99.0% to 99.5% recall: what do you gain, what does it cost, and would you do it?</summary>Faces: 400M x (0.995 - 0.990) = 2M fewer leaks. From the threshold table, recall 0.995 needs t = 0.04, where false boxes per frame rise from 0.366 to 0.808, about 0.44 more per frame, or 442M extra false blurs over 1B frames. That is 221 false blurs per prevented leak. Under our assumed 100x cost ratio the move is not worth it; at a 1,000x ratio it is. The better answer is to shift the PR curve with data, a stronger model or a verifier, instead of paying along the existing curve.</details>
+<details class="ans" data-lvl="sr"><summary>3. The target is 99.5% recall with 95% confidence and the test set has 20,000 faces. Is a measured 0.995 enough?</summary>No. The standard error is sqrt(0.995 x 0.005 / 20,000) = 0.0005, and the one-sided bound is 1.645 x 0.0005 = 0.0008, so the measured recall must be about 0.9958. Either lower the threshold (more false blurs), grow the test set (the bound shrinks with the square root of n), or improve the model. Small slices need even more care: a 2,000-face night slice has a standard error of about 0.0022 at 0.99, so the interval is wide.</details>
+<details class="ans" data-lvl="st"><summary>4. A launch in a new country has an unfamiliar plate format and a few hundred labeled plates. What do you do?</summary>Do not publish until an audit passes. Use the existing detector at a lower plate threshold, which exploits the general "rectangle with characters mounted on a vehicle" prior, then run model-assisted labeling to produce a few thousand plates, fine-tune with oversampling and region-specific augmentation, and re-audit with a region-specific sample. Also check false alarms (signs, stickers), since the lowered threshold will raise them. Add the region to the monitored slices permanently.</details>
+<details class="ans" data-lvl="st"><summary>5. Model v2 improves mAP by two points but its night recall is 1.5 points lower at the same false-alarm budget. Ship it?</summary>Not as is. The release gate is per-slice recall, not mAP. Options: train with more night data and re-evaluate; use v1 for dark frames (brightness-gated) and v2 elsewhere; or run both and render the union for risky regions, accepting 2x compute there (union is safe because duplicates cost nothing). Ship v2 globally only when the night slice meets its bound.</details>
+<details class="ans" data-lvl="st"><summary>6. A new model raises recall from 99.0% to 99.3%. Is a full reprocessing run worth $62,000?</summary>Faces protected: 400M x 0.003 = 1.2M, so $62,000 / 1.2M is about $0.05 per additional protected face, before counting plates. But do not run it uniformly. If the top 5% of tiles carry 60% of views, reprocessing that tier costs about $3,100 and removes most of the real-world exposure within hours; the long tail can follow on cheap spot capacity over days. Re-render from raw pixels and union with sticky blurs.</details>
+<details class="ans" data-lvl="st"><summary>The privacy team wants 99.9 percent face recall and you are at 99.5 percent. How do you close the gap, and how do you prove you did?</summary><p>Error-analyze the misses by slice: tiny faces, profile and occluded faces, night, motion blur, reflections, faces on posters or screens. Each slice has a different fix. Small faces: higher-resolution tiles and multi-scale features. Hard poses: mined hard negatives and targeted labeling from audits. Borderline frames: a second, heavier model run only when the first model's score lands in an uncertain band, which keeps cost close to the baseline. Temporal propagation across neighboring capture positions recovers faces missed in one frame but seen in the next.</p><p>Proving it needs a fresh audit set that was never used for tuning, with doubled annotation because annotators also miss faces (that caps measurable recall). Zero misses in n faces only bounds the miss rate at about 3/n with 95 percent confidence, so 3,000 clean faces bound 0.1 percent; if you expect a few misses you need tens of thousands. Report a confidence interval, not a point.</p><p class="probe"><b>Likely follow-ups:</b> Your labelers miss 0.2 percent of faces. How does that change what you can claim? &middot; What is the cheapest slice to fix and what is the highest-risk slice?</p><p class="signal"><b>What makes this Staff-level:</b> You move from one number to slice-level causes, and your claim comes with sample size and confidence.</p></details>
+<details class="ans" data-lvl="pr"><summary>A regulator asks you to demonstrate that blurring is applied to every published image and cannot be reversed. What do you build?</summary><p>Make the guarantee structural. The serving path can only read from the redacted store; raw imagery sits in a separate, access-controlled store with short retention. The publish pipeline fails closed: if a frame has no recorded detection job for an approved model version, it cannot be published. Each published tile records the model version and thresholds that produced it, in an immutable log.</p><p>Add independent verification: a different detector re-scans a random sample of published tiles and a human audit samples the rest, with alarms on any detected face. Irreversibility is about the transform: use a strong blur or solid fill and destroy the original pixels in the published derivative, because mild blur or pixelation can be partially inverted. Support user-initiated takedown requests with a service-level agreement. This is evidence you can show an auditor: lineage, independent checks, fail-closed publishing.</p><p class="probe"><b>Likely follow-ups:</b> How do you handle a model bug discovered after publishing? &middot; How do you verify a detector with another detector without sharing its blind spots?</p><p class="signal"><b>What makes this Principal-level:</b> You design invariants and evidence trails, and you can explain how the system fails closed.</p></details>
+<details class="ans" data-lvl="st"><summary>Reprocessing the whole corpus costs about $62,000 per model upgrade. Design a policy for when and what to reprocess.</summary><p>Value each upgrade as expected harm avoided: faces in the corpus times the recall gain times the cost of a miss, compared to compute cost and the risk of regressions. Reprocess by priority, not all at once: dense urban areas and high-traffic locations first, recent captures first, and regions with new regulation first. Use selective reprocessing: re-run only frames where the old model's top score fell in an uncertain band or where a cheap triage model disagrees.</p><p>Lower the unit cost: preemptible GPUs, batching, and incremental checkpoints. Set a trigger policy in advance (for example, reprocess when expected recall gain exceeds a stated threshold or at a fixed annual cadence, whichever comes first) so the decision is not renegotiated each time.</p><p class="probe"><b>Likely follow-ups:</b> What if the new model finds new faces but also introduces new blur on non-faces? &middot; How would you test the triage model without reprocessing everything?</p><p class="signal"><b>What makes this Staff-level:</b> You turn a recurring cost into a policy with a value model, a priority order and a way to shrink the work.</p></details>
+<details class="ans" data-lvl="st"><summary>Face recall differs across lighting, age and region. How do you measure and act on it without inferring sensitive attributes in production?</summary><p>Evaluate on a curated audit set where slice membership is known from collection or consented annotation, not predicted at serving time. Use non-sensitive proxies that the system can legitimately condition on: face size, pose, light level, image quality, capture region. Set a floor per slice (for example, no slice below 99 percent recall) instead of optimizing the average, and block launches that break a floor.</p><p>Fixes follow the data: collect or synthesize more examples for weak slices, reweight the loss, and prefer a single threshold chosen to meet the floor over per-demographic thresholds, which would require inferring attributes. Document slice results in a model card and review them each release.</p><p class="probe"><b>Likely follow-ups:</b> Two slices conflict: improving one lowers the other. What do you do? &middot; How do you collect slice data ethically?</p><p class="signal"><b>What makes this Staff-level:</b> You use slice floors and proxies you can defend, and you can explain what you refuse to build.</p></details>
+
+<h2 class="nonum">References</h2>
+<ol class="refs">
+<li>A. Frome et al. "Large-scale Privacy Protection in Google Street View." ICCV 2009. <a href="https://research.google.com/archive/papers/cbprivacy_iccv09.pdf">research.google.com/archive/papers/cbprivacy_iccv09.pdf</a></li>
+<li>S. Ren, K. He, R. Girshick, J. Sun. "Faster R-CNN: Towards Real-Time Object Detection with Region Proposal Networks." 2015. <a href="https://arxiv.org/abs/1506.01497">arXiv:1506.01497</a></li>
+<li>J. Redmon, S. Divvala, R. Girshick, A. Farhadi. "You Only Look Once: Unified, Real-Time Object Detection." 2015. <a href="https://arxiv.org/abs/1506.02640">arXiv:1506.02640</a></li>
+<li>W. Liu et al. "SSD: Single Shot MultiBox Detector." 2015. <a href="https://arxiv.org/abs/1512.02325">arXiv:1512.02325</a></li>
+<li>T.-Y. Lin, P. Goyal, R. Girshick, K. He, P. Dollar. "Focal Loss for Dense Object Detection" (RetinaNet). ICCV 2017. <a href="https://arxiv.org/abs/1708.02002">arXiv:1708.02002</a></li>
+<li>T.-Y. Lin et al. "Feature Pyramid Networks for Object Detection." 2016. <a href="https://arxiv.org/abs/1612.03144">arXiv:1612.03144</a></li>
+<li>A. Shrivastava, A. Gupta, R. Girshick. "Training Region-based Object Detectors with Online Hard Example Mining." 2016. <a href="https://arxiv.org/abs/1604.03540">arXiv:1604.03540</a></li>
+<li>N. Bodla et al. "Soft-NMS: Improving Object Detection With One Line of Code." 2017. <a href="https://arxiv.org/abs/1704.04503">arXiv:1704.04503</a></li>
+<li>H. Rezatofighi et al. "Generalized Intersection over Union: A Metric and A Loss for Bounding Box Regression." 2019. <a href="https://arxiv.org/abs/1902.09630">arXiv:1902.09630</a></li>
+<li>J. Deng et al. "RetinaFace: Single-stage Dense Face Localisation in the Wild." 2019. <a href="https://arxiv.org/abs/1905.00641">arXiv:1905.00641</a></li>
+<li>F. C. Akyon, S. O. Altinuc, A. Temizel. "Slicing Aided Hyper Inference and Fine-tuning for Small Object Detection" (SAHI). 2022. <a href="https://arxiv.org/abs/2202.06934">arXiv:2202.06934</a></li>
+<li>K. Yang, J. Yau, L. Fei-Fei, J. Deng, O. Russakovsky. "A Study of Face Obfuscation in ImageNet." ICML 2022. <a href="https://arxiv.org/abs/2103.06191">arXiv:2103.06191</a></li>
+<li>J. Buolamwini, T. Gebru. "Gender Shades: Intersectional Accuracy Disparities in Commercial Gender Classification." FAT* 2018. <a href="https://proceedings.mlr.press/v81/buolamwini18a.html">proceedings.mlr.press/v81/buolamwini18a.html</a></li>
+<li>Google Maps Help. "Blur Street View imagery" (face and plate blurring, report a problem, permanent blur on request). <a href="https://support.google.com/maps/answer/15439776">support.google.com/maps/answer/15439776</a></li>
+</ol>
+</main></div>
+<script src="assets/dg.js"></script>
+<script src="assets/nav.js"></script>
+<script src="assets/qa.js"></script>
+</body>
+</html>

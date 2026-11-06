@@ -1,0 +1,514 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Event Recommendation System</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-slug="event-recommendation">
+<div class="topbar"><a href="index.html">&larr; ML System Design Study Guide</a><span style="color:var(--muted)">Chapter 7 of 11</span></div>
+<div class="layout"><aside class="toc" id="toc"></aside>
+<main>
+<div class="kicker">Chapter 7</div>
+<h1>Event Recommendation System</h1>
+<p class="lead">An Eventbrite or Meetup style platform earns money when people register for events, but an event happens once, locally, and usually with a handful of friends. By the time you have enough clicks to know an event is good, it is over. The core idea of this chapter: rank with content, place, time, and social features instead of collaborative history, and treat every new event as a cold-start item that must earn its first impressions through a controlled exploration budget.</p>
+
+<h2>Clarifying Requirements</h2>
+<div class="dlg">
+<div class="turn c"><span>Candidate</span><p>What is the product surface and the business goal?</p></div>
+<div class="turn i"><span>Interviewer</span><p>A personalized "Events for you" feed on the home page, plus a weekly email and occasional push. The goal is more registrations and ticket sales.</p></div>
+<div class="turn c"><span>Candidate</span><p>How big is the platform?</p></div>
+<div class="turn i"><span>Interviewer</span><p>About 10 million users, 3 million daily active, and roughly 1 million active events (upcoming and not canceled) at any time.</p></div>
+<div class="turn c"><span>Candidate</span><p>Are events in person, online, or both?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Mostly in person, so location is central. Online events exist; treat them with a flag so distance does not apply.</p></div>
+<div class="turn c"><span>Candidate</span><p>What feedback signals do we log?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Impressions, clicks, bookmarks, and registrations (free RSVPs and paid tickets). Paid events also have a check-in scan; free events do not.</p></div>
+<div class="turn c"><span>Candidate</span><p>Do we have a social graph?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Yes: friendships, invitations, and group memberships. Friend attendance can be shown only for friends who allow it.</p></div>
+<div class="turn c"><span>Candidate</span><p>How quickly must a new event be recommendable, and how long do events live?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Within minutes of publishing. Most events are created two to six weeks ahead; many hosts run one event ever.</p></div>
+<div class="turn c"><span>Candidate</span><p>What are the latency and freshness expectations?</p></div>
+<div class="turn i"><span>Interviewer</span><p>The feed API should answer in under 200 ms at p99, and ticket counts or friend attendance should be no more than a minute stale.</p></div>
+<div class="turn c"><span>Candidate</span><p>Can events be canceled, rescheduled, or sell out, and are they recurring?</p></div>
+<div class="turn i"><span>Interviewer</span><p>All three happen. Treat every occurrence as its own event, and describe how the system reacts to state changes.</p></div>
+<div class="turn c"><span>Candidate</span><p>Constraints and out of scope?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Privacy of social signals matters. Search, dynamic pricing, and recommending audiences to hosts are out of scope.</p></div>
+</div>
+<div class="summary"><p>Design a personalized event feed for a platform with about 10M users, 3M daily actives, and 1M active events. The model predicts registrations from impressions, clicks, bookmarks, and RSVPs plus friend, location, and time context. Events are short-lived and local, so most are cold; the feed must rank within 200 ms and react to sold-out, canceled, and rescheduled events.</p></div>
+
+<script type="application/json" class="dg" data-cap="Product flow: the feed, email, and push all lead to the event page; every arrow is a logged event that becomes a training label">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"feed","t":"Events for you","s":"home feed, 20 events per page","c":0,"r":0,"k":"io"},
+  {"id":"detail","t":"Event detail page","s":"date, venue, friends going","c":1,"r":0},
+  {"id":"co","t":"Register or buy","s":"free RSVP or paid checkout","c":2,"r":0},
+  {"id":"conf","t":"Ticket confirmed","s":"calendar invite and email","c":3,"r":0,"k":"io"},
+  {"id":"dig","t":"Email or push digest","s":"weekly picks, reminders","c":0,"r":1,"k":"io"},
+  {"id":"bm","t":"Bookmark","s":"save for later","c":1,"r":1,"k":"data"},
+  {"id":"rem","t":"Reminder push","s":"24h before sale ends or event","c":2,"r":1},
+  {"id":"att","t":"Attend or no-show","s":"check-in scan for paid events","c":3,"r":1,"k":"io"}],
+ "edges":[["feed","detail","click"],["detail","co","register",{"hl":1}],["co","conf"],["dig","detail","open"],["detail","bm","save"],["bm","rem"],["rem","co","return",{"d":1}],["conf","att","event day"]]}
+</script>
+
+<p>Events behave differently from videos or movies, and the whole design follows from that. A video accumulates views for years. An event collects most of its registrations in a short burst right before it starts, and then its label is closed forever. Macedo and Marinho analyzed Meetup data from three US metro areas: more than 45% of events had at most one positive RSVP, about 90% had ten or fewer, and positive RSVPs clustered close to the event date. Only about 30% of users had co-attended two or more events, an empirical ceiling for collaborative filtering.</p>
+
+<script type="application/json" class="dg" data-cap="Illustrative accumulation curves: an event gets about a fifth of its registrations by the halfway point of its listing window, while a video gets most of its views early">
+{"type":"curve","xl":"Fraction of listing window elapsed (event: publish to start; video: first 30 days)","yl":"Cumulative share","h":300,"series":[
+ {"n":"Event registrations","c":1,"lp":4,"pts":[[0,0],[0.2,0.06],[0.4,0.15],[0.6,0.28],[0.8,0.52],[0.9,0.75],[1,1]]},
+ {"n":"Video views","c":0,"lp":3,"pts":[[0,0],[0.1,0.45],[0.2,0.62],[0.4,0.8],[0.6,0.9],[1,1]]}]}
+</script>
+
+<div class="callout key"><p>An event is a perishable item: its useful life is weeks, its demand arrives late, and its capacity is finite. A model that waits for interaction history will always be one step behind, so features known at publish time (content, host, place, time) and social context carry the load.</p></div>
+
+<h2>Frame the Problem as an ML Task</h2>
+<h3>ML objective</h3>
+<p>Several objectives sound plausible. The table compares them; the choice affects labels, calibration, and how you can later tune business rules.</p>
+<table>
+<caption>Objective options</caption>
+<tr><th>Objective</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Maximize clicks, P(click)</td><td>Dense labels (about 4% of impressions); fast feedback</td><td>Rewards curiosity and clickbait; weak link to tickets sold</td></tr>
+<tr><td>Maximize registrations, P(register)</td><td>Aligned with the business goal; works for free and paid events</td><td>Sparse (about 0.4% of impressions); labels arrive days later</td></tr>
+<tr><td>Maximize expected revenue, P(register) times price</td><td>Directly ties to ticket sales</td><td>Favors expensive events; ignores free events that build future paid demand</td></tr>
+<tr><td>Maximize attended registrations, P(register) times P(attend)</td><td>Accounts for no-shows and host experience</td><td>Attendance is only observed for scanned tickets, and only after the event</td></tr>
+<tr><td>Multi-task: heads for click, bookmark, register</td><td>Dense signals regularize the sparse one; weights tunable later</td><td>Needs calibrated heads and a tuned combination formula</td></tr>
+</table>
+<div class="callout tip"><p>State the decision with its reason: train a calibrated P(register) as the primary head, with click and bookmark as auxiliary heads that share representations. Apply price, no-show, and capacity effects afterwards in re-ranking, where they are easy to adjust, instead of baking them into labels.</p></div>
+
+<h3>Input and output</h3>
+<p>The input is a user, the request context, and a set of candidate events; the output is a probability per event that becomes a ranked page. Scoring all 1M events per request is unnecessary, because a user can only attend nearby, upcoming events.</p>
+<script type="application/json" class="dg" data-cap="Input and output: user, context, and candidates go in; a per-event probability comes out and is sorted into the feed">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"u","t":"User profile","s":"home cell, history, interests","c":0,"r":0,"k":"user"},
+  {"id":"x","t":"Request context","s":"time, device, current location","c":0,"r":1,"k":"io"},
+  {"id":"c","t":"Candidate events","s":"about 500 upcoming nearby events","c":0,"r":2,"k":"io"},
+  {"id":"m","t":"Event ranker","s":"scores each user-event pair","c":1,"r":1,"k":"model"},
+  {"id":"p","t":"P(register)","s":"one probability per event","c":2,"r":1,"k":"vec"},
+  {"id":"l","t":"Ranked feed","s":"top 20 after re-ranking","c":3,"r":1,"k":"io"}],
+ "edges":[["u","m"],["x","m"],["c","m"],["m","p"],["p","l","sort + rules",{"hl":1}]]}
+</script>
+
+<h3>ML category</h3>
+<p>This is a ranking problem with sparse implicit feedback. Compare the model families first.</p>
+<table>
+<caption>Model families for event ranking</caption>
+<tr><th>Family</th><th>Idea</th><th>Trade-offs</th></tr>
+<tr><td>Collaborative filtering (matrix factorization, KNN)</td><td>Learn from who attended what</td><td>Needs history per event; in the Meetup study KNN beat matrix factorization, and both lost much of their strength on cold events</td></tr>
+<tr><td>Content and location only</td><td>Match categories, text, distance, time</td><td>Works at publish time; ignores taste nuance and social pull</td></tr>
+<tr><td>Pointwise learning to rank</td><td>Predict P(register) for each (user, event) pair, then sort</td><td>Simple, scalable, calibrated; ignores list context</td></tr>
+<tr><td>Pairwise (RankNet, BPR)</td><td>Learn that a registered event beats a skipped one</td><td>Optimizes order; pair count explodes and scores are not probabilities</td></tr>
+<tr><td>Listwise (LambdaRank, LambdaMART)</td><td>Optimize a list metric such as nDCG with gradient weights</td><td>Closest to the metric; harder to calibrate and tune</td></tr>
+</table>
+<script type="application/json" class="dg" data-cap="Pointwise, pairwise, and listwise training differ in what one training example is and what the loss compares">
+{"type":"graph","cols":4,
+ "groups":[{"t":"Pointwise (chosen first)","c0":0,"c1":3,"r0":0,"r1":0},{"t":"Pairwise","c0":0,"c1":3,"r0":1,"r1":1},{"t":"Listwise","c0":0,"c1":3,"r0":2,"r1":2}],
+ "nodes":[
+  {"id":"a1","t":"One (user, event) pair","s":"label 1 if registered","c":0,"r":0,"k":"data"},
+  {"id":"a2","t":"Scorer f(u, e)","s":"same model for every pair","c":1,"r":0,"k":"model"},
+  {"id":"a3","t":"Log loss","s":"predict the label directly","c":2,"r":0},
+  {"id":"a4","t":"Sort by score","s":"scores are probabilities","c":3,"r":0,"k":"io"},
+  {"id":"b1","t":"Triple (u, e+, e-)","s":"registered vs not registered","c":0,"r":1,"k":"data"},
+  {"id":"b2","t":"Scorer f(u, e)","s":"shared weights","c":1,"r":1,"k":"model"},
+  {"id":"b3","t":"Pairwise loss","s":"push f(e+) above f(e-)","c":2,"r":1},
+  {"id":"b4","t":"Sort by score","s":"scores are only relative","c":3,"r":1,"k":"io"},
+  {"id":"c1","t":"A whole result list","s":"20 events for one request","c":0,"r":2,"k":"data"},
+  {"id":"c2","t":"Scorer f(u, e)","s":"scores every event in list","c":1,"r":2,"k":"model"},
+  {"id":"c3","t":"Listwise loss","s":"weights swaps by nDCG gain","c":2,"r":2},
+  {"id":"c4","t":"Sort by score","s":"order optimized directly","c":3,"r":2,"k":"io"}],
+ "edges":[["a1","a2"],["a2","a3"],["a3","a4"],["b1","b2"],["b2","b3"],["b3","b4"],["c1","c2"],["c2","c3"],["c3","c4"]]}
+</script>
+<div class="callout tip"><p><b>Decision.</b> Start with a pointwise ranker trained with log loss. It gives calibrated probabilities that you reuse for capacity throttling and revenue weighting. Run LambdaMART as an offline and online challenger once the pipeline is stable.</p></div>
+
+<h2>Data Preparation</h2>
+<h3>Data engineering</h3>
+<p>Four data sources feed the system: the event catalog, the interaction log, the social graph, and the geography layer. Each event is a node in a small graph that ties hosts, venues, categories, and people together.</p>
+<script type="application/json" class="dg" data-cap="Data model: events connect hosts, venues, and categories; users connect to events through logged interactions and to each other through friendships and invites">
+{"type":"graph","cols":3,
+ "nodes":[
+  {"id":"h","t":"Host","s":"organizer, past events, refunds","c":0,"r":0,"k":"user"},
+  {"id":"e","t":"Event","s":"text, price, capacity, start time","c":1,"r":0,"k":"data"},
+  {"id":"t","t":"Category and tags","s":"taxonomy plus text embedding","c":2,"r":0,"k":"vec"},
+  {"id":"lg","t":"Interaction log","s":"impression, click, bookmark, RSVP","c":1,"r":1,"k":"data"},
+  {"id":"v","t":"Venue and geo cell","s":"lat/lng, H3 cell, city","c":2,"r":1,"k":"store"},
+  {"id":"f","t":"Friends","s":"mutual friend graph","c":0,"r":2,"k":"user"},
+  {"id":"u","t":"User","s":"home cell, interests, history","c":1,"r":2,"k":"user"},
+  {"id":"iv","t":"Invites and groups","s":"inviter, invitee, group joins","c":2,"r":2,"k":"data"}],
+ "edges":[["h","e","organizes"],["e","t","tagged"],["e","v","held at"],["lg","e","RSVP, click",{"hl":1}],["u","lg","logs",{"d":1}],["f","u","friend of"],["iv","u","invites"]]}
+</script>
+<table>
+<caption>Events (about 1M active rows, about 33K new per day)</caption>
+<tr><th>event_id</th><th>host_id</th><th>category</th><th>price</th><th>city / cell</th><th>starts_at</th><th>capacity</th><th>published_at</th></tr>
+<tr><td>e101</td><td>h17</td><td>live music</td><td>25.00</td><td>Austin / c412</td><td>2026-11-20 19:00</td><td>300</td><td>2026-10-02</td></tr>
+<tr><td>e102</td><td>h88</td><td>tech meetup</td><td>0.00</td><td>Austin / c413</td><td>2026-11-12 18:30</td><td>80</td><td>2026-11-05</td></tr>
+<tr><td>e103</td><td>h31</td><td>fitness</td><td>12.00</td><td>Denver / c207</td><td>2026-11-09 08:00</td><td>25</td><td>2026-11-08</td></tr>
+</table>
+<table>
+<caption>Interaction log (about 60M impressions per day, about 150 bytes per row)</caption>
+<tr><th>user_id</th><th>event_id</th><th>type</th><th>ts</th><th>position</th><th>surface</th><th>model</th></tr>
+<tr><td>u1</td><td>e101</td><td>impression</td><td>11-05 09:12</td><td>3</td><td>feed</td><td>v42</td></tr>
+<tr><td>u1</td><td>e101</td><td>click</td><td>11-05 09:13</td><td>3</td><td>feed</td><td>v42</td></tr>
+<tr><td>u1</td><td>e101</td><td>register</td><td>11-07 20:40</td><td>-</td><td>detail</td><td>-</td></tr>
+</table>
+<table>
+<caption>Friendships and invites (assumed 40 friends per user, so about 200M undirected edges)</caption>
+<tr><th>user_id</th><th>friend_id</th><th>since</th><th>shows_rsvp</th></tr>
+<tr><td>u1</td><td>u7</td><td>2023-05</td><td>true</td></tr>
+<tr><td>u1</td><td>u9</td><td>2024-02</td><td>false</td></tr>
+</table>
+<p>At 150 bytes per row, 60M impressions are about 9 GB per day and about 270 GB for a 30-day training window. Log the model version, position, and the exact feature values served for every impression, so training can replay what the model saw rather than recomputing features later.</p>
+
+<h3>Feature engineering</h3>
+<p>Five feature groups cover most of the signal. The first four are available the minute an event is published, which is why they dominate the cold-start path.</p>
+<script type="application/json" class="dg" data-cap="Feature groups are concatenated into one vector for the ranker; location, time, social, and content work for brand-new events">
+{"type":"graph","cols":4,"gapY":16,
+ "nodes":[
+  {"id":"g1","t":"Location","s":"distance, H3 cell, same metro","c":0,"r":0,"k":"data"},
+  {"id":"g2","t":"Time","s":"days until start, hour, weekday","c":0,"r":1,"k":"data"},
+  {"id":"g3","t":"Social","s":"friends going, invited by friend","c":0,"r":2,"k":"data"},
+  {"id":"g4","t":"Event content","s":"category, text embedding, price","c":0,"r":3,"k":"data"},
+  {"id":"g5","t":"History and popularity","s":"user affinity, smoothed CVR","c":0,"r":4,"k":"data"},
+  {"id":"fv","t":"Feature vector","s":"dense plus embedding inputs","c":1,"r":2,"k":"vec"},
+  {"id":"rk","t":"Event ranker","s":"GBDT then DNN","c":2,"r":2,"k":"model"},
+  {"id":"pr","t":"P(register)","c":3,"r":2,"k":"io"}],
+ "edges":[["g1","fv"],["g2","fv"],["g3","fv"],["g4","fv"],["g5","fv"],["fv","rk","concat"],["rk","pr"]]}
+</script>
+<table>
+<caption>Features by group</caption>
+<tr><th>Group</th><th>Features</th><th>Encoding</th></tr>
+<tr><td>Location</td><td>Distance from home and from current location; same-metro flag; transit time; H3 cell of venue</td><td>log1p(distance) plus quantile buckets; cell embedding (16-d)</td></tr>
+<tr><td>Time</td><td>Days until start; hour and weekday of the event; hours since publish; duration; calendar conflict (if linked); user's usual hour and weekday</td><td>Buckets for days left; sin/cos for hour and weekday; cross with user affinity</td></tr>
+<tr><td>Social</td><td>Count of friends going or interested; invited by a friend; host followed by friends; shared group memberships</td><td>log1p counts, binary flags; only friends who allow visibility</td></tr>
+<tr><td>Event content</td><td>Category; title and description text; price and free flag; capacity and fill ratio; host history (events run, average registrations, refund rate); image present</td><td>Category embedding; 64-d sentence embedding; price buckets; host stats with smoothing</td></tr>
+<tr><td>History</td><td>Decayed category counts; price and distance preferences; mean embedding of last 20 registered events; recent clicks; cold-user flag</td><td>Decayed count vectors; mean-pooled embeddings; cosine to event embedding</td></tr>
+<tr><td>Early popularity (as-of)</td><td>Registrations, clicks, and impressions in the last 1h and 24h; velocity</td><td>Bayesian-smoothed rates; set to missing for a random share of training rows</td></tr>
+</table>
+<p><b>Distance and time shape behavior.</b> Macedo and Marinho found that around half of positive RSVPs came from within 10 km, and almost none beyond 100 km. Time behaves differently by event type: free meetups fill in the last few days, while concerts and festivals sell over weeks. A tree model can learn these shapes from raw values; a linear or neural model benefits from bucketed distance and days-left plus crosses with category.</p>
+<script type="application/json" class="dg" data-cap="Illustrative distance decay: relative registration probability falls with distance, fastest for dense-city users and slowest for destination festivals">
+{"type":"curve","xl":"Distance from user to venue (km)","yl":"Relative registration probability","xmax":60,"series":[
+ {"n":"City user, weekly meetup","c":0,"lp":2,"pts":[[0,1],[2,0.85],[5,0.6],[10,0.35],[20,0.14],[40,0.04],[60,0.02]]},
+ {"n":"Suburban user","c":1,"lp":3,"pts":[[0,1],[5,0.85],[10,0.68],[20,0.42],[40,0.18],[60,0.09]]},
+ {"n":"Destination festival","c":2,"d":1,"lp":4,"pts":[[0,1],[10,0.9],[20,0.8],[40,0.6],[60,0.45]]}]}
+</script>
+<script type="application/json" class="dg" data-cap="Illustrative timing: free meetups collect registrations in the final days, paid concerts spread over weeks; each series sums to 100%">
+{"type":"bars","labels":["0-1 days","2-3 days","4-7 days","8-14 days","15-30 days","31+ days"],"series":[{"n":"Free meetup","v":[38,27,20,10,4,1]},{"n":"Paid concert","v":[12,10,16,24,22,16]}],"fmt":null}
+</script>
+<div class="callout math"><p><b>Smoothing early popularity.</b> A new event shows 1 registration in 100 impressions, a raw rate of 1%. Use a category prior of 0.4% with strength 250 impressions: smoothed rate = (1 + 250 &times; 0.004) / (100 + 250) = 2 / 350 &asymp; 0.57%. The estimate moves toward the prior until the event has enough data to speak for itself.</p></div>
+
+<div class="callout warn"><p><b>Early-popularity leakage.</b> If you compute &ldquo;registrations so far&rdquo; at training time from the final table, you include the very registration you are trying to predict, plus all later ones. Build every popularity and friends-going feature as-of the impression timestamp, or simply use the feature values logged at serving time. Offline AUC that looks too good after adding popularity features is usually this bug.</p></div>
+
+<div class="callout warn"><p><b>Friend features and privacy.</b> Use only friends whose RSVPs are visible, aggregate to counts, and never show or encode a specific hidden attendee. Treat sensitive categories (health, religion, politics, sexual orientation) as protected: do not infer sensitive traits from event history, and give users a way to hide events and turn off social signals.</p></div>
+
+<script type="application/json" class="dg" data-cap="Social signal: the event with three friends going outranks one with a single friend, even when neither has much history">
+{"type":"net","h":300,"nodes":[
+ {"id":"me","t":"You","x":8,"y":50,"k":"me"},
+ {"id":"a","t":"A","x":36,"y":14,"k":"fr","s":"friend"},
+ {"id":"b","t":"B","x":36,"y":50,"k":"fr","s":"friend"},
+ {"id":"c","t":"C","x":36,"y":86,"k":"fr","s":"friend"},
+ {"id":"e1","t":"E1","x":80,"y":22,"k":"hit","s":"Jazz night, 3 friends going"},
+ {"id":"e2","t":"E2","x":80,"y":62,"k":"cand","s":"Trail run, 1 friend going"},
+ {"id":"e3","t":"E3","x":94,"y":92,"k":"other","s":"Mixer, 0 friends"}],
+ "edges":[["me","a"],["me","b"],["me","c"],["a","e1",{"hl":1,"l":"going"}],["b","e1",{"hl":1}],["c","e1",{"hl":1}],["a","e2",{"d":1}]]}
+</script>
+
+<h3>Labels</h3>
+<table>
+<caption>Label sources</caption>
+<tr><th>Source</th><th>Meaning</th><th>Strength and flaw</th></tr>
+<tr><td>Registration (RSVP or ticket)</td><td>Strong intent, directly tied to revenue</td><td>Rare (about 0.4% of impressions); arrives late, often days after the impression</td></tr>
+<tr><td>Click or bookmark</td><td>Interest signal</td><td>Dense, but clickbait-prone; bookmarks signal later intent</td></tr>
+<tr><td>Check-in or ticket scan</td><td>Actually attended</td><td>Most reliable, but only for ticketed events and only after the event</td></tr>
+</table>
+<p><b>Decision.</b> The positive label for the primary head is a registration by the same user for that event within 7 days of an impression and before the event starts. Clicks and bookmarks train the auxiliary heads. A negative is an impression with no registration in the window. Collapse repeated impressions of the same (user, event) on the same day, and attribute the label to the last impression before the action.</p>
+<script type="application/json" class="dg" data-cap="Label construction: join impressions to later registrations, then keep all positives and only 5% of negatives">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"im","t":"Impression log","s":"user, event, ts, position","c":0,"r":0,"k":"data"},
+  {"id":"rg","t":"Registration log","s":"user, event, ts, ticket type","c":0,"r":1,"k":"data"},
+  {"id":"jn","t":"Label join","s":"7-day window, ends at event start","c":1,"r":0},
+  {"id":"po","t":"Positive","s":"registered in window","c":2,"r":0,"k":"io"},
+  {"id":"ne","t":"Negative","s":"shown, no action in window","c":2,"r":1,"k":"io"},
+  {"id":"sm","t":"Negative sampler","s":"keep 5% of negatives","c":3,"r":1},
+  {"id":"tr","t":"Training table","s":"about 7.4% positive","c":3,"r":0,"k":"data"}],
+ "edges":[["im","jn"],["rg","jn"],["jn","po"],["jn","ne"],["po","tr"],["ne","sm"],["sm","tr","w = 0.05",{"hl":1}]]}
+</script>
+<div class="callout math"><p><b>Label sparsity.</b> Assume 60M impressions and a 0.4% registration rate per day: 240K registrations. A 30-day window has 1.8B impressions and 1.8B &times; 0.004 = 7.2M positives. Per event, 60M / 1M = 60 impressions per day. A new event with 100 impressions has expected 0.4 registrations, and P(no registration) = 0.996<sup>100</sup> &asymp; 0.67. To see at least one registration with 95% probability you need n with 0.996<sup>n</sup> &le; 0.05, so n &asymp; ln(0.05) / ln(0.996) &asymp; 747 impressions. Per-event conversion estimates are mostly noise for days, which is why priors matter.</p></div>
+<div class="callout math"><p><b>Negative downsampling and recalibration.</b> Keep every positive and a fraction w = 0.05 of negatives. Negatives: 1.8B &minus; 7.2M = 1.7928B, times 0.05 = 89.64M. Rows after sampling: 7.2M + 89.64M = 96.84M, so the positive rate becomes 7.2 / 96.84 &asymp; 7.4%. A model trained on this data predicts q on the sampled distribution, but real traffic has far more negatives. Because sampling multiplies the odds by 1/w, the true probability is p = q / (q + (1 &minus; q) / w). Check: q = 0.0743 gives p = 0.0743 / (0.0743 + 0.9257 &times; 20) = 0.0743 / 18.588 &asymp; 0.004, the base rate. A prediction of q = 0.30 becomes p = 0.30 / (0.30 + 0.70 &times; 20) = 0.30 / 14.3 &asymp; 2.1%.</p></div>
+<script type="application/json" class="dg" data-cap="Recalibration after negative sampling: the same model output q maps to very different true probabilities depending on the keep rate w">
+{"type":"curve","xl":"Model output q on sampled data","yl":"Calibrated probability p","xmax":0.4,"ymax":0.2,"series":[
+ {"n":"w = 1 (no sampling)","c":2,"d":1,"lp":1,"pts":[[0,0],[0.2,0.2]]},
+ {"n":"w = 0.2","c":1,"lp":4,"pts":[[0,0],[0.1,0.027],[0.2,0.0588],[0.3,0.0968],[0.4,0.1429]]},
+ {"n":"w = 0.05","c":0,"lp":4,"pts":[[0,0],[0.1,0.0055],[0.2,0.0123],[0.3,0.021],[0.4,0.0323]]}]}
+</script>
+<p><b>Other label problems.</b> Delay: a registration can land days after the impression, so a nightly job re-joins labels and flips earlier negatives to positives (see Chapelle on delayed feedback for a modeling alternative). Position bias: top slots get more clicks regardless of quality, so log position, include it in training, and fix it to a neutral value at serving. Selection bias: only shown events have labels, so reserve a small slice of traffic (for example 1%) for randomized or exploratory impressions with logged propensities.</p>
+
+<h2>Model Development</h2>
+<table>
+<caption>Model options</caption>
+<tr><th>Model</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Logistic regression with crosses</td><td>Fast, interpretable baseline; easy to calibrate</td><td>Manual feature crosses; weak on interactions such as distance by category</td></tr>
+<tr><td>Gradient-boosted trees (pointwise or LambdaMART)</td><td>Excellent on tabular features and missing values; quick to train and serve; strong cold-start behavior with content features</td><td>Weak with raw text and high-cardinality IDs unless pre-embedded</td></tr>
+<tr><td>GBDT leaves into logistic regression</td><td>Used successfully in ads; combines trees' crosses with online-updatable weights</td><td>Two-stage pipeline to maintain</td></tr>
+<tr><td>Multi-task DNN with embeddings</td><td>Learns from text, IDs, and sequences; shares signal across click, bookmark, register</td><td>More data and tuning; slower to debug; calibration needs care</td></tr>
+</table>
+<p><b>Decision.</b> Phase one: a GBDT with a pointwise log-loss objective, trained on downsampled data and recalibrated. Phase two: a multi-task DNN that consumes text and category embeddings, blended with or replacing the GBDT where offline and online metrics justify it. In the illustrative comparison below, the tree model captures most of the gain, and the DNN helps most on cold events through content embeddings.</p>
+<script type="application/json" class="dg" data-cap="Illustrative AUC by model on warm events (20+ impressions) and cold events (under 20): the gap between warm and cold is the cold-start problem">
+{"type":"bars","labels":["Popular nearby","Logistic regression","GBDT","DNN + embeddings"],"series":[{"n":"Warm events","v":[0.71,0.76,0.83,0.84]},{"n":"Cold events","v":[0.6,0.69,0.76,0.79]}]}
+</script>
+<script type="application/json" class="dg" data-cap="Multi-task ranker: user, event, and pair features pass through their own blocks and merge in a shared MLP with click, bookmark, and register heads">
+{"type":"stack","cols":[
+ {"t":"User block","layers":[{"t":"User features","s":"history, home cell, interests"},{"t":"Embeddings and pooling","s":"category, last 20 events"},{"t":"Dense 128","s":"user representation","k":"model"}]},
+ {"t":"Event block","layers":[{"t":"Event features","s":"category, text, host, price"},{"t":"Embeddings and pooling","s":"text 64-d, category 16-d"},{"t":"Dense 128","s":"event representation","k":"model"}]},
+ {"t":"Pair and context block","layers":[{"t":"Pair and context","s":"distance, days left, friends"},{"t":"Bucketize, normalize","s":"log1p, quantile buckets"},{"t":"Dense 64","s":"interaction features","k":"model"}]}],
+ "join":{"t":"Concat + MLP 256-128","s":"heads: click, bookmark, register"}}
+</script>
+<p><b>Making the model survive cold start.</b> DropoutNet (Volkovs et al.) randomly removes the collaborative inputs during training so the network learns to rely on content when they are missing. The same idea works for trees: set the early-popularity and per-event count features to missing for about 30% of training rows, and always for rows with fewer than 20 impressions. Without this, the model learns to lean on popularity and then misranks the new events it will see most of the time in production. Meta-learning approaches (Vartak et al.) are an alternative that adapt a per-user decision rule from item features, but they add training complexity that rarely pays off on top of a good content model.</p>
+
+<h3>Loss function</h3>
+<p>The primary loss is binary cross-entropy on P(register). Multi-task training adds auxiliary losses with weights that are tunable hyperparameters, for example L = L<sub>reg</sub> + 0.5 L<sub>bookmark</sub> + 0.2 L<sub>click</sub> (illustrative weights).</p>
+<div class="callout math"><p><b>Log loss example.</b> Loss for one example is &minus;[y ln p + (1 &minus; y) ln(1 &minus; p)]. A registered example predicted at p = 0.02 costs &minus;ln 0.02 = 3.91. A non-registered example predicted at p = 0.004 costs &minus;ln 0.996 = 0.004. Rare positives dominate the loss, so a few missed registrations are expensive and the model is pushed to separate them.</p></div>
+<div class="callout math"><p><b>LambdaMART intuition.</b> Gradients are scaled by how much a swap changes nDCG. A registered event at rank 5 contributes 1 / log<sub>2</sub>6 = 0.387. Moving it to rank 1 adds 1 &minus; 0.387 = 0.613 to DCG; moving it to rank 4 adds 1 / log<sub>2</sub>5 &minus; 0.387 = 0.431 &minus; 0.387 = 0.044. The listwise gradient pushes about 14 times harder on the first fix.</p></div>
+
+<h3>Training data construction and splitting</h3>
+<p>Split by time, not at random. A random split puts the same event, host, and friend neighborhood in both train and test, so the model memorizes event identity and the offline score overstates production quality. Leave a gap equal to the label window so training never sees labels that would not exist yet in production, and test mainly on events that were new in the test period.</p>
+<script type="application/json" class="dg" data-cap="Time-based split with a label gap: the test period contains events and registrations the model could not have seen">
+{"type":"graph","cols":5,
+ "groups":[{"t":"Random split","c0":0,"c1":4,"r0":0,"r1":0},{"t":"Time-based split (use this)","c0":0,"c1":4,"r0":1,"r1":1}],
+ "nodes":[
+  {"id":"rs","t":"Shuffle all impressions","s":"same events land in train and test","c":0,"r":0,"cs":5,"k":"img"},
+  {"id":"tr","t":"Train","s":"days 1 to 53","c":0,"r":1,"cs":2,"k":"data"},
+  {"id":"va","t":"Validate","s":"days 54 to 60","c":2,"r":1,"k":"data"},
+  {"id":"gp","t":"Label gap","s":"days 61 to 67","c":3,"r":1},
+  {"id":"te","t":"Test","s":"days 68 to 74","c":4,"r":1,"k":"model"}],
+ "edges":[["tr","va"],["va","gp"],["gp","te"]]}
+</script>
+<table>
+<caption>Retraining cadence versus streaming updates</caption>
+<tr><th>Component</th><th>Update cadence</th><th>Why</th></tr>
+<tr><td>Event text embeddings</td><td>At publish time</td><td>Content never changes; new events need vectors immediately</td></tr>
+<tr><td>Ranker weights</td><td>Daily full retrain on the last 30 days</td><td>Taste drifts slowly; daily retraining catches seasonality and new categories</td></tr>
+<tr><td>Calibration layer</td><td>Hourly, on the last few hours</td><td>Cheap fix for traffic mix shifts without retraining the whole model</td></tr>
+<tr><td>Counters (popularity, tickets left, friends going)</td><td>Seconds, from the stream</td><td>These are the features that change fastest and decide sold-out behavior</td></tr>
+<tr><td>Exploration posteriors</td><td>Minutes</td><td>Allocation of new-event impressions should react as evidence arrives</td></tr>
+</table>
+<div class="callout tip"><p>Be explicit about why not fully online learning: feedback loops and noisy labels can drift the model, rollbacks are hard, and a bad update affects live traffic immediately. Fresh features plus daily retraining plus an hourly calibration step gives most of the benefit with far less risk.</p></div>
+
+<h2>Evaluation</h2>
+<h3>Offline metrics</h3>
+<p>Evaluate per request on time-split data. Use a single running example: a user has 10 events in the offline candidate set ranked by the model. The user registered for the events at ranks 2 and 5, and a third registered event sits at rank 14 outside the top 10.</p>
+<script type="application/json" class="dg" data-cap="Top 5 of the running example (highlighted events were registered): the model puts registrations at ranks 2 and 5">
+{"type":"ranklist","ql":"User u1","q":"Fri 7pm, Austin","qs":"ranked by P(register)","items":[
+ {"t":"Rooftop jazz night","s":"p = 0.062, not registered","v":0.62,"sc":"0.062"},
+ {"t":"Python meetup: async IO","s":"p = 0.058, registered","v":0.58,"sc":"0.058","hl":1},
+ {"t":"Sunday trail run","s":"p = 0.044, not registered","v":0.44,"sc":"0.044"},
+ {"t":"Food truck festival","s":"p = 0.041, not registered","v":0.41,"sc":"0.041"},
+ {"t":"Indie film social","s":"p = 0.037, registered","v":0.37,"sc":"0.037","hl":1}]}
+</script>
+<table>
+<caption>Offline metric candidates (running example: relevant at ranks 2, 5, 14)</caption>
+<tr><th>Metric</th><th>Definition</th><th>Example</th><th>Flaw</th><th>Decision</th></tr>
+<tr><td>Precision@k</td><td>Share of top k that are relevant</td><td>@5: 2/5 = 0.40</td><td>Ignores order inside k and total relevant count</td><td>Report as a sanity check</td></tr>
+<tr><td>Recall@k</td><td>Share of all relevant events in top k</td><td>@5: 2/3 = 0.67</td><td>Rewards long lists; ignores order</td><td>Use for candidate generation</td></tr>
+<tr><td>mAP</td><td>Mean over relevant items of precision at each hit</td><td>(1/2 + 2/5 + 3/14) / 3 = 0.371</td><td>Binary relevance only</td><td>Use for ranking</td></tr>
+<tr><td>nDCG@10</td><td>Position-discounted gain divided by the ideal</td><td>1.018 / 2.131 = 0.478</td><td>Sensitive to graded gains you must choose</td><td>Primary ranking metric</td></tr>
+<tr><td>AUC (per user, GAUC)</td><td>Probability a positive outscores a negative</td><td>Scores 0.30, 0.12 vs 0.25, 0.10, 0.05: 5/6 = 0.833</td><td>Dominated by easy negatives; blind to calibration</td><td>Secondary, by slice</td></tr>
+<tr><td>Log loss and calibration</td><td>Quality of probabilities; predicted versus observed rates by bucket</td><td>0.9% predicted vs 0.4% observed = 2.25x over</td><td>Does not measure order</td><td>Gate for capacity and revenue use</td></tr>
+</table>
+<div class="callout math"><p><b>Recomputing the examples.</b> AP: precision at the hits is 1/2 = 0.5, 2/5 = 0.4, and 3/14 = 0.214; their mean is 1.114 / 3 = 0.371. nDCG@10: DCG = 1 / log<sub>2</sub>3 + 1 / log<sub>2</sub>6 = 0.631 + 0.387 = 1.018 (the third relevant event is outside the top 10). An ideal list would place three relevant events first: IDCG = 1 + 0.631 + 0.5 = 2.131, so nDCG@10 = 1.018 / 2.131 = 0.478. AUC: the 0.30 positive beats all 3 negatives; the 0.12 positive beats 0.10 and 0.05 but loses to 0.25; 3 + 2 = 5 of 6 pairs are correct.</p></div>
+<p>Slice every metric by cold versus warm events, city size, free versus paid, and days until start. In the Meetup data, NDCG@20 stayed below about 0.3 even for the best simple recommenders, so expect low absolute numbers and compare relative lift to a popular-nearby baseline. Also keep in mind that logged data only contains shown events; where possible, use the randomized exploration slice or inverse-propensity weighting to check that a gain is not just agreement with the old ranker.</p>
+
+<h3>Online metrics</h3>
+<script type="application/json" class="dg" data-cap="Illustrative conversion funnel per 1,000 feed impressions; numbers match the 4% click rate and 0.4% registration rate used throughout">
+{"type":"funnel","stages":[
+ {"t":"Impressions","s":"events viewed in feed","n":"1,000","m":"100%"},
+ {"t":"Clicks","s":"event page opened","n":"40","m":"CTR 4%"},
+ {"t":"Bookmark or checkout start","s":"strong intent","n":"12","m":"30% of clicks"},
+ {"t":"Registrations","s":"RSVP or paid ticket","n":"4","m":"0.4% of impressions"},
+ {"t":"Attended","s":"check-in or scan","n":"3","m":"75% show rate"}]}
+</script>
+<table>
+<caption>Online and guardrail metrics</caption>
+<tr><th>Type</th><th>Metric</th><th>Why it matters</th></tr>
+<tr><td>Business</td><td>Registrations per session; ticket revenue; attended registrations</td><td>Direct goal; attended registrations protect against no-show inflation</td></tr>
+<tr><td>Engagement</td><td>CTR; bookmark rate; click-to-register rate</td><td>Fast signals that explain movement in the primary metric</td></tr>
+<tr><td>Cold start</td><td>Share of new events with an impression in the first hour; hours to first registration</td><td>Shows whether exploration is working for new hosts</td></tr>
+<tr><td>Guardrail</td><td>Cancellation and refund rate; no-show rate; impressions to sold-out events; hide and report rate; latency p99</td><td>Prevents optimizing sales at the cost of trust or wasted exposure</td></tr>
+<tr><td>Marketplace health</td><td>Exposure Gini across hosts; share of exposure to new hosts; notification opt-outs</td><td>Keeps the supply side healthy so future events keep being created</td></tr>
+</table>
+<div class="callout math"><p><b>Sample size.</b> Take registrations per session as the metric: 10 viewed impressions at 0.4% gives 1 &minus; 0.996<sup>10</sup> &asymp; 0.04 per session, so variance &asymp; 0.04 &times; 0.96 = 0.0384. To detect a 2% relative lift (0.0008 absolute) with 80% power at 5% significance, n per arm &asymp; 2 &times; (1.96 + 0.84)<sup>2</sup> &times; 0.0384 / 0.0008<sup>2</sup> = 15.68 &times; 0.0384 / 6.4&times;10<sup>-7</sup> &asymp; 0.94M sessions. At 6M sessions per day that is under a day on paper, but the real test must still run two to three weeks.</p></div>
+<div class="callout warn"><p><b>Two-sided interference.</b> Treatment and control users compete for the same limited tickets. If the new model sells out an event for treatment users, control users lose seats, so the measured lift is partly stolen demand and overstates the platform gain. Friends in different arms also share social signals, and events live for weeks, so one-day tests miss the lifecycle. Randomize by geographic cluster (for example H3 cells at a coarse resolution plus a buffer, or whole metros), run for at least two to three weeks to cover registration timing, compare against a holdout, and track capacity guardrails such as sold-out exposure and refunds. Cluster designs have far fewer independent units, so plan for lower power.</p></div>
+
+<h2>Serving</h2>
+<h3>Candidate generation</h3>
+<p>Scoring 1M events per request is wasteful. A user in a big metro has a few thousand plausible events inside a 25 km radius (assumed density of about 2 per km<sup>2</sup>), and most of them are irrelevant for a given session. Use several cheap sources, merge, and send about 500 events to the ranker.</p>
+<script type="application/json" class="dg" data-cap="Candidate generation: five sources with quotas (200 + 100 + 150 + 30 + 20 = 500) are merged and filtered before ranking">
+{"type":"graph","cols":4,"gapY":20,
+ "nodes":[
+  {"id":"cx","t":"User and context","s":"home cell, time, travel radius","c":0,"r":2,"k":"user"},
+  {"id":"s1","t":"Nearby and upcoming","s":"H3 k-ring + time filter, top 200","c":1,"r":0,"k":"store"},
+  {"id":"s2","t":"Friends' events","s":"attending or invited, top 100","c":1,"r":1,"k":"data"},
+  {"id":"s3","t":"Interest match","s":"embedding ANN, top 150","c":1,"r":2,"k":"vec"},
+  {"id":"s4","t":"Followed hosts","s":"new events by hosts, top 30","c":1,"r":3,"k":"data"},
+  {"id":"s5","t":"New-event exploration","s":"cold events needing data, 20","c":1,"r":4,"k":"data"},
+  {"id":"mg","t":"Merge and filter","s":"dedupe, drop sold out and past","c":2,"r":2},
+  {"id":"ot","t":"About 500 candidates","s":"sent to the ranker","c":3,"r":2,"k":"io"}],
+ "edges":[["cx","s1"],["cx","s2"],["cx","s3"],["cx","s4"],["cx","s5"],["s1","mg"],["s2","mg"],["s3","mg"],["s4","mg"],["s5","mg"],["mg","ot",{"hl":1}]]}
+</script>
+<p><b>Geo-index sizing.</b> Index events in a hierarchical grid such as H3 or S2 (or geohash). At H3 resolution 6 a hexagon averages 36.1 km<sup>2</sup> with an edge of 3.7 km; at resolution 7 it is 5.16 km<sup>2</sup> with a 1.4 km edge; at resolution 5 it is 252.9 km<sup>2</sup>. A 25 km radius covers &pi; &times; 25<sup>2</sup> &asymp; 1,963 km<sup>2</sup>, which is 1,963 / 36.1 &asymp; 54 resolution-6 cells, or 61 cells for a k-ring with k = 4 (3k(k+1) + 1 = 61, about 2,200 km<sup>2</sup>). That is 61 posting-list lookups, versus roughly 380 at resolution 7. Fetch cells, then apply an exact distance filter. Keep posting lists keyed by cell and start day so time filters are cheap, and remove events when they start, sell out, or cancel.</p>
+<table>
+<caption>Why resolution 6 is a reasonable default</caption>
+<tr><th>H3 resolution</th><th>Average cell area</th><th>Lookups for 25 km radius</th><th>Trade-off</th></tr>
+<tr><td>5</td><td>252.9 km<sup>2</sup></td><td>about 8 to 19</td><td>Few lookups, but each list is long and over-fetches</td></tr>
+<tr><td>6</td><td>36.1 km<sup>2</sup></td><td>about 54 to 61</td><td>Balanced; good for metro-scale radius</td></tr>
+<tr><td>7</td><td>5.16 km<sup>2</sup></td><td>about 380</td><td>Precise, but many lookups; use adaptively for dense city centers</td></tr>
+</table>
+
+<h3>Ranking and re-ranking</h3>
+<p>The ranker scores the 500 candidates with fresh features. Re-ranking then applies product rules that a pure probability cannot express.</p>
+<script type="application/json" class="dg" data-cap="Re-ranking pipeline: hard filters, diversity, capacity throttling, exploration slots, and fairness shape the final feed">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"sc","t":"Scored candidates","s":"500 events with P(register)","c":0,"r":0,"k":"io"},
+  {"id":"ft","t":"Hard filters","s":"canceled, sold out, started, hidden","c":1,"r":0},
+  {"id":"dv","t":"Diversity","s":"max 3 per category, 2 per host","c":2,"r":0},
+  {"id":"cp","t":"Capacity and urgency","s":"throttle low stock, boost soon","c":3,"r":0},
+  {"id":"ex","t":"Exploration slots","s":"1 of every 10 for new events","c":3,"r":1,"k":"model"},
+  {"id":"fr","t":"Host fairness","s":"exposure floor and cap per host","c":2,"r":1},
+  {"id":"fd","t":"Final feed","s":"20 events per page","c":1,"r":1,"k":"io"}],
+ "edges":[["sc","ft"],["ft","dv"],["dv","cp"],["cp","ex"],["ex","fr"],["fr","fd"]]}
+</script>
+<div class="callout math"><p><b>Capacity-aware throttling.</b> An event has 20 tickets left and the model predicts p = 2% per impression. Expected impressions to fill it = 20 / 0.02 = 1,000. Allow roughly 1.5 times that, about 1,500 impressions, then stop promoting it. Showing it to 10,000 users would burn 9,000 slots on an event that will say &ldquo;sold out&rdquo;. Add expected no-shows for paid tickets only after you measure them: with a 25% no-show rate (assumption) 20 seats could be sold to about 20 / 0.75 &asymp; 27 buyers if the host allows overbooking, otherwise do not.</p></div>
+
+<h3>Serving architecture</h3>
+<script type="application/json" class="dg" data-cap="End-to-end architecture: request path, streaming feature updates, and offline training meet at the ranking service">
+{"type":"graph","cols":5,
+ "groups":[{"t":"Online request path (p99 under 200 ms)","c0":0,"c1":4,"r0":0,"r1":0},{"t":"Near-real-time: streaming features","c0":0,"c1":4,"r0":1,"r1":1},{"t":"Offline: training and registry","c0":0,"c1":4,"r0":2,"r1":2}],
+ "nodes":[
+  {"id":"api","t":"Feed API","s":"user request","c":0,"r":0,"k":"io"},
+  {"id":"cd","t":"Candidate service","s":"geo, time, sources","c":1,"r":0},
+  {"id":"ix","t":"Event index","s":"cell + start-day lists","c":2,"r":0,"k":"store"},
+  {"id":"rk","t":"Ranking service","s":"GBDT or DNN","c":3,"r":0,"k":"model"},
+  {"id":"rr","t":"Re-ranking","s":"rules, capacity, exploration","c":4,"r":0},
+  {"id":"lg","t":"Event log stream","s":"impressions, RSVPs","c":0,"r":1,"k":"data"},
+  {"id":"fl","t":"Stream processor","s":"windows, counters","c":1,"r":1},
+  {"id":"fs","t":"Online feature store","s":"key-value, ms reads","c":2,"r":1,"k":"store"},
+  {"id":"lk","t":"Data lake","s":"labeled logs, 30 days","c":0,"r":2,"k":"store"},
+  {"id":"tn","t":"Training pipeline","s":"daily retrain","c":1,"r":2,"k":"model"},
+  {"id":"rg","t":"Model registry","s":"versions, canary","c":3,"r":2,"k":"store"}],
+ "edges":[["api","cd"],["cd","ix","lookup"],["ix","rk","500 events"],["rk","rr"],["api","lg","logged events"],["lg","fl"],["fl","fs"],["fs","rk","fresh features",{"d":1,"hl":1,"sa":"t","sb":"b"}],["lg","lk"],["lk","tn"],["tn","rg","daily model"],["rg","rk","weights",{"d":1,"hl":1}]]}
+</script>
+<p><b>Latency and scale (assumptions).</b> 3M daily actives with 2 sessions each gives 6M feed requests per day, about 70 per second on average and about 550 per second at an 8x peak. Scoring 500 candidates per request is 550 &times; 500 = 275K scorings per second. At roughly 100 microseconds per scoring for a 300-tree GBDT, that is about 28 cores, so a small fleet with headroom handles it. A plausible budget: candidate lookup 30 ms, feature fetch 20 ms, ranking 40 ms, re-ranking 10 ms, network and serialization 40 ms, leaving margin under 200 ms. Active events at about 2 KB of features each take 2 GB, and 10M users at 1 KB take 10 GB, so the online feature store fits in memory.</p>
+<table>
+<caption>Failure modes and degradation</caption>
+<tr><th>Failure</th><th>Impact</th><th>Fallback</th></tr>
+<tr><td>Feature store slow or down</td><td>Missing counts and friend features</td><td>Serve cached values or defaults; GBDT handles missing values; alert on rate of defaults</td></tr>
+<tr><td>Ranker unavailable</td><td>No personalized scores</td><td>Per-cell precomputed popular-and-upcoming list refreshed every few minutes</td></tr>
+<tr><td>Stream lag</td><td>Stale tickets left; sold-out events shown</td><td>Check event state at read time before rendering; show &ldquo;selling fast&rdquo; only with fresh data</td></tr>
+<tr><td>Index out of sync with lifecycle events</td><td>Canceled event appears in feed</td><td>Hard filter against a small event-state cache after ranking</td></tr>
+<tr><td>Bad model rollout</td><td>Metric regression</td><td>Canary 1%, automated guardrail checks, one-click rollback to the registry's previous version</td></tr>
+</table>
+<p><b>Monitoring.</b> Watch calibration (predicted versus observed registration rate per bucket and per city, hourly), feature drift (population stability for distance, days-left, and counts), stream lag, the share of impressions going to sold-out or canceled events, share of new events getting first impressions within an hour, and slice metrics by city size.</p>
+
+<h3>Cold-start strategy for new events</h3>
+<p>A new event gets a prior from content, host, place, and time, then earns evidence through a limited exploration budget, and finally graduates to the warm ranker. The exploration budget needs arithmetic: if one position in 10 is reserved, that is 6M impressions per day. With about 33K new events per day (1M active over a 30-day life) each gets about 180 exploratory impressions on average.</p>
+<script type="application/json" class="dg" data-cap="Cold-start loop: a content-only prior seeds a Bayesian exploration policy; evidence then moves the event to the warm ranker">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"ne","t":"New event published","s":"no impressions yet","c":0,"r":0,"k":"io"},
+  {"id":"ce","t":"Content encoder","s":"text, category, host, price","c":1,"r":0,"k":"model"},
+  {"id":"pp","t":"Cold prior P(register)","s":"content-only, dropout-trained","c":2,"r":0,"k":"model"},
+  {"id":"ea","t":"Exploration allocator","s":"Thompson sampling on Beta prior","c":3,"r":0},
+  {"id":"fb","t":"Early feedback","s":"impressions, clicks, RSVPs","c":3,"r":1,"k":"data"},
+  {"id":"po","t":"Posterior update","s":"prior plus observed conversions","c":2,"r":1},
+  {"id":"wr","t":"Warm ranker","s":"popularity features switch on","c":1,"r":1,"k":"model"},
+  {"id":"nr","t":"Normal ranking","s":"competes on predicted value","c":0,"r":1,"k":"io"}],
+ "edges":[["ne","ce"],["ce","pp"],["pp","ea","prior mean"],["ea","fb","slots"],["fb","po"],["po","wr"],["wr","nr"],["pp","po","seed",{"d":1}]]}
+</script>
+<div class="callout math"><p><b>Bayesian update.</b> Model the event's registration rate as Beta(1, 249), mean 1/250 = 0.4%. After 180 exploratory impressions: with 0 registrations the posterior mean is 1 / 430 = 0.23%; with 2 registrations it is 3 / 430 = 0.70%. Even at 180 impressions, P(zero registrations) = 0.996<sup>180</sup> &asymp; 0.49, so half of average events still have no label; the prior and the content model decide their ranking until real evidence arrives.</p></div>
+<script type="application/json" class="dg" data-cap="Illustrative content embedding space: a new event with no RSVPs lands next to similar past events, so its cold prior borrows their conversion behavior">
+{"type":"embed","h":320,"seed":9,"nn":3,
+ "clusters":[{"n":"Live music","x":160,"y":170,"r":24,"k":8},{"n":"Tech meetups","x":420,"y":120,"r":24,"k":8},{"n":"Food and drink","x":610,"y":210,"r":24,"k":7},{"n":"Fitness and outdoors","x":370,"y":250,"r":20,"k":7}],
+ "query":{"x":200,"y":195,"t":"new event, no RSVPs"}}
+</script>
+
+<h3>Event lifecycle and notifications</h3>
+<p>Every state change must reach the index, the feature store, and registered users. Lifecycle events are first-class messages in the log.</p>
+<script type="application/json" class="dg" data-cap="Event lifecycle: each state decides whether the event is rankable, hidden, or purged, and who gets notified">
+{"type":"graph","cols":5,
+ "nodes":[
+  {"id":"d","t":"Draft","s":"not visible","c":0,"r":0,"k":"io"},
+  {"id":"p","t":"Published","s":"indexed, cold-start path","c":1,"r":0},
+  {"id":"o","t":"On sale","s":"ranked normally","c":2,"r":0,"k":"model"},
+  {"id":"l","t":"Started","s":"removed from index","c":3,"r":0},
+  {"id":"en","t":"Ended","s":"labels close, attendance logged","c":4,"r":0,"k":"io"},
+  {"id":"rs","t":"Rescheduled","s":"re-score, notify registrants","c":1,"r":1},
+  {"id":"so","t":"Sold out","s":"hidden, waitlist button","c":2,"r":1},
+  {"id":"cn","t":"Canceled","s":"purge, notify, refund","c":3,"r":1}],
+ "edges":[["d","p","publish"],["p","o","sales open"],["o","l","start time"],["l","en"],["o","so","stock = 0"],["o","rs","date change"],["rs","p","new date"],["o","cn","host cancels"]]}
+</script>
+<p><b>Notification timing.</b> Pushes and emails reuse the ranker with a stricter bar and a frequency cap (for example one push per day and three per week). Free meetups benefit from a nudge in the last 48 hours; paid concerts from an early message plus a reminder before the sale closes or stock runs low. Do not notify about an event with only a handful of tickets left, and measure uplift (who registers because of the message) rather than just opens, so the system does not spam users who would have come anyway.</p>
+
+<h3>Challenges</h3>
+<table>
+<caption>Challenges and approaches</caption>
+<tr><th>Challenge</th><th>Approach</th></tr>
+<tr><td>Cold start for events</td><td>Content and host priors; dropout-trained ranker; exploration budget with Bayesian updating</td></tr>
+<tr><td>Cold start for users</td><td>Home location, onboarding interests, popular nearby by category, time-of-week prior</td></tr>
+<tr><td>Speed and freshness</td><td>Streaming counters, daily retraining, hourly calibration, event-state check at read time</td></tr>
+<tr><td>Diversity</td><td>Category and host caps; relevance-with-diversity re-ranking; mix of friends, nearby, and discovery</td></tr>
+<tr><td>Fairness to organizers</td><td>Exposure floor for new hosts, cap on any host's share, track exposure Gini and conversion by host size</td></tr>
+<tr><td>Privacy</td><td>Opt-in friend visibility, aggregated counts, sensitive-category protections, easy hide controls</td></tr>
+<tr><td>No-shows</td><td>Attend head where check-in exists; weight attended registrations in revenue-oriented ranking; reminders</td></tr>
+</table>
+
+<h2>Other Talking Points</h2>
+<ul>
+<li>Recurring events as series: model the series for taste and host quality, but score each occurrence with its own date, capacity, and counts, so a sold-out Friday does not hide an open Saturday.</li>
+<li>Travelers and moved users: use current location when it is recent, otherwise home cell, because a stale home cell sends a visitor irrelevant suggestions.</li>
+<li>Group recommendations: when a user plans with friends, rank for the group using the friends who opt in, since friend attendance is both a feature and a product surface.</li>
+<li>Calendar integration: a conflict flag removes events the user cannot attend, which raises precision without touching the model.</li>
+<li>Online events: treat distance as not applicable and add timezone handling, otherwise they either dominate or vanish from local feeds.</li>
+<li>Spam and fraud: screen fake or scam events with an integrity model before ranking, because the ranker will happily promote an event that converts well and refunds badly.</li>
+<li>Explanations: show reasons such as &ldquo;two friends are going&rdquo; or &ldquo;near you&rdquo;; they raise trust and click-to-register rate and give users a way to correct the system.</li>
+<li>Seasonality and holidays: add calendar features and keep a seasonal baseline, because Valentine's weekend and festival season break last month's patterns.</li>
+<li>Contextual bandits (for example LinUCB) for the exploration slot when the number of candidate new events is large and rewards are delayed.</li>
+<li>Host-side value: report to organizers how much exposure they got and why, because supply growth depends on hosts believing the marketplace is fair.</li>
+</ul>
+
+<h2 class="nonum">Check yourself</h2>
+<p class="qa-intro">Questions are tagged by the level they target. The first set checks Senior-level fundamentals and arithmetic; Staff and Principal questions probe trade-offs, operations, experimentation and organization. Try to answer aloud for two minutes before opening one.</p>
+<div class="qa-bar" data-qa></div>
+<details class="ans" data-lvl="sr"><summary>Why does collaborative filtering struggle for events, and what carries the signal instead?</summary>Events expire, so each one has few interactions before its label closes. In the Meetup data more than 45% of events had at most one positive RSVP, and only about 30% of users had co-attended two or more events. Content, location, time, host history, and social signals are available at publish time and carry most of the signal.</details>
+<details class="ans" data-lvl="sr"><summary>You keep 5% of negatives. The model outputs q = 0.2 on the sampled data. What is the real probability?</summary>p = q / (q + (1 &minus; q) / w) = 0.2 / (0.2 + 0.8 / 0.05) = 0.2 / (0.2 + 16) = 0.2 / 16.2 &asymp; 1.2%. If you skip this step, every downstream rule that uses probabilities (capacity throttling, revenue weighting, notification thresholds) will be about 16 times too confident.</details>
+<details class="ans" data-lvl="sr"><summary>Offline AUC jumps after adding a &ldquo;registrations so far&rdquo; feature, but the online test is flat. What happened?</summary>Likely leakage: the feature was computed from the final table, so it included the label and future registrations. Fix it by logging feature values at serving time or building features as-of the impression timestamp, and by randomly dropping popularity features during training so the model also works on new events.</details>
+<details class="ans" data-lvl="st"><summary>How would you design the A/B test for a new ranker, given limited tickets?</summary>Individual-level randomization is biased because treatment and control users compete for the same seats. Randomize by metro or coarse geo cluster (with buffers), run two to three weeks to cover registration timing, track sold-out exposure, refunds, and no-shows, and keep a holdout. Expect lower power from fewer clusters. For rough sizing, per-user randomization on registrations per session (variance about 0.0384, 2% relative lift) needs about 0.94M sessions per arm, so the cluster design may require a longer run.</details>
+<details class="ans" data-lvl="sr"><summary>An event has 8 tickets left and a predicted conversion of 2% per impression. How many impressions should you allow?</summary>Impressions to fill = 8 / 0.02 = 400. With a 1.5x safety factor, about 600 impressions. After that, throttle promotion and show the event only to high-intent users (friends, bookmarkers), so slots go to events that can still convert.</details>
+<details class="ans" data-lvl="sr"><summary>Why H3 resolution 6 for a 25 km candidate radius, and what would change in a dense downtown?</summary>The radius covers about 1,963 km<sup>2</sup>; a resolution-6 cell averages 36.1 km<sup>2</sup>, so about 54 cells (61 with a k = 4 ring) is a small number of lookups. Resolution 7 would need about 380 lookups. In dense downtowns, lists per cell are long, so use resolution 7 adaptively or add category filters to the index key.</details>
+<details class="ans" data-lvl="st"><summary>Organizers want exposure, attendees want relevance, and tickets are limited. How do you formulate the objective?</summary><p>Maximize expected registrations subject to capacity and fairness constraints. A capacity-aware score multiplies the predicted conversion by a factor that falls as remaining tickets approach what the pace of current demand will fill, so you stop showing an event that will sell out and give exposure to ones that need it. The impression budget for an event with 8 tickets left at 2 percent conversion is about 8 / 0.02 = 400 impressions.</p><p>Add organizer-side fairness: an exposure floor for new organizers so they can build history, and a cap so a single organizer cannot dominate. Guardrails: refund and cancellation rate, "sold out" disappointment, and organizer retention. Evaluate with marketplace-level experiments, for example randomizing by city, because user-level tests leak across the shared inventory.</p><p class="probe"><b>Likely follow-ups:</b> What is the failure when predicted conversion is miscalibrated? &middot; How do you avoid showing sold-out events during the delay in inventory updates?</p><p class="signal"><b>What makes this Staff-level:</b> You see events as a constrained marketplace, not a pure ranking problem, and you choose the experiment unit to match.</p></details>
+<details class="ans" data-lvl="st"><summary>You launch in a brand-new city with no history. What does the system do on day one?</summary><p>Lean on features that transfer: content (category, title text embeddings), time and day patterns, price, host history from other cities, and distance expressed relative to the city's density rather than in absolute kilometers. Use priors from similar cities (clustered by category mix and size) for popularity and for calibration offsets. Add exploration so the first week generates data, and use social signals (friends' registrations, imported contacts) where available.</p><p>Evaluate from the start with a small, randomized exploration slice, and compare the new city's calibration curve to existing cities before trusting scores. Avoid high-capacity ID embeddings in the first weeks; they have no data. Measure time-to-reasonable-quality (days until calibration error falls within tolerance) as a launch KPI.</p><p class="probe"><b>Likely follow-ups:</b> How would you tell that the city-similarity prior is wrong? &middot; What do you do about seasonality you have not seen in this city?</p><p class="signal"><b>What makes this Staff-level:</b> You plan for the cold start as a repeatable launch playbook with its own KPI.</p></details>
+<details class="ans" data-lvl="pr"><summary>The business wants push notifications to drive registrations. How do you measure true impact and avoid fatigue?</summary><p>Optimize for incremental registrations, not click rate. Notifications often reach people who would have registered anyway, so a model that predicts click will target the wrong users. Estimate the treatment effect with a randomized holdout (users who would have been messaged but are not) and train an uplift model, or at least rank by predicted lift.</p><p>Control fatigue with per-user budgets, quiet hours, send-time optimization and frequency caps tuned by the opt-out curve. Guardrails: unsubscribe and notification-disable rate, uninstall rate, and long-term engagement of heavily messaged cohorts. Review quarterly: if a cohort's opt-outs rise, the notification program is borrowing from the future.</p><p class="probe"><b>Likely follow-ups:</b> How large must the holdout be and how long does it run? &middot; What would make you turn the channel off for a user?</p><p class="signal"><b>What makes this Principal-level:</b> You distinguish correlation from causal lift and account for the long-term cost of the channel.</p></details>
+<details class="ans" data-lvl="st"><summary>AUC is 0.82, but organizers in suburban areas report that their events get almost no exposure. Diagnose.</summary><p>Check for density and popularity bias: features such as distance to city center, venue popularity and past registrations are correlated with location, so the model learns "downtown wins". Slice evaluation by region (impressions per event, calibration per region) before concluding anything; the aggregate AUC hides it. Check position bias and the candidate stage too: a fixed-radius candidate generator can starve suburban events.</p><p>Fixes: calibrate per region, add exposure floors and exploration for under-served areas, adjust candidate radius by density (the H3 resolution choice), and train with propensity weights from logged impressions. Report exposure Gini by region and organizer as a standing fairness metric.</p><p class="probe"><b>Likely follow-ups:</b> How do you separate low exposure from low demand? &middot; What does an exposure floor cost in conversions?</p><p class="signal"><b>What makes this Staff-level:</b> You start from slices and mechanisms (candidate stage, features, bias) before proposing a fix.</p></details>
+
+<h2 class="nonum">References</h2>
+<ol class="refs">
+<li>de Macedo and Marinho. Event Recommendation in Event-based Social Networks. CEUR Workshop Proceedings Vol-1210, 2014. <a href="https://ceur-ws.org/Vol-1210/SP2014_02.pdf">ceur-ws.org</a></li>
+<li>Macedo, Marinho, and Santos. Context-Aware Event Recommendation in Event-based Social Networks. RecSys 2015. <a href="https://dl.acm.org/doi/10.1145/2792838.2800187">dl.acm.org</a></li>
+<li>Liu, He, Tian, Lee, McPherson, and Han. Event-based Social Networks: Linking the Online and Offline Social Worlds. KDD 2012. <a href="https://dl.acm.org/doi/abs/10.1145/2339530.2339693">dl.acm.org</a></li>
+<li>Volkovs, Yu, and Poutanen. DropoutNet: Addressing Cold Start in Recommender Systems. NeurIPS 2017. <a href="https://papers.nips.cc/paper/7081-dropoutnet-addressing-cold-start-in-recommender-systems">papers.nips.cc</a></li>
+<li>Vartak et al. A Meta-Learning Perspective on Cold-Start Recommendations for Items. NeurIPS 2017. <a href="https://papers.nips.cc/paper/2017/hash/51e6d6e679953c6311757004d8cbbba9-Abstract.html">papers.nips.cc</a></li>
+<li>He et al. Practical Lessons from Predicting Clicks on Ads at Facebook. ADKDD 2014 (negative downsampling and recalibration). <a href="https://quinonero.net/Publications/predicting-clicks-facebook.pdf">quinonero.net</a></li>
+<li>Burges. From RankNet to LambdaRank to LambdaMART: An Overview. Microsoft Research, 2010. <a href="https://www.microsoft.com/en-us/research/publication/from-ranknet-to-lambdarank-to-lambdamart-an-overview/">microsoft.com</a></li>
+<li>Rendle et al. BPR: Bayesian Personalized Ranking from Implicit Feedback. UAI 2009. <a href="https://arxiv.org/abs/1205.2618">arxiv.org</a></li>
+<li>Li, Chu, Langford, and Schapire. A Contextual-Bandit Approach to Personalized News Article Recommendation. WWW 2010. <a href="https://arxiv.org/abs/1003.0146">arxiv.org</a></li>
+<li>Chapelle. Modeling Delayed Feedback in Display Advertising. KDD 2014. <a href="https://dl.acm.org/doi/10.1145/2623330.2623634">dl.acm.org</a></li>
+<li>H3 documentation: tables of cell statistics across resolutions. <a href="https://h3geo.org/docs/core-library/restable">h3geo.org</a></li>
+<li>Uber Engineering. H3: Uber's Hexagonal Hierarchical Spatial Index. <a href="https://www.uber.com/us/en/blog/h3/">uber.com</a></li>
+<li>S2 Geometry Library. <a href="https://s2geometry.io/">s2geometry.io</a></li>
+<li>Holtz, Lobel, Liskovich, and Aral. Reducing Interference Bias in Online Marketplace Experiments Using Cluster Randomization. Management Science. <a href="https://dl.acm.org/doi/10.1287/mnsc.2020.01157">dl.acm.org</a></li>
+</ol>
+</main></div>
+<script src="assets/dg.js"></script>
+<script src="assets/nav.js"></script>
+<script src="assets/qa.js"></script>
+</body>
+</html>

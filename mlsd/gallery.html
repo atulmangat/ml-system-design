@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Diagram and Component Gallery</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-slug="gallery">
+<div class="topbar"><a href="index.html">&larr; ML System Design Study Guide</a><span style="color:var(--muted)">Gallery (authoring reference)</span></div>
+<div class="layout"><aside class="toc" id="toc"></aside>
+<main>
+<div class="kicker">Authoring reference</div>
+<h1>Diagram and component gallery</h1>
+<p class="lead">Every diagram type and page component, with the exact markup. View source to copy. All diagrams are declared as JSON in <code>&lt;script type="application/json" class="dg" data-cap="Caption"&gt;</code> blocks and rendered by <code>assets/dg.js</code>.</p>
+
+<h2>Page components</h2>
+<h3>Dialogue</h3>
+<div class="dlg">
+<div class="turn c"><span>Candidate</span><p>Is the query always an image?</p></div>
+<div class="turn i"><span>Interviewer</span><p>Yes, images only.</p></div>
+</div>
+<div class="summary"><p>Build an image-to-image search system over 100 billion images with low latency and no personalization.</p></div>
+<div class="callout tip"><p>Say the trade-off out loud before you pick an option.</p></div>
+<div class="callout warn"><p>Euclidean distance degrades in very high dimensions; prefer cosine or dot product.</p></div>
+<div class="callout key"><p>Similar items should be close in embedding space; everything else is plumbing.</p></div>
+<div class="callout math"><p>nDCG = DCG / IDCG = 4.693 / 4.762 &asymp; 0.985.</p></div>
+<table>
+<caption>Comparison table (markup: plain &lt;table&gt;, wrapped automatically)</caption>
+<tr><th>Option</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>A</td><td>Fast</td><td>Less accurate</td></tr>
+<tr><td>B</td><td>Accurate</td><td>Slow</td></tr>
+</table>
+
+<h2>graph: architecture and pipelines</h2>
+<p>Nodes sit on a grid (<code>c</code> column, <code>r</code> row, optional <code>cs</code> column span). Kinds: <code>io</code> (pill), <code>svc</code> (service), <code>model</code> (ML model), <code>store</code> (database), <code>data</code> (document), <code>img</code>, <code>vec</code>, <code>user</code>. Edges: <code>[from, to, "label", {d:1 dashed, hl:1 highlighted, sa:"t|b|l|r", sb:"t|b|l|r"}]</code>.</p>
+<script type="application/json" class="dg" data-cap="Prediction pipeline (top) and indexing pipeline (bottom) with groups">
+{"type":"graph","cols":5,
+ "groups":[{"t":"Online: prediction pipeline","c0":0,"c1":4,"r0":0,"r1":0},{"t":"Offline: indexing pipeline","c0":0,"c1":4,"r0":1,"r1":1}],
+ "nodes":[
+  {"id":"q","t":"Query image","s":"user selects a crop","c":0,"r":0,"k":"img"},
+  {"id":"emb","t":"Embedding service","s":"preprocess + encoder","c":1,"r":0,"k":"model"},
+  {"id":"ann","t":"Nearest neighbor service","s":"ANN lookup","c":2,"r":0},
+  {"id":"rr","t":"Re-ranking service","s":"policy, dedupe","c":3,"r":0},
+  {"id":"res","t":"Ranked results","c":4,"r":0,"k":"io"},
+  {"id":"up","t":"New image","s":"uploaded","c":0,"r":1,"k":"img"},
+  {"id":"emb2","t":"Embedding service","c":1,"r":1,"k":"model"},
+  {"id":"idx","t":"Indexing service","c":2,"r":1},
+  {"id":"vdb","t":"Embedding index","s":"sharded, quantized","c":3,"r":1,"k":"store"}],
+ "edges":[["q","emb","224x224"],["emb","ann","128-d vector"],["ann","rr","top 500"],["rr","res"],["up","emb2"],["emb2","idx"],["idx","vdb"],["vdb","ann","searched by",{"d":1,"sa":"t","sb":"b"}]]}
+</script>
+<script type="application/json" class="dg" data-cap="A training example for contrastive learning: embeddings and a vector node">
+{"type":"graph","cols":4,
+ "nodes":[
+  {"id":"q","t":"Query image","c":0,"r":0,"k":"img"},
+  {"id":"p","t":"Positive","s":"augmented copy","c":0,"r":1,"k":"img"},
+  {"id":"n","t":"Negatives","s":"other images in batch","c":0,"r":2,"k":"img"},
+  {"id":"enc","t":"Shared encoder","s":"CNN or ViT","c":1,"r":1,"k":"model"},
+  {"id":"v","t":"Embeddings","s":"128-d","c":2,"r":1,"k":"vec"},
+  {"id":"l","t":"Contrastive loss","s":"softmax + cross-entropy","c":3,"r":1,"k":"svc"}],
+ "edges":[["q","enc"],["p","enc"],["n","enc"],["enc","v"],["v","l","similarities"]]}
+</script>
+
+<h2>embed: embedding space</h2>
+<p>Seeded random clusters. <code>query</code> draws a diamond and dashed lines to its <code>nn</code> nearest points. Cluster marker <code>m</code>: <code>c</code> circle, <code>s</code> square, <code>t</code> triangle.</p>
+<script type="application/json" class="dg" data-cap="Similar images land close together in embedding space">
+{"type":"embed","h":320,"seed":5,"nn":3,
+ "clusters":[{"n":"Dogs","x":170,"y":150,"r":34,"k":8},{"n":"Beaches","x":420,"y":120,"r":38,"k":8},{"n":"Pasta","x":620,"y":210,"r":32,"k":7},{"n":"Cars","x":330,"y":240,"r":28,"k":7}],
+ "query":{"x":405,"y":150,"t":"query"}}
+</script>
+
+<h2>funnel</h2>
+<script type="application/json" class="dg" data-cap="Multi-stage recommendation funnel">
+{"type":"funnel","stages":[
+ {"t":"Candidate generation","s":"two-tower + ANN","n":"~1,000","m":"10M videos"},
+ {"t":"Ranking","s":"deep multi-task model","n":"~100"},
+ {"t":"Re-ranking","s":"diversity, policy, freshness","n":"~20"}]}
+</script>
+
+<h2>matrix</h2>
+<script type="application/json" class="dg" data-cap="Similarity matrix of 4 queries vs 4 candidates; the diagonal holds the true matches">
+{"type":"matrix","rl":"Queries","cl":"Candidates","rows":["q1","q2","q3","q4"],"cols":["c1","c2","c3","c4"],
+ "v":[[0.9,0.2,0.1,0.3],[0.1,0.8,0.3,0.2],[0.2,0.1,0.95,0.1],[0.3,0.2,0.2,0.85]],"hl":"diag"}
+</script>
+<script type="application/json" class="dg" data-cap="User-video interaction matrix with unknown entries (collaborative filtering)">
+{"type":"matrix","rl":"Users","cl":"Videos","rows":["u1","u2","u3"],"cols":["v1","v2","v3","v4"],
+ "v":[[1,null,0.3,null],[null,1,null,0.3],[0.3,null,1,null]],"unk":"?"}
+</script>
+
+<h2>net: social or co-click graph</h2>
+<p>Nodes use 0-100 coordinates. Kinds: <code>me</code>, <code>fr</code>, <code>cand</code>, <code>hit</code>, <code>other</code>.</p>
+<script type="application/json" class="dg" data-cap="Mutual friends make a strong candidate">
+{"type":"net","h":280,"nodes":[
+ {"id":"a","t":"You","x":12,"y":50,"k":"me"},
+ {"id":"b","t":"B","x":40,"y":18,"k":"fr","s":"friend"},
+ {"id":"c","t":"C","x":40,"y":82,"k":"fr","s":"friend"},
+ {"id":"d","t":"D","x":72,"y":50,"k":"cand","s":"candidate"},
+ {"id":"e","t":"E","x":92,"y":20,"k":"other"}],
+ "edges":[["a","b"],["a","c"],["b","d",{"hl":1,"l":"mutual"}],["c","d",{"hl":1}],["d","e",{"d":1}]]}
+</script>
+
+<h2>curve: line chart</h2>
+<script type="application/json" class="dg" data-cap="Precision-recall curve with the chosen operating point">
+{"type":"curve","xl":"Recall","yl":"Precision","series":[
+ {"n":"Model v2","c":0,"lp":2,"pts":[[0,1],[0.3,0.98],[0.6,0.94],[0.8,0.86],[0.92,0.7],[1,0.35]]},
+ {"n":"Model v1","c":1,"d":1,"lp":3,"pts":[[0,1],[0.3,0.94],[0.6,0.84],[0.8,0.7],[0.92,0.5],[1,0.25]]}],
+ "marks":[{"x":0.8,"y":0.86,"t":"operating point"}]}
+</script>
+
+<h2>bars</h2>
+<script type="application/json" class="dg" data-cap="Grouped columns">
+{"type":"bars","labels":["Baseline","+ Hard negatives","+ Fine-tuned encoder"],"series":[{"n":"nDCG@10","v":[0.62,0.71,0.78]},{"n":"Recall@100","v":[0.81,0.88,0.93]}]}
+</script>
+<script type="application/json" class="dg" data-cap="Horizontal bars">
+{"type":"bars","horiz":true,"labels":["Exact search","IVF-PQ","HNSW"],"series":[{"n":"Latency (ms)","v":[900,12,6]}],"fmt":null}
+</script>
+
+<h2>stack: towers and layer stacks</h2>
+<script type="application/json" class="dg" data-cap="Two-tower model; similarity of the two embeddings is the score">
+{"type":"stack","cols":[
+ {"t":"User tower","layers":[{"t":"User + context features","s":"age, device, watch history"},{"t":"Dense 512 + ReLU"},{"t":"Dense 128","s":"user embedding","k":"model"}]},
+ {"t":"Video tower","layers":[{"t":"Video features","s":"ID, title, duration"},{"t":"Dense 512 + ReLU"},{"t":"Dense 128","s":"video embedding","k":"model"}]}],
+ "join":{"t":"Dot product","s":"relevance score"}}
+</script>
+
+<h2>ranklist</h2>
+<script type="application/json" class="dg" data-cap="A query and its ranked results with similarity scores">
+{"type":"ranklist","ql":"Query image","q":"golden retriever","qs":"cropped from a photo","items":[
+ {"t":"Retriever on lawn","s":"similarity 0.93","v":0.93,"hl":1},{"t":"Labrador portrait","s":"similarity 0.88","v":0.88},{"t":"Puppy in snow","s":"similarity 0.79","v":0.79}]}
+</script>
+<h2>More options</h2>
+<ul>
+<li><b>Number formats from JSON</b> (<code>bars</code>, <code>matrix</code>): <code>"fmt":"pct"</code> (90%), <code>"pct1"</code> (90.5%), <code>"int"</code> (12,345), <code>"k"</code> (12k, 1.2M), or a template such as <code>"{v} ms"</code>.</li>
+<li><b>Matrix cell text</b>: <code>"t":[["TP","FN"],["FP","TN"]]</code> overrides the printed value; <code>v</code> still sets the shade.</li>
+<li><b>Curve axes</b>: <code>"xticks":[[1,"1"],[10,"10"],[100,"100"]]</code>, <code>"yticks"</code> likewise; <code>"xlog":true</code> for a log x-axis (xmin must be &gt; 0). Series label position: <code>"lp": index of the point to label</code>.</li>
+<li><b>Embed legend</b>: <code>"legend":[{"t":"Text query","c":0,"m":"c"},{"t":"Video","c":1,"m":"s"}]</code> (marker <code>c</code>, <code>s</code>, <code>t</code>).</li>
+<li><b>Ranklist</b>: scores <code>v</code> are scaled to 1 (or <code>"vmax"</code>); show a different label with <code>"sc"</code>.</li>
+<li><b>Custom hand-drawn SVG</b> that still gets automatic figure numbers: put the SVG in <code>&lt;template id="t-x"&gt;</code> and declare <code>{"type":"svg","tpl":"t-x"}</code>. Use the CSS classes from style.css.</li>
+<li><b>Fit pass</b>: nav.js automatically shrinks text that overflows its box and keeps labels inside the diagram. Keep titles short anyway.</li>
+</ul>
+<h2>Live behaviour (automatic)</h2>
+<p><code>assets/live.js</code> is loaded by nav.js and upgrades the drawn diagrams. Authors do nothing extra.</p>
+<ul>
+<li><b>Architecture graphs and stacks:</b> data packets flow along every arrow; hover a node to trace its connections and dim the rest; <i>Walk through</i> lights the request path step by step in the order the <code>edges</code> are listed, so list edges in the order data flows.</li>
+<li><b>Embedding spaces (<code>embed</code> with a <code>query</code>):</b> drag the query diamond; nearest neighbours (<code>nn</code>) and a "k nearest: cluster x n" readout update live. Give clusters names (<code>n</code>) so the readout is meaningful.</li>
+<li><b>Charts (<code>curve</code>):</b> hover for a crosshair with exact interpolated values for every series. Give each series a name (<code>n</code>).</li>
+<li><b>Social graphs (<code>net</code>):</b> hover a node to highlight its neighbours and edges.</li>
+<li><b>Tooltips:</b> bars, matrix cells, funnel stages and ranked results show their values on hover.</li>
+<li><b>Autoplay (GIF-style):</b> <code>assets/motion.js</code> builds each figure when it scrolls into view (bars grow, funnels cascade, stacks rise, matrix cells ripple, curves draw, ranked lists slide in, graphs assemble). While a figure stays on screen it loops a demo: graphs auto-walk their data flow with a step caption, embedding spaces glide the query between clusters, charts sweep the crosshair, social graphs cycle the highlighted neighbourhood. Hovering a figure pauses its loop. Each figure has <i>Replay</i> and (for loops) <i>Pause</i> buttons. Authors do nothing extra; keep <code>edges</code> in data-flow order and name clusters and series.</li>
+<li><b>Controls:</b> a <i>Live diagrams</i> switch in the top bar turns the packet animation off (remembered per browser). Motion is also off when the system asks for reduced motion, and animation pauses for diagrams that are off screen.</li>
+</ul>
+<h2 class="nonum">Check yourself</h2>
+<details class="ans" data-lvl="st"><summary>Example Staff-level question</summary><p>Example answer with a recommendation first, then trade-offs and how you would measure it.</p><p class="probe"><b>Likely follow-ups:</b> one or two probes</p><p class="signal"><b>What makes this Staff-level:</b> one sentence</p></details>
+</main></div>
+<script src="assets/dg.js"></script>
+<script src="assets/nav.js"></script>
+</body>
+</html>
