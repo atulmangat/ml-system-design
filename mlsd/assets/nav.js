@@ -73,7 +73,7 @@
       svg = '<svg class="fig" viewBox="0 0 ' + W + " " + (rows.length * rowH + top) + '">' + out.join("") + "</svg>";
     }
     var fig = document.createElement("figure");
-    fig.innerHTML = svg + "<figcaption><b>Figure " + chNo + "." + figN + "</b>" + cap.replace(/</g, "&lt;") + "</figcaption>";
+    fig.innerHTML = '<div class="figscroll">' + svg + "</div><figcaption><b>Figure " + chNo + "." + figN + "</b>" + cap.replace(/</g, "&lt;") + "</figcaption>";
     el.parentNode.replaceChild(fig, el);
   });
 
@@ -138,7 +138,11 @@
       hs.forEach(function (e, i) { if (!e.id) e.id = "s" + i; h += '<a data-sec="' + e.id + '" href="#' + e.id + '">' + e.textContent + "</a>"; });
       h += "</div>";
     }
-    toc.innerHTML = h;
+    var curCh = CH[idx] ? (idx + 1) + ". " + CH[idx][1] : "Chapters";
+    toc.innerHTML = '<button type="button" class="toc-toggle" aria-expanded="false"><span class="tt-l">\u2630 Chapters &amp; sections</span><span class="tt-c">' + curCh + '</span></button><div class="toc-body">' + h + "</div>";
+    var tt = toc.querySelector(".toc-toggle");
+    tt.addEventListener("click", function () { var o = toc.classList.toggle("open"); tt.setAttribute("aria-expanded", o ? "true" : "false"); });
+    toc.addEventListener("click", function (e) { if (e.target.closest && e.target.closest("a[data-sec]")) { toc.classList.remove("open"); tt.setAttribute("aria-expanded", "false"); } });
     links = [].slice.call(toc.querySelectorAll("a[data-sec]"));
     if (links.length && "IntersectionObserver" in window) {
       var io = new IntersectionObserver(function (es) {
@@ -164,6 +168,26 @@
       "Details were cross-checked against the public papers and engineering posts listed in References.";
     main.appendChild(cr);
   }
+
+
+  /* light / dark toggle */
+  (function () {
+    var root = document.documentElement, tb = document.querySelector(".topbar");
+    if (!tb) return;
+    function cur() { return root.getAttribute("data-theme") === "dark" ? "dark" : "light"; }
+    var b = document.createElement("button"); b.type = "button"; b.className = "themebtn";
+    b.innerHTML = '<svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>';
+    function sync() { var d = cur() === "dark"; b.setAttribute("aria-label", d ? "Switch to light mode" : "Switch to dark mode"); b.title = b.getAttribute("aria-label"); b.setAttribute("aria-pressed", d ? "true" : "false"); }
+    b.addEventListener("click", function () {
+      var n = cur() === "dark" ? "light" : "dark"; root.setAttribute("data-theme", n);
+      try { localStorage.setItem("mlsd-theme", n); } catch (e) {} sync();
+    });
+    if (window.matchMedia) matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function (e) {
+      var saved = null; try { saved = localStorage.getItem("mlsd-theme"); } catch (x) {}
+      if (!saved) { root.setAttribute("data-theme", e.matches ? "dark" : "light"); sync(); }
+    });
+    tb.appendChild(b); sync();
+  })();
 
   /* interactive layer (hover, flow, drag, crosshair) */
   var lv = document.createElement("script"); lv.src = "assets/live.js";

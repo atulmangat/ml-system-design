@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ML System Design Study Guide</title>
+<script>(function(){try{var t=localStorage.getItem("mlsd-theme");if(t!=="light"&&t!=="dark")t=window.matchMedia&&matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light";document.documentElement.setAttribute("data-theme",t)}catch(e){}})()</script>
 <link rel="stylesheet" href="assets/style.css">
 <style>
 .wrap{max-width:1040px;margin:0 auto;padding:0 24px 90px}
@@ -26,14 +27,12 @@
 
 /* featured chapter 1 */
 .featured-card{background:var(--accent-soft);border:1.5px solid var(--accent);border-radius:16px;padding:24px 28px;margin:32px 0;display:flex;flex-wrap:wrap;gap:20px;align-items:center;justify-content:space-between;text-decoration:none;color:var(--fg);transition:transform .12s,box-shadow .12s}
-.featured-card:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(47,91,234,0.12)}
+.featured-card:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(47,61,146,.16)}
 .featured-content{max-width:700px}
 .featured-content .n{color:var(--accent);font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:4px}
 .featured-content .t{font-size:1.45rem;font-weight:700;margin:0 0 6px;letter-spacing:-.01em}
 .featured-content .d{font-size:14.5px;color:var(--muted);line-height:1.55;margin:0}
-.featured-btn{background:var(--accent);color:#fff;font-weight:600;font-size:14px;padding:10px 20px;border-radius:10px;white-space:nowrap;display:inline-flex;align-items:center;gap:6px}
-:root[data-theme="dark"] .featured-btn{color:#0f1319}
-@media (prefers-color-scheme: dark){:root:not([data-theme="light"]) .featured-btn{color:#0f1319}}
+.featured-btn{background:var(--accent);color:var(--on-accent);font-weight:600;font-size:14px;padding:10px 20px;border-radius:10px;white-space:nowrap;display:inline-flex;align-items:center;gap:6px}
 
 /* grid cards */
 .section-hdr{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin:44px 0 16px;padding-top:24px;border-top:1px solid var(--line)}
@@ -53,9 +52,7 @@
 .steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;margin:20px 0;padding:0;list-style:none}
 .steps li{display:flex;gap:16px;align-items:flex-start;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;transition:transform .12s,border-color .12s}
 .steps li:hover{border-color:var(--accent);transform:translateY(-2px)}
-.step-num{flex:none;display:flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:9px;background:var(--accent);color:#fff;font-weight:700;font-size:14px;margin-top:1px}
-:root[data-theme="dark"] .step-num{color:#0f1319}
-@media (prefers-color-scheme: dark){:root:not([data-theme="light"]) .step-num{color:#0f1319}}
+.step-num{flex:none;display:flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:50%;background:transparent;border:1px solid var(--gold);color:var(--gold);font-family:var(--serif);font-weight:600;font-size:15px;margin-top:1px}
 .step-body{flex:1;min-width:0}
 .step-title{font-weight:700;font-size:15px;color:var(--fg);margin-bottom:5px;line-height:1.35}
 .step-desc{font-size:14px;color:var(--muted);line-height:1.55;margin:0}
@@ -68,7 +65,7 @@
 </head>
 <body data-slug="index">
 <div class="topbar">
-  <strong>ML System Design Study Guide</strong>
+  <strong>ML System Design<span class="hide-sm"> Study Guide</span></strong>
   <div style="display:flex;gap:18px;align-items:center">
     <a href="intro.html" style="font-weight:600;color:var(--accent);text-decoration:none">Start Chapter 1 &rarr;</a>
     <span style="color:var(--muted)">11 chapters · 227 diagrams</span>

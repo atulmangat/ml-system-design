@@ -82,7 +82,7 @@
     function pt(i, v) { var r = R * v / 5; return [cx + r * Math.cos(ang(i)), cy + r * Math.sin(ang(i))]; }
     function poly(vs) { return vs.map(function (v, i) { var p = pt(i, v); return p[0].toFixed(1) + "," + p[1].toFixed(1); }).join(" "); }
     var wrap = el("div", "sc-wrap"), svg = document.createElementNS(NS, "svg");
-    svg.setAttribute("viewBox", "0 0 " + W + " 400"); svg.setAttribute("class", "sc-radar"); svg.setAttribute("role", "img"); svg.setAttribute("aria-label", "Radar chart of self-assessed readiness");
+    svg.setAttribute("viewBox", "-70 0 " + (W + 140) + " 400"); svg.setAttribute("class", "sc-radar"); svg.setAttribute("role", "img"); svg.setAttribute("aria-label", "Radar chart of self-assessed readiness");
     var g = "";
     [1, 2, 3, 4, 5].forEach(function (k) { g += '<polygon class="sc-ring" points="' + poly(DIM.map(function () { return k; })) + '"/>'; });
     DIM.forEach(function (d, i) { var p = pt(i, 5), lp = pt(i, 5.85); g += '<line class="sc-axis" x1="' + cx + '" y1="' + cy + '" x2="' + p[0] + '" y2="' + p[1] + '"/><text class="sc-lbl" x="' + lp[0] + '" y="' + lp[1] + '" text-anchor="' + (Math.abs(lp[0] - cx) < 12 ? "middle" : lp[0] > cx ? "start" : "end") + '">' + d[0] + "</text>"; });

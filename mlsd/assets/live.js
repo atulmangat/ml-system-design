@@ -33,7 +33,7 @@
       sv.classList.toggle("nolive", !liveOn);
       try { if (liveOn && sv.__vis) sv.unpauseAnimations(); else sv.pauseAnimations(); } catch (e) {}
     });
-    if (btn) { btn.setAttribute("aria-pressed", liveOn ? "true" : "false"); btn.textContent = "Live diagrams: " + (liveOn ? "on" : "off"); }
+    if (btn) { btn.setAttribute("aria-pressed", liveOn ? "true" : "false"); btn.innerHTML = '<span class="lt-full">Live diagrams: </span><span class="lt-short">Live: </span>' + (liveOn ? "on" : "off"); }
   }
   var tb = document.querySelector(".topbar");
   if (tb) {
@@ -140,6 +140,11 @@
         if (step >= edges.length) { timer = setTimeout(stop, 1400); return; }
         var e = edges[step++];
         cap.innerHTML = "<b>Step " + step + " of " + edges.length + "</b> " + nm(e.__a) + " &rarr; " + nm(e.__b);
+        var fsc = sv.parentNode;
+        if (e.__b && fsc && fsc.classList && fsc.classList.contains("figscroll") && fsc.scrollWidth > fsc.clientWidth + 4) {
+          var nr = e.__b.g.getBoundingClientRect(), cr = fsc.getBoundingClientRect();
+          fsc.scrollTo({ left: fsc.scrollLeft + (nr.left + nr.width / 2) - (cr.left + cr.width / 2), behavior: "smooth" });
+        }
         e.classList.add("act"); prev = e;
         if (e.__b) { e.__b.g.classList.add("act"); prevNode = e.__b.g; } else prevNode = null;
         timer = setTimeout(next, 800);
